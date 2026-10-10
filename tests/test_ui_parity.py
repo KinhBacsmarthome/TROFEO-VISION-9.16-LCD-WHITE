@@ -500,7 +500,14 @@ def _dispatching_functions_never_referenced() -> list[str]:
     import ast
     import re
 
+    # Every identifier and every ``def`` name, counted ONCE.  A regex per
+    # function over the 8 MB corpus cost 140 ms a name -- 31 s, half the
+    # suite (2026-10-10).  ``\bname\b`` matches exactly the whole-word
+    # tokens of ``\w+``, so the counts are the same -- compared on 412 names.
+    from collections import Counter
     blob = _identifier_corpus()
+    tokens = Counter(re.findall(r"\w+", blob))
+    defs = Counter(re.findall(r"\bdef\s+(\w+)", blob))
     dead: list[str] = []
     for path in sorted((_SRC / "trcc" / "ui").rglob("*.py")):
         if "__pycache__" in path.parts:
@@ -523,9 +530,7 @@ def _dispatching_functions_never_referenced() -> list[str]:
             )
             if not dispatches:
                 continue
-            uses = (len(re.findall(rf"\b{re.escape(node.name)}\b", blob))
-                    - len(re.findall(rf"\bdef\s+{re.escape(node.name)}\b", blob)))
-            if uses == 0:
+            if tokens[node.name] - defs[node.name] == 0:
                 dead.append(f"{path.relative_to(_SRC)}:{node.lineno} {node.name}")
     return dead
 
