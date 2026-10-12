@@ -33,6 +33,10 @@ Adam Honse (CalcProgrammer1) and Erik Gilling (konkers):
 * ``CorsairDRAMDevices.cpp`` -- each product id's name, LED count, and
   whether its LEDs run in reverse.
 
+**Modified.**  A Python port written for TRCC, first on 2026-10-08; every
+change since is in TRCC's git history.  It is distributed as part of TRCC
+under GPL-3.0-or-later, which OpenRGB's "or later" allows.
+
 The packet is the one OpenRGB 0.9's ``CorsairDominatorPlatinumController``
 sends too; it was confirmed on the maintainer's sticks before this was
 written.  Protocol 1-3 sticks need OpenRGB's slower per-byte path, which is

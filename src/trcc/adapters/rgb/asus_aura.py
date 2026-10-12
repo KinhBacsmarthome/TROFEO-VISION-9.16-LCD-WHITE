@@ -38,6 +38,10 @@ Martin Hartl (inlart) and Adam Honse (CalcProgrammer1):
   0x1B, 12 V headers at 0x1D, ARGB headers at 0x02), the channel order
   (onboard first, direct channel 0x04; then each ARGB header), and the 0x35
   effect packet that switches a channel to direct (mode 0xFF).
+
+**Modified.**  A Python port written for TRCC, first on 2026-10-10; every
+change since is in TRCC's git history.  It is distributed as part of TRCC
+under GPL-3.0-or-later, which OpenRGB's "or later" allows.
 """
 from __future__ import annotations
 

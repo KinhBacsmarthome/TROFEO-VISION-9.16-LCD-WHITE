@@ -7,7 +7,8 @@ USB ids -- so the two never fight over one device.
 
 **Credit.**  The wire format is OpenRGB's, learned from and ported to Python
 from the OpenRGB project (https://gitlab.com/CalcProgrammer1/OpenRGB,
-GPL-2.0-or-later), read at commit 9515475 (2026-10-08):
+GPL-2.0-or-later), by Adam Honse (CalcProgrammer1), read at commit 9515475
+(2026-10-08):
 
 * ``Documentation/OpenRGBSDK.md`` -- the packet header, the packet ids, and
   the Device / Mode / Zone / LED Data layouts per protocol version;
@@ -18,6 +19,10 @@ GPL-2.0-or-later), read at commit 9515475 (2026-10-08):
 * ``NetworkClient.cpp`` -- the client asks for the version, then uses the
   lower of the two (:1811-1817), so speaking protocol 1 is enough for every
   server since OpenRGB 0.5.
+
+**Modified.**  A Python port written for TRCC, first on 2026-10-08; every
+change since is in TRCC's git history.  It is distributed as part of TRCC
+under GPL-3.0-or-later, which OpenRGB's "or later" allows.
 
 Protocol 1 because it is the smallest that carries the vendor string: no
 segments, flags or per-zone modes to parse.  A server that never answers the
