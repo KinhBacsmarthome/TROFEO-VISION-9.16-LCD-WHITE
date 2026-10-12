@@ -462,6 +462,26 @@ def test_no_ui_spawns_an_app_while_one_is_starting(
         holder.release()
 
 
+def test_an_exiting_app_s_lock_is_not_mistaken_for_a_starting_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``trcc kill`` returns when the socket is gone; the old App lets go of
+    the lock about a second later.  A UI in between must start a new App once
+    the lock is free, not wait out its timeout and fall back in-process.
+
+    MUTATION CHECK: return ``ipc.wait_for_daemon(...)`` from the held branch.
+    """
+    import threading
+
+    holder = ipc.AppLock()
+    assert holder.acquire()
+    threading.Timer(0.3, holder.release).start()
+    monkeypatch.setattr(ipc, "wait_for_daemon", lambda timeout: True)
+    with mock.patch.object(daemon.subprocess, "Popen") as popen:
+        assert daemon.ensure_daemon(timeout=5.0) is True
+    assert popen.called
+
+
 def test_a_server_never_removes_a_socket_it_does_not_own(fake_platform) -> None:
     """An orphaned App's shutdown deleted the LIVE App's socket file, so the
     next UI found nothing and started a third."""

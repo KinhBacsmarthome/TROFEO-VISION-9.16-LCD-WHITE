@@ -123,6 +123,35 @@ def uptime_s() -> int:
 #: How long an older App gets to shut down when it is replaced: its close
 #: blanks and releases every panel (~5 s for a 10-panel fleet, measured).
 _REPLACE_TIMEOUT_S = 15.0
+#: How often a UI asks whether the App holding the lock has let go of it.
+#: Not every socket poll: each ask takes the lock for an instant.
+_LOCK_POLL_S = 0.25
+
+
+def _wait_for_the_lock_holder(timeout: float) -> bool:
+    """Wait for the App that holds the lock: True once it answers.  False
+    when it lets go of the lock without ever answering -- it was EXITING, not
+    starting -- or when *timeout* runs out.
+
+    ``trcc kill`` returns once the old App's socket is gone, about a second
+    before that App releases the lock on its way out.  The next UI used to
+    read the held lock as "an App is starting", wait the whole *timeout* for
+    an App that was leaving, and fall back to running in-process.
+    """
+    log.info("_wait_for_the_lock_holder: timeout=%s", timeout)
+    deadline = time.monotonic() + timeout
+    asked = 0.0
+    while time.monotonic() < deadline:
+        if ipc.daemon_running():
+            return True
+        if time.monotonic() - asked >= _LOCK_POLL_S:
+            asked = time.monotonic()
+            if not ipc.AppLock.held():
+                log.info("_wait_for_the_lock_holder: it let go of the lock "
+                         "without answering -- it was exiting")
+                return False
+        time.sleep(0.05)
+    return False
 
 
 def ensure_daemon(*, timeout: float = 10.0) -> bool:
@@ -155,10 +184,16 @@ def ensure_daemon(*, timeout: float = 10.0) -> bool:
             return ipc.daemon_running()
 
     if ipc.AppLock.held():
-        # An App is STARTING: it holds the lock and has not bound yet.  A
-        # second one beside it would own the same panels (#314).
-        log.info("ensure_daemon: an App is starting — waiting for it")
-        return ipc.wait_for_daemon(timeout=timeout)
+        # An App holds the lock and has not answered: one STARTING -- a
+        # second beside it would own the same panels (#314) -- or one EXITING.
+        log.info("ensure_daemon: an App holds the lock — waiting for it")
+        if _wait_for_the_lock_holder(timeout):
+            return True
+        if ipc.AppLock.held():
+            log.warning("ensure_daemon: the App holding the lock did not "
+                        "answer within %.0fs", timeout)
+            return False
+        log.info("ensure_daemon: that App was exiting — starting a new one")
     cmd = _daemon_spawn_cmd()
     log.info("Spawning the shared App: %s", " ".join(cmd))
     # Strip the daemon-mode flag from the child's env so the spawned daemon
