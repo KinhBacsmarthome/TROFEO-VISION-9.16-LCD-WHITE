@@ -169,6 +169,13 @@ class FollowChoice:
     is_lcd: bool = False
 
 
+def _remembered(lights: Sequence[RgbLight], kind: LightKind) -> bool:
+    """Whether *kind*'s lights come from the last Find's record."""
+    remembered = any(light.remembered for light in lights if light.kind is kind)
+    log.debug("_remembered: %s -> %s", kind.value, remembered)
+    return remembered
+
+
 def _detail(light: RgbLight) -> str:
     """The grey line under a light's name."""
     log.debug("_detail: %s %s", light.kind.value, light.ref)
@@ -308,13 +315,6 @@ class RgbPage:
         return tuple(light for light in self._lights
                      if light.kind is LightKind.RAM)
 
-    def _remembered(self, kind: LightKind) -> bool:
-        """Whether *kind*'s lights come from the last Find's record."""
-        remembered = any(light.remembered for light in self._lights
-                         if light.kind is kind)
-        log.debug("RgbPage._remembered: %s -> %s", kind.value, remembered)
-        return remembered
-
     def rows(self, kind: LightKind) -> tuple[LightRow, ...]:
         """The lights of *kind*, with whether each is ticked."""
         rows = tuple(LightRow(light.ref, light.name, _detail(light),
@@ -341,7 +341,7 @@ class RgbPage:
         """The line under the sticks: where the list came from, or why it
         is empty."""
         if self.rows(LightKind.RAM):
-            note = REMEMBERED_NOTE if self._remembered(LightKind.RAM) else ""
+            note = REMEMBERED_NOTE if _remembered(self._lights, LightKind.RAM) else ""
         else:
             note = ("Press Find lights to look for RGB memory."
                     if not self.scanned else "No RGB memory found.")
@@ -353,7 +353,7 @@ class RgbPage:
         """The OpenRGB box's status line."""
         if self.openrgb_error:
             note = f"not reachable -- {self.openrgb_error}"
-        elif self._remembered(LightKind.OPENRGB):
+        elif _remembered(self._lights, LightKind.OPENRGB):
             note = REMEMBERED_NOTE
         elif not self.scanned:
             note = "not searched yet -- press Find lights"
