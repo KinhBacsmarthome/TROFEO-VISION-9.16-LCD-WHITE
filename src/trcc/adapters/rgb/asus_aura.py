@@ -49,6 +49,7 @@ from ...core.led_models import stretch
 from ...core.logs import per_frame
 from ...core.models import RgbMirrorDevice
 from ...core.ports import BulkTransport, RgbMirror
+from ...core.rgb_catalog import MOTHERBOARD_CONTROLLERS
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -56,8 +57,12 @@ frame_log = per_frame(__name__)
 Rgb = tuple[int, int, int]
 
 AURA_VID = 0x0B05
-#: The motherboard controllers, OpenRGB's ``AuraMainboardController``.
-MAINBOARD_PIDS = (0x18F3, 0x1939, 0x19AF, 0x1AA6, 0x1BED)
+#: OpenRGB's detect function for the boards this drives.
+MAINBOARD_DETECTOR = "DetectAsusAuraUSBMotherboards"
+#: The motherboard controllers, OpenRGB's ``AuraMainboardController`` --
+#: from the generated catalog, so the ids live in one place.
+MAINBOARD_PIDS = tuple(sorted({c.pid for c in MOTHERBOARD_CONTROLLERS
+                               if c.detector == MAINBOARD_DETECTOR}))
 #: Every report the controller takes and sends.
 REPORT_ID = 0xEC
 PAYLOAD = 64

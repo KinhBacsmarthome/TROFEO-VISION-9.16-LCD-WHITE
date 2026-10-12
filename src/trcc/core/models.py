@@ -1532,6 +1532,24 @@ class RgbMirrorDevice:
     ref: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class RgbControllerId:
+    """An RGB controller OpenRGB finds by its USB HID ids -- one row of the
+    generated ``core/rgb_catalog.py``.
+
+    ``detector`` is OpenRGB's detect function, which names the family (and,
+    for the families TRCC drives, its driver).  ``interface``,
+    ``usage_page`` and ``usage`` narrow the match; None matches any.
+    """
+    vid: int
+    pid: int
+    name: str
+    detector: str
+    interface: int | None = None
+    usage_page: int | None = None
+    usage: int | None = None
+
+
 class RamAccessState(str, Enum):
     """Whether this user may reach RGB memory's bus (the chipset SMBus).
 
