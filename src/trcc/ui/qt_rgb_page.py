@@ -110,6 +110,14 @@ def _muted(text: str = "") -> QLabel:
     return label
 
 
+def _title(text: str) -> QLabel:
+    """A box's title -- OpenRGB's, the motherboard's."""
+    log.debug("_title: %s", text)
+    label = QLabel(text)
+    label.setObjectName("rgb-title")
+    return label
+
+
 def _heading(text: str) -> QLabel:
     log.debug("_heading: %s", text)
     label = QLabel(text)
@@ -125,14 +133,19 @@ class _LightCard(QFrame):
         super().__init__()
         log.debug("_LightCard.__init__: %s checked=%s", row.ref, row.checked)
         self.setObjectName("rgb-card")
-        self.check = QCheckBox(row.title, self)
-        self.check.setObjectName("rgb-light")
-        self.check.setChecked(row.checked)
-        self.check.toggled.connect(partial(toggled, row.ref))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(2)
-        layout.addWidget(self.check)
+        if row.checkable:
+            self.check = QCheckBox(row.title, self)
+            self.check.setObjectName("rgb-light")
+            self.check.setChecked(row.checked)
+            self.check.toggled.connect(partial(toggled, row.ref))
+            layout.addWidget(self.check)
+        else:
+            title = QLabel(row.title, self)
+            title.setObjectName("rgb-light")
+            layout.addWidget(title)
         layout.addWidget(_muted(row.detail))
 
 
@@ -163,6 +176,12 @@ class _LightsColumn(QWidget):
         self._address.textEdited.connect(self._on_address_edited)
         self._openrgb_note = _muted()
         self._openrgb = QVBoxLayout()
+        self._board_box = QFrame(self)
+        self._board_box.setObjectName("rgb-openrgb")
+        self._board = QVBoxLayout(self._board_box)
+        self._board.addWidget(_title("Motherboard"))
+        self._board_rows = QVBoxLayout()
+        self._board.addLayout(self._board_rows)
         self.find_button = QPushButton("Find lights", self)
         self.find_button.setObjectName("rgb-button")
         self.find_button.clicked.connect(self.find_clicked)
@@ -173,6 +192,7 @@ class _LightsColumn(QWidget):
         layout.addWidget(self._ram_note)
         layout.addWidget(self._access_card)
         layout.addWidget(self._openrgb_box())
+        layout.addWidget(self._board_box)
         layout.addWidget(self.find_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
 
@@ -182,9 +202,7 @@ class _LightsColumn(QWidget):
         box.setObjectName("rgb-openrgb")
         layout = QVBoxLayout(box)
         top = QHBoxLayout()
-        title = QLabel("OpenRGB")
-        title.setObjectName("rgb-title")
-        top.addWidget(title)
+        top.addWidget(_title("OpenRGB"))
         top.addWidget(self._address, 1)
         layout.addLayout(top)
         layout.addWidget(self._openrgb_note)
@@ -200,6 +218,11 @@ class _LightsColumn(QWidget):
             _clear(layout)
             for row in page.rows(kind):
                 layout.addWidget(_LightCard(row, self._on_light_toggled))
+        _clear(self._board_rows)
+        board = page.rows(LightKind.BOARD) + page.rows(LightKind.FOUND)
+        for row in board:
+            self._board_rows.addWidget(_LightCard(row, self._on_light_toggled))
+        self._board_box.setVisible(bool(board))
         reachable = page.ram_reachable
         self._ram_note.setText(page.ram_note if reachable else "")
         self._ram_note.setVisible(reachable and bool(page.ram_note))

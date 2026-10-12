@@ -27,7 +27,13 @@
   runs it itself, so the real one may differ in detail. "Find lights" searches for the memory and for OpenRGB at
   the address you type. What it finds is remembered: after a restart the page
   lists those lights at once, marked "found at the last search", without
-  reading the bus until you press Find lights again. The same is `trcc system rgb`, `trcc system
+  reading the bus until you press Find lights again. Find also finds the
+  motherboard's RGB the way OpenRGB does -- by the board's USB lighting
+  controller and its name -- and lists an ASUS Aura board's own LEDs and
+  each ARGB header (an ASUS board's lights are listed for now; following
+  and effects come next). A controller OpenRGB knows that TRCC does not
+  drive (MSI, Gigabyte, ASRock and others) is listed as found, and TRCC
+  never writes to it. The same is `trcc system rgb`, `trcc system
   ram-effect` and `trcc system follow --source/--mapping/--target`, or
   `/system/rgb`, `/system/ram-effect` and `/system/rgb-follow` in the API.
   The OpenRGB and RAM switches on the settings panel (classic window) and the

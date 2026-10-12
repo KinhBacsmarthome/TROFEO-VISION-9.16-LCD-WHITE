@@ -1573,6 +1573,21 @@ class BoardIdentity:
     name: str
 
 
+#: The most LEDs an ASUS Aura ARGB header drives -- its config table's 0x78
+#: per header (OpenRGB #3693), a limit, not a count.
+MAX_ARGB_LEDS = 120
+
+
+@dataclass(frozen=True, slots=True)
+class FoundBoard:
+    """A motherboard RGB controller Find spotted: its catalog row, the HID
+    interface it matched, and the name its lights take -- OpenRGB's naming,
+    the brand and the board's DMI name ("ASUS PRIME Z790-V AX")."""
+    controller: RgbControllerId
+    interface: HidInterface
+    label: str
+
+
 class RamAccessState(str, Enum):
     """Whether this user may reach RGB memory's bus (the chipset SMBus).
 
@@ -1683,9 +1698,17 @@ class RamEffectSettings:
 
 
 class LightKind(str, Enum):
-    """What drives a light: TRCC itself (RGB memory) or OpenRGB."""
+    """What a light is and what drives it.
+
+    ``RAM``: RGB memory, driven by TRCC.  ``OPENRGB``: one of OpenRGB's
+    devices.  ``BOARD``: a motherboard's lights TRCC drives (an ASUS Aura
+    header).  ``FOUND``: a motherboard controller OpenRGB knows that TRCC
+    does not drive -- listed, never written to.
+    """
     RAM = "ram"
     OPENRGB = "openrgb"
+    BOARD = "board"
+    FOUND = "found"
 
 
 @dataclass(frozen=True, slots=True)

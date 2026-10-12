@@ -26,6 +26,7 @@ from ._base import Command, Query
 
 if TYPE_CHECKING:
     from ...app import App
+    from ...services.rgb_boards import BoardScan
 
 log = logging.getLogger(__name__)
 
@@ -37,8 +38,11 @@ def _lights(app: App, message: str = "", *, ok: bool = True) -> RgbLightsResult:
     saved, each light marked ``remembered``."""
     sticks = app.rgb_mirror.ram_sticks()
     openrgb, openrgb_error = app.rgb_mirror.openrgb_lights()
+    boards = app.rgb_boards.last()
     lights: list[RgbLight] = []
-    for kind, found in ((LightKind.RAM, sticks), (LightKind.OPENRGB, openrgb)):
+    for kind, found in ((LightKind.RAM, sticks), (LightKind.OPENRGB, openrgb),
+                        (LightKind.BOARD, boards and boards.driven),
+                        (LightKind.FOUND, boards and boards.found)):
         remembered = found is None
         devices = app.settings.found_lights(kind) if found is None else found
         lights += [RgbLight(d.ref, d.name, d.led_count, kind,
@@ -52,6 +56,17 @@ def _lights(app: App, message: str = "", *, ok: bool = True) -> RgbLightsResult:
         ok=ok, message=message, lights=tuple(lights),
         scanned=sticks is not None, openrgb_error=openrgb_error,
         ram_access=app.platform.ram_access().status().state)
+
+
+def _board_summary(boards: BoardScan) -> str:
+    """What the motherboard part of a Find found, in a few words."""
+    log.debug("_board_summary: %s", boards)
+    if boards.error:
+        return boards.error
+    parts = [f"{len(boards.driven)} light(s)"] if boards.driven else []
+    if boards.found:
+        parts.append(f"{len(boards.found)} controller(s) TRCC does not drive")
+    return ", ".join(parts) or "none found"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,12 +119,18 @@ class ScanRgbLights(Command[RgbLightsResult]):
         openrgb, _error = app.rgb_mirror.openrgb_lights()
         if openrgb is not None:
             app.settings.set_found_lights(LightKind.OPENRGB, openrgb)
+        boards = app.rgb_boards.scan()
+        if not boards.error:              # a board not read keeps its record
+            app.settings.set_found_lights(LightKind.BOARD, boards.driven)
+            app.settings.set_found_lights(LightKind.FOUND, boards.found)
         app.events.publish(RgbLightsChanged())
         message = (f"RAM: {ram_error}" if ram_error else
                    f"Found {len(sticks)} RGB memory stick(s)")
         message += (f"; OpenRGB: {len(openrgb)} device(s)" if openrgb is not None
                     else "; OpenRGB: not reachable")
-        return _lights(app, message=message, ok=not ram_error)
+        message += f"; motherboard: {_board_summary(boards)}"
+        return _lights(app, message=message,
+                       ok=not ram_error and not boards.error)
 
     @staticmethod
     def _move_openrgb(app: App, host: str, port: int) -> None:

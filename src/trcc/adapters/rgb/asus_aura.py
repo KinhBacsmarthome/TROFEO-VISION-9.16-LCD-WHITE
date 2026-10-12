@@ -161,13 +161,15 @@ class AuraMainboard(RgbMirror):
     id 0xEC -- a stand-in platform hands out a scripted controller, so a test
     or a mock run never reaches a real one.  *argb_leds* says how many LEDs
     each ARGB header drives (header number from 1); a header not in it has
-    none and is listed with 0.
+    none and is listed with 0.  *label* names the board's lights.
     """
 
     def __init__(self, open_hid: Callable[[], BulkTransport],
-                 argb_leds: Mapping[int, int] | None = None) -> None:
-        log.debug("AuraMainboard.__init__: argb_leds=%s", argb_leds)
+                 argb_leds: Mapping[int, int] | None = None, *,
+                 label: str = "ASUS Aura") -> None:
+        log.debug("AuraMainboard.__init__: %s argb_leds=%s", label, argb_leds)
         self._open = open_hid
+        self._label = label
         self._argb_leds = dict(argb_leds or {})
         self._hid: BulkTransport | None = None
         self._layout: AuraLayout | None = None
@@ -250,11 +252,11 @@ class AuraMainboard(RgbMirror):
         channels: list[_Channel] = []
         if layout.onboard_leds:
             channels.append(_Channel(RgbMirrorDevice(
-                0, "ASUS Aura -- board LEDs", layout.onboard_leds,
+                0, f"{self._label} -- board LEDs", layout.onboard_leds,
                 "aura/onboard"), effect=0, direct=_ONBOARD_CHANNEL))
         for header in range(1, layout.argb_headers + 1):
             channels.append(_Channel(RgbMirrorDevice(
-                len(channels), f"ASUS Aura -- ARGB header {header}",
+                len(channels), f"{self._label} -- ARGB header {header}",
                 self._argb_leds.get(header, 0), f"aura/argb{header}"),
                 effect=len(channels), direct=header - 1))
         return tuple(channels)

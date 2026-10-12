@@ -330,3 +330,29 @@ def test_the_legend_letters_each_strip_and_says_what_it_runs() -> None:
         "A: Vengeance A -- Rain\n"
         "B: Vengeance B -- not known -- its factory default, or set by "
         "another program")
+
+
+HEADER = RgbLight("aura/argb1", "ASUS PRIME Z790-V AX -- ARGB header 1", 0,
+                  LightKind.BOARD)
+ONBOARD = RgbLight("aura/onboard", "ASUS PRIME Z790-V AX -- board LEDs", 1,
+                   LightKind.BOARD)
+MYSTIC = RgbLight("usb/1462:7e06", "MSI MAG B650 (MSI Mystic Light MS_7E06)",
+                  0, LightKind.FOUND)
+
+
+def test_motherboard_lights_are_listed_but_take_no_part_yet() -> None:
+    """Listed, never ticked: following a stick with the board present is
+    not "two kinds at once".
+
+    MUTATION CHECK: tick every light again (drop ``TICKABLE`` from load)."""
+    page = _page(STICK_A, HEADER, ONBOARD, MYSTIC)
+    rows = page.rows(LightKind.BOARD) + page.rows(LightKind.FOUND)
+    assert [(r.detail, r.checked, r.checkable) for r in rows] == [
+        ("direct · LED count not set", False, False),
+        ("direct · 1 LED", False, False),
+        ("found -- TRCC does not drive it; another app may", False, False)]
+    page.set_source(RgbSource.FOLLOW)
+    assert page.problem is None
+    assert page.apply() == FollowDevice(RgbFollowMode.RAM, "127.0.0.1", 6742,
+                                        "", FollowMapping.HALVES,
+                                        FollowColors.VIVID, ())

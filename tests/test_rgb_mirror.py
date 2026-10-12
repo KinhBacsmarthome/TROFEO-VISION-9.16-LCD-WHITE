@@ -777,6 +777,13 @@ def _lights_app(tmp_path: Path) -> tuple[App, _PlatformWithRam, list]:
     return app, platform, seen
 
 
+def _not_board(lights):  # type: ignore[no-untyped-def]
+    """RAM and OpenRGB lights only -- the stand-in fleet's board is listed
+    beside them, and has tests of its own."""
+    return [light for light in lights
+            if light.kind.value not in ("board", "found")]
+
+
 def test_the_lights_are_read_without_the_bus_until_find(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from trcc.core.commands import RgbLights, ScanRgbLights
 
@@ -786,8 +793,8 @@ def test_the_lights_are_read_without_the_bus_until_find(tmp_path) -> None:  # ty
     assert platform.ram.touched == []
     found = app.dispatch(ScanRgbLights())
     assert found.ok and found.scanned
-    assert [(light.kind.value, light.ref) for light in found.lights] == [
-        ("ram", "i2c-3/0x19"), ("ram", "i2c-3/0x1b")]
+    assert [(light.kind.value, light.ref) for light in _not_board(found.lights)
+            ] == [("ram", "i2c-3/0x19"), ("ram", "i2c-3/0x1b")]
     assert found.message.startswith("Found 2 RGB memory stick(s); OpenRGB: ")
     assert found.openrgb_error            # no OpenRGB in a test: said, not hidden
     assert [type(e).__name__ for e in seen] == ["RgbLightsChanged"]
@@ -810,7 +817,7 @@ def test_a_find_is_listed_again_after_a_restart_without_the_bus(tmp_path) -> Non
     again, platform, _seen = _lights_app(tmp_path)
     listed = again.dispatch(RgbLights())
     assert [(light.ref, light.led_count, light.remembered)
-            for light in listed.lights] == [("i2c-3/0x19", 10, True),
+            for light in _not_board(listed.lights)] == [("i2c-3/0x19", 10, True),
                                             ("i2c-3/0x1b", 10, True)]
     assert listed.scanned is False
     assert platform.ram.touched == []
@@ -844,8 +851,8 @@ def test_a_find_replaces_its_own_kind_and_a_failed_one_keeps_it(tmp_path) -> Non
     again = App(platform)               # the App takes the bus from here
     failed = again.dispatch(ScanRgbLights())
     assert not failed.ok
-    assert [(light.ref, light.remembered) for light in failed.lights] == [
-        ("i2c-3/0x19", True), ("Fan hub", True)]
+    assert [(light.ref, light.remembered) for light in _not_board(failed.lights)
+            ] == [("i2c-3/0x19", True), ("Fan hub", True)]
     assert [s.ref for s in again.settings.found_lights(LightKind.RAM)] == [
         "i2c-3/0x19"]
     again.close()
@@ -859,7 +866,8 @@ def test_a_damaged_found_light_is_dropped_not_guessed(tmp_path) -> None:  # type
         {"kind": "ram", "ref": "i2c-3/0x19", "name": "A", "led_count": 10},
         {"kind": "ram", "ref": "", "name": "no ref", "led_count": 10},
         {"kind": "ram", "ref": "i2c-3/0x1a", "name": "B", "led_count": "10"},
-        {"kind": "ram", "ref": "i2c-3/0x1b", "name": "C", "led_count": 0},
+        {"kind": "ram", "ref": "i2c-3/0x1b", "name": "C", "led_count": -1},
+        {"kind": "board", "ref": "aura/argb2", "name": "unset", "led_count": 0},
         {"ref": "i2c-3/0x1c", "name": "no kind", "led_count": 10},
         "not even a dict"]
     assert [(s.index, s.ref) for s in app.settings.found_lights(LightKind.RAM)

@@ -28,6 +28,7 @@ from ..core.logs import per_frame
 from ..core.models import (
     DATE_FORMATS,
     DEFAULT_REFRESH_INTERVAL_S,
+    MAX_ARGB_LEDS,
     MAX_REFRESH_INTERVAL_S,
     MIN_REFRESH_INTERVAL_S,
     RECENT_COLOR_DEFAULT,
@@ -123,6 +124,10 @@ class AppSettings:
     # so a restart lists them without reading a bus.  ``found_lights``
     # validates.
     rgb_lights: list[dict[str, Any]] = field(default_factory=list)
+    # How many LEDs each ASUS Aura ARGB header drives, by header number from
+    # 1 (JSON keys are text).  The board cannot say: the header's data line
+    # runs one way.  ``aura_argb_leds`` validates.
+    aura_argb_leds: dict[str, int] = field(default_factory=dict)
 
 
 # =========================================================================
@@ -853,7 +858,7 @@ class Settings:
                     and isinstance(ref := record.get("ref"), str) and ref
                     and isinstance(name := record.get("name"), str)
                     and type(count := record.get("led_count")) is int
-                    and count > 0 and isinstance(record.get("kind"), str)):
+                    and count >= 0 and isinstance(record.get("kind"), str)):
                 log.warning("found_lights: unreadable entry %r -- dropped",
                             record)
             elif record["kind"] == kind.value:
@@ -876,6 +881,19 @@ class Settings:
                 {"kind": kind.value, "ref": light.ref, "name": light.name,
                  "led_count": light.led_count} for light in lights]
             self._save()
+
+    def aura_argb_leds(self) -> dict[int, int]:
+        """LEDs per Aura ARGB header, by header number; a damaged entry is
+        dropped, never guessed."""
+        raw = self._app.aura_argb_leds
+        counts = {int(header): leds for header, leds in
+                  (raw.items() if isinstance(raw, dict) else ())
+                  if str(header).isdigit() and int(header) > 0
+                  and type(leds) is int and 0 <= leds <= MAX_ARGB_LEDS}
+        if isinstance(raw, dict) and len(counts) != len(raw):
+            log.warning("aura_argb_leds: unreadable entries in %r dropped", raw)
+        log.debug("aura_argb_leds: %s", counts)
+        return counts
 
     def rgb_follow_targets(self) -> tuple[str, ...]:
         """The lights that follow (refs); anything not a list of text is all.

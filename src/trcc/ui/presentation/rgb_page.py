@@ -153,12 +153,19 @@ def strip_legend(strips: Sequence[tuple[str, RamEffectSettings | None]]
 
 @dataclass(frozen=True, slots=True)
 class LightRow:
-    """One light as the list shows it."""
+    """One light as the list shows it; ``checkable`` -- whether it can take
+    part in following or effects yet."""
     ref: str
     title: str
     detail: str
     kind: LightKind
     checked: bool
+    checkable: bool = True
+
+
+#: The kinds a light can be ticked for: following, effects.  A motherboard's
+#: lights are listed, and wait for their own increment.
+TICKABLE = frozenset({LightKind.RAM, LightKind.OPENRGB})
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +188,12 @@ def _detail(light: RgbLight) -> str:
     log.debug("_detail: %s %s", light.kind.value, light.ref)
     if light.kind is LightKind.OPENRGB:
         return f"via OpenRGB · {light.led_count} LEDs"
+    if light.kind is LightKind.FOUND:
+        return "found -- TRCC does not drive it; another app may"
+    if light.kind is LightKind.BOARD:
+        count = light.led_count
+        return (f"direct · {count} LED{'' if count == 1 else 's'}" if count
+                else "direct · LED count not set")
     # The name already says where the stick sits (``named_by_ref``).
     saved = (f" · {EFFECT_LABELS[light.effect.effect]} saved"
              if light.effect else "")
@@ -282,7 +295,7 @@ class RgbPage:
         self.ram_access = lights.ram_access
         self._follow = follow
         self._devices = tuple(devices)
-        refs = {light.ref for light in self._lights}
+        refs = {light.ref for light in self._lights if light.kind in TICKABLE}
         self._checked = (set(follow.targets) & refs if follow.targets
                          else refs)
         if follow.host:
@@ -318,7 +331,8 @@ class RgbPage:
     def rows(self, kind: LightKind) -> tuple[LightRow, ...]:
         """The lights of *kind*, with whether each is ticked."""
         rows = tuple(LightRow(light.ref, light.name, _detail(light),
-                              light.kind, light.ref in self._checked)
+                              light.kind, light.ref in self._checked,
+                              light.kind in TICKABLE)
                      for light in self._lights if light.kind is kind)
         log.debug("RgbPage.rows: %s -> %d", kind.value, len(rows))
         return rows

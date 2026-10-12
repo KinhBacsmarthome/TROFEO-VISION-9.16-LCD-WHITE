@@ -16,7 +16,7 @@ from typing import Any, TypeVar
 
 from .adapters.device import DEVICES
 from .adapters.repo.github_releases import GitHubReleases
-from .adapters.rgb import make_mirror
+from .adapters.rgb import make_board_driver, make_mirror
 from .adapters.theme.cloud import CzhordeCatalog
 from .adapters.theme.filesystem import FileContentStore
 from .core.commands import Command
@@ -96,6 +96,7 @@ from .services.migration import LibraryMigration
 from .services.overlay import OverlayService
 from .services.quickstart import QuickstartService
 from .services.reconnect_watcher import ReconnectWatcher
+from .services.rgb_boards import MotherboardFinder
 from .services.rgb_mirror import Columns, RgbMirrorService
 from .services.settings import Settings
 from .services.slideshow import SlideshowService
@@ -379,6 +380,13 @@ class App(CommandBus):
         self.rgb_mirror = RgbMirrorService(make_rgb_mirror or partial(
             make_mirror, smbuses=platform.smbuses), on_sent=self._follow_sent)
         self.events.subscribe(LedColorsChanged, self.rgb_mirror.on_colors)
+        # Motherboard RGB, found the way OpenRGB finds it -- only on a Find.
+        # Read through ``platform``, so a stand-in's scripted board is all a
+        # test or mock run sees; each header's LED count is the user's.
+        self.rgb_boards = MotherboardFinder(
+            platform.rgb_hardware,
+            partial(make_board_driver, open_transport=platform.open_transport,
+                    argb_leds=self.settings.aura_argb_leds))
         # Whether a newer TRCC exists: asked here, for every window, from
         # start_session on -- never by a window (services/update_watch.py).
         self.update_watch = UpdateWatch(self._check_for_update,
