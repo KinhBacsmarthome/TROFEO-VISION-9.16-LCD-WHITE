@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 from ._frames import pad_rows
 from ._safe import is_under
@@ -22,6 +22,8 @@ from .models import (
     DEFAULT_REFRESH_INTERVAL_S,
     FAN_SLOT_KEYWORDS,
     MIN_REFRESH_INTERVAL_S,
+    BoardIdentity,
+    HidInterface,
     RamAccessState,
     RamAccessStatus,
     RamEffectSettings,
@@ -2329,6 +2331,38 @@ class _NoRamAccess(RamAccess):
         return self._status
 
 
+class RgbHardware(ABC):
+    """What Find reads to spot RGB controllers.
+
+    Concrete: ``SysfsRgbHardware`` (``adapters/system/_rgb_hardware.py``).
+    Nothing here opens a device: both answers come from what the OS already
+    publishes, so a Find that lists every HID interface disturbs none.
+    """
+
+    @abstractmethod
+    def board(self) -> BoardIdentity | None:
+        """The motherboard's DMI names; None where the OS gives none."""
+
+    @abstractmethod
+    def hid_interfaces(self) -> tuple[HidInterface, ...]:
+        """Every USB HID interface, read without opening any."""
+
+
+class _NoRgbHardware(RgbHardware):
+    """An OS TRCC has no way to look on yet: nothing is there to find."""
+
+    def __init__(self, os_name: str) -> None:
+        log.debug("_NoRgbHardware: %s", os_name)
+
+    def board(self) -> BoardIdentity | None:
+        log.debug("_NoRgbHardware.board")
+        return None
+
+    def hid_interfaces(self) -> tuple[HidInterface, ...]:
+        log.debug("_NoRgbHardware.hid_interfaces")
+        return ()
+
+
 class RamLights(RgbMirror):
     """RGB memory TRCC drives itself: it follows, and it keeps effects.
 
@@ -2974,6 +3008,20 @@ class Platform(ABC):
         """The opt-in grant to reach RGB memory -- on an OS that has one."""
         log.debug("ram_access: %s has none", type(self).__name__)
         return _NoRamAccess(type(self).__name__)
+
+    #: The OS adapter's ``RgbHardware`` class -- a table entry, as
+    #: ``BaseOS._transport_openers`` is, so an OS names it without a method
+    #: of its own.  None: TRCC has no way to look on this OS yet.
+    RGB_HARDWARE: ClassVar[type[RgbHardware] | None] = None
+
+    def rgb_hardware(self) -> RgbHardware:
+        """What Find reads to spot RGB controllers -- it opens nothing.  A
+        stand-in platform scripts it, as it scripts the transports."""
+        made = type(self).RGB_HARDWARE
+        log.debug("rgb_hardware: %s -> %s", type(self).__name__,
+                  getattr(made, "__name__", None))
+        return made() if made is not None else _NoRgbHardware(
+            type(self).__name__)
 
 
 # =========================================================================

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         HttpFetcher,
         Platform,
         RamAccess,
+        RgbHardware,
         ScsiTransport,
         SmBus,
     )
@@ -512,6 +513,7 @@ def _build_dev_platform(specs: list[dict] | None = None, *,
         DeviceSpec,
         ScriptedAuraController,
         ScriptedRamAccess,
+        ScriptedRgbHardware,
         is_aura,
         scripted_bulk_transport,
         scripted_ram,
@@ -538,6 +540,8 @@ def _build_dev_platform(specs: list[dict] | None = None, *,
             #: The board's Aura lighting controller -- scripted, so a mock
             #: run with the fan following never lights the host's real one.
             self.aura = ScriptedAuraController()
+            #: What Find spots: the scripted board, not the host's sysfs.
+            self.rgb = ScriptedRgbHardware()
 
         def paths(self) -> Paths:
             return dev_paths
@@ -608,6 +612,10 @@ def _build_dev_platform(specs: list[dict] | None = None, *,
         def ram_access(self) -> RamAccess:
             log.debug("DevMockPlatform.ram_access: scripted, not the host's")
             return self.ram_grant
+
+        def rgb_hardware(self) -> RgbHardware:
+            log.debug("DevMockPlatform.rgb_hardware: scripted, not the host's")
+            return self.rgb
 
     log.info("DevMockPlatform: %d simulated device(s) on real %s base",
              len(parsed), host_cls.__name__)

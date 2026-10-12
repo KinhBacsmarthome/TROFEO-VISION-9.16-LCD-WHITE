@@ -41,7 +41,9 @@ from trcc.adapters.rgb.asus_aura import AURA_VID, MAINBOARD_PIDS, REPORT_ID
 from trcc.adapters.rgb.corsair_dram import crc8
 from trcc.adapters.system._base import disambiguate
 from trcc.core.models import (
+    BoardIdentity,
     DeviceInfo,
+    HidInterface,
     ProductInfo,
     RamAccessState,
     RamAccessStatus,
@@ -49,6 +51,7 @@ from trcc.core.models import (
 )
 from trcc.core.ports import (
     RamAccess,
+    RgbHardware,
     SensorEnumerator,
     SmBus,
     Transport,
@@ -495,6 +498,8 @@ class MockPlatform(FakePlatform):
         self._reply_override: ReplyOverride = {}
         #: The board's lighting controller: what an Aura follower writes to.
         self.aura = ScriptedAuraController()
+        #: What Find spots: the board's names and its Aura's HID interface.
+        self.rgb = ScriptedRgbHardware()
         log.info("MockPlatform: %d spec(s) loaded, root=%s",
                  len(self._specs), root)
 
@@ -526,6 +531,10 @@ class MockPlatform(FakePlatform):
             log.info("MockPlatform.sensors: REAL host sensors (dev box)")
             self._sensors = build_linux_sensors()
         return self._sensors
+
+    def rgb_hardware(self) -> RgbHardware:
+        log.debug("MockPlatform.rgb_hardware: scripted, not the host's")
+        return self.rgb
 
     def scan_devices(self) -> list[DeviceInfo]:
         """Surface one ``DeviceInfo`` per spec that resolves in the registry."""
@@ -721,6 +730,35 @@ def is_aura(vid: int, pid: int) -> bool:
 AURA_BOARD_TABLE = bytes.fromhex(
     "1e9f03010000783c00010000783c00010000783c000000000000000104020"
     "1f400000000").ljust(60, b"\x00")
+
+
+#: The maintainer's board as DMI names it, and its Aura controller's HID
+#: interface as sysfs listed it on 2026-10-12.
+MAINTAINER_BOARD = BoardIdentity("ASUSTeK COMPUTER INC.", "PRIME Z790-V AX")
+AURA_INTERFACE = HidInterface(AURA_VID, 0x19AF, 2, 0xFF72, 0x00A1,
+                              "AsusTek Computer Inc. AURA LED Controller",
+                              "/dev/hidraw0")
+
+
+class ScriptedRgbHardware(RgbHardware):
+    """What Find spots, scripted: by default the maintainer's board with its
+    Aura controller.  A test that needs another machine passes its own."""
+
+    def __init__(self, board: BoardIdentity | None = MAINTAINER_BOARD,
+                 interfaces: tuple[HidInterface, ...] = (AURA_INTERFACE,)
+                 ) -> None:
+        log.debug("ScriptedRgbHardware: %s, %d interface(s)", board,
+                  len(interfaces))
+        self.scripted_board = board
+        self.interfaces = interfaces
+
+    def board(self) -> BoardIdentity | None:
+        log.debug("ScriptedRgbHardware.board")
+        return self.scripted_board
+
+    def hid_interfaces(self) -> tuple[HidInterface, ...]:
+        log.debug("ScriptedRgbHardware.hid_interfaces")
+        return self.interfaces
 
 
 class ScriptedAuraController(FakeBulkTransport):

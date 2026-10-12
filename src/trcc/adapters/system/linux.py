@@ -50,6 +50,7 @@ from ._desktop_entry import XdgDesktopEntry
 from ._polkit_install import POLKIT_POLICY
 from ._polkit_install import install as install_polkit_files
 from ._ram_access import LinuxRamAccess
+from ._rgb_hardware import SysfsRgbHardware
 from ._selinux import install as install_selinux_policy
 from ._udev import install as install_udev_rules
 
@@ -621,6 +622,9 @@ class LinuxOS(BaseOS, key="linux"):
     USB access via pyusb (libusb).  Udev rules installed by setup() give
     non-root users access to the devices listed in the product registry.
     """
+
+    #: Find spots RGB controllers from sysfs -- no device is opened.
+    RGB_HARDWARE = SysfsRgbHardware
 
     # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
 

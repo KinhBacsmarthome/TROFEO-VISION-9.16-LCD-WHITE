@@ -1550,6 +1550,29 @@ class RgbControllerId:
     usage: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class HidInterface:
+    """One USB HID interface as the OS lists it -- from what the OS already
+    publishes; the device is never asked.  ``usage_page`` and ``usage`` are
+    the first pair its report descriptor gives, as hidapi reports them;
+    ``path`` is its device node, for the log."""
+    vid: int
+    pid: int
+    interface: int
+    usage_page: int
+    usage: int
+    name: str = ""
+    path: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class BoardIdentity:
+    """The motherboard as its firmware names it (DMI ``board_vendor`` and
+    ``board_name``) -- what OpenRGB names a board's lights by."""
+    vendor: str
+    name: str
+
+
 class RamAccessState(str, Enum):
     """Whether this user may reach RGB memory's bus (the chipset SMBus).
 

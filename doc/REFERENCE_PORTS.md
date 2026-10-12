@@ -6,7 +6,7 @@ Every abstract contract in the tree: what a new implementation must write, what 
 
 Ordered **cheapest to extend first** — the ports at the top are where this codebase welcomes a contributor, the ones at the bottom are where it does not yet.
 
-48 ports.
+49 ports.
 
 | port | implement | inherit | implementations |
 |---|---|---|---|
@@ -22,6 +22,7 @@ Ordered **cheapest to extend first** — the ports at the top are where this cod
 | [`_QtUI`](#_qtui) | 1 | 3 | 2 |
 | [`DataInstallRunner`](#datainstallrunner) | 2 | 0 | 2 |
 | [`IdentifiedSource`](#identifiedsource) | 2 | 0 | 19 |
+| [`RgbHardware`](#rgbhardware) | 2 | 0 | 2 |
 | [`SingleFileTheme`](#singlefiletheme) | 2 | 0 | 1 |
 | [`TlsIdentity`](#tlsidentity) | 2 | 0 | 1 |
 | [`VideoExportRunner`](#videoexportrunner) | 2 | 0 | 2 |
@@ -56,7 +57,7 @@ Ordered **cheapest to extend first** — the ports at the top are where this cod
 | [`SensorEnumerator`](#sensorenumerator) | 11 | 8 | 1 |
 | [`BaseOS`](#baseos) | 12 | 18 | 8 |
 | [`Renderer`](#renderer) | 13 | 9 | 1 |
-| [`Platform`](#platform) | 25 | 2 | 8 |
+| [`Platform`](#platform) | 25 | 3 | 8 |
 | [`ContentStore`](#contentstore) | 27 | 0 | 1 |
 
 ---
@@ -242,6 +243,21 @@ name() -> str
 ```
 
 **Implementations (19):** `AmdGpu` · `GpuSourceChain` · `HwinfoGpu` · `HwmonDisk` · `HwmonDram` · `HwmonFan` · `HwmonVoltage` · `IntelGpu` · `LhmDisk` · `LhmGpu` · `MacosHidGpu` · `NouveauGpu` · `NvidiaGpu` · `PowermetricsGpu` · `PsutilBoardTemp` · `SmcFan` · `SmcGpu` · `SysctlFan` · `WmiVideoControllerGpu`
+
+## RgbHardware
+
+`core/ports.py`
+
+What Find reads to spot RGB controllers.
+
+**You implement (2):**
+
+```python
+board() -> BoardIdentity | None
+hid_interfaces() -> tuple[HidInterface, ...]
+```
+
+**Implementations (2):** `SysfsRgbHardware` · `_NoRgbHardware`
 
 ## SingleFileTheme
 
@@ -904,7 +920,7 @@ usb_power_state(vid: 'int', pid: 'int', unit: 'str' = '') -> UsbPowerState | Non
 worker_thread_context() -> AbstractContextManager[None]
 ```
 
-**You inherit (2):** `ram_access` · `smbuses`
+**You inherit (3):** `ram_access` · `rgb_hardware` · `smbuses`
 
 **Implementations (8):** `BsdOS` · `FreeBsdOS` · `GenericBsd` · `LinuxOS` · `MacOSPlatform` · `NetBsdOS` · `OpenBsdOS` · `WindowsPlatform`
 
