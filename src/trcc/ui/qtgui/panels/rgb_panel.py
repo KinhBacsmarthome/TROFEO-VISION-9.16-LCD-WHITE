@@ -15,6 +15,7 @@ from ....core.commands import (
     RgbFollow,
     RgbLights,
     ScanRgbLights,
+    SetAuraLeds,
     SetRamEffect,
     SetRgbFollow,
 )
@@ -25,6 +26,7 @@ from ...presentation.rgb_page import (
     ApplyPlan,
     FindLights,
     FollowDevice,
+    HeaderLeds,
     LeaveLights,
     SaveEffect,
 )
@@ -61,6 +63,10 @@ class QtRgbPage(RgbPageView):
     def _find(self, plan: FindLights) -> Command[Any]:
         log.info("QtRgbPage._find: %s", plan)
         return ScanRgbLights(host=plan.host, port=plan.port)
+
+    def _leds(self, plan: HeaderLeds) -> Command[Any]:
+        log.info("QtRgbPage._leds: %s", plan)
+        return SetAuraLeds(header=plan.header, leds=plan.leds)
 
     def _send(self, plan: ApplyPlan) -> Command[Any]:
         log.info("QtRgbPage._send: %s", plan)

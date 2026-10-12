@@ -1445,6 +1445,19 @@ trcc led zone-sync-zones KEY ZONES
 
 System-level operations (setup, sensors, info).
 
+### `trcc system aura-leds`
+
+Say how many LEDs an ASUS Aura ARGB header drives. The board cannot tell: the header's data line runs one way. The board is read again after, so the new count is listed.
+
+```bash
+trcc system aura-leds HEADER LEDS
+```
+
+| Argument | Description |
+|---|---|
+| `HEADER` | The ARGB header, from 1 (see `trcc system rgb`). |
+| `LEDS` | How many LEDs it drives. |
+
 ### `trcc system autostart`
 
 Manage auto-launch-on-login (XDG .desktop on Linux).

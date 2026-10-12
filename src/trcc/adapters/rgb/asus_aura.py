@@ -51,7 +51,7 @@ from dataclasses import dataclass
 
 from ...core.led_models import stretch
 from ...core.logs import per_frame
-from ...core.models import RgbMirrorDevice
+from ...core.models import AURA_HEADER_REF, RgbMirrorDevice
 from ...core.ports import BulkTransport, RgbMirror
 from ...core.rgb_catalog import MOTHERBOARD_CONTROLLERS
 
@@ -257,6 +257,7 @@ class AuraMainboard(RgbMirror):
         for header in range(1, layout.argb_headers + 1):
             channels.append(_Channel(RgbMirrorDevice(
                 len(channels), f"{self._label} -- ARGB header {header}",
-                self._argb_leds.get(header, 0), f"aura/argb{header}"),
+                self._argb_leds.get(header, 0),
+                AURA_HEADER_REF.format(header)),
                 effect=len(channels), direct=header - 1))
         return tuple(channels)

@@ -37,6 +37,7 @@ from ...core.commands import (
     RunSetup,
     RunUpgrade,
     ScanRgbLights,
+    SetAuraLeds,
     SetDiskDevice,
     SetHddEnabled,
     SetRamEffect,
@@ -77,6 +78,7 @@ from ._shared import http_error_if_failed
 from .schemas import (
     AppStatusEntry,
     AppStatusResponse,
+    AuraLedsRequest,
     AutostartRequest,
     DebugReportRequest,
     DiskDeviceRequest,
@@ -332,6 +334,17 @@ def rgb_scan(request: Request,
              scan.port)
     result = request.app.state.trcc.dispatch(
         ScanRgbLights(host=scan.host, port=scan.port))
+    http_error_if_failed(result)
+    return result
+
+
+@router.post("/aura-leds")
+def aura_leds_set(body: AuraLedsRequest, request: Request) -> RgbLightsResult:
+    """Say how many LEDs an ASUS Aura ARGB header drives."""
+    log.info("api POST /system/aura-leds: header %d -> %d", body.header,
+             body.leds)
+    result = request.app.state.trcc.dispatch(SetAuraLeds(header=body.header,
+                                                         leds=body.leds))
     http_error_if_failed(result)
     return result
 

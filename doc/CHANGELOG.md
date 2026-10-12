@@ -33,7 +33,11 @@
   each ARGB header (an ASUS board's lights are listed for now; following
   and effects come next). A controller OpenRGB knows that TRCC does not
   drive (MSI, Gigabyte, ASRock and others) is listed as found, and TRCC
-  never writes to it. The same is `trcc system rgb`, `trcc system
+  never writes to it. An ARGB header cannot say how many LEDs are plugged into
+  it, so you set it once, beside the header on the RGB page, with
+  `trcc system aura-leds HEADER COUNT`, or with `/system/aura-leds` in the
+  API. Finding a motherboard works on Linux for now; Windows and macOS find
+  none yet. The same is `trcc system rgb`, `trcc system
   ram-effect` and `trcc system follow --source/--mapping/--target`, or
   `/system/rgb`, `/system/ram-effect` and `/system/rgb-follow` in the API.
   The OpenRGB and RAM switches on the settings panel (classic window) and the

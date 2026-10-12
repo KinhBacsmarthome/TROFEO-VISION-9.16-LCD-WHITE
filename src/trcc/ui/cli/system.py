@@ -40,6 +40,7 @@ from ...core.commands import (
     RunSetup,
     RunUpgrade,
     ScanRgbLights,
+    SetAuraLeds,
     SetHddEnabled,
     SetRamEffect,
     SetRamLighting,
@@ -693,6 +694,24 @@ def ram_effect(
         direction=direction,
         colors=tuple(_parse_rgb(c) for c in color or ()),
         random_colors=random_colors, brightness=brightness))
+    _echo_lights(result)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("aura-leds")
+def aura_leds(
+    header: int = typer.Argument(..., min=1, help="The ARGB header, from 1 "
+                                 "(see `trcc system rgb`)."),
+    leds: int = typer.Argument(..., min=0, help="How many LEDs it drives."),
+) -> None:
+    """Say how many LEDs an ASUS Aura ARGB header drives.
+
+    The board cannot tell: the header's data line runs one way.  The board
+    is read again after, so the new count is listed.
+    """
+    log.info("cli system aura-leds: header %d -> %d", header, leds)
+    result = get_app().dispatch(SetAuraLeds(header=header, leds=leds))
     _echo_lights(result)
     if not result.ok:
         raise typer.Exit(code=1)

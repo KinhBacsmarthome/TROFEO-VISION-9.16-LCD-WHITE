@@ -1576,6 +1576,17 @@ class BoardIdentity:
 #: The most LEDs an ASUS Aura ARGB header drives -- its config table's 0x78
 #: per header (OpenRGB #3693), a limit, not a count.
 MAX_ARGB_LEDS = 120
+#: An ASUS Aura ARGB header's light ref, by header number from 1 -- made by
+#: the driver, named by ``SetAuraLeds``.
+AURA_HEADER_REF = "aura/argb{}"
+
+
+def aura_header(ref: str) -> int | None:
+    """The ARGB header number *ref* names, or None for any other light."""
+    prefix = AURA_HEADER_REF.format("")
+    number = ref.removeprefix(prefix)
+    frame_log.debug("aura_header: %s", ref)
+    return int(number) if ref.startswith(prefix) and number.isdigit() else None
 
 
 @dataclass(frozen=True, slots=True)

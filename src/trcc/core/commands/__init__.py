@@ -99,7 +99,7 @@ from .led import (
     SetWeekStart,
     ToggleLed,
 )
-from .rgb import RgbLights, ScanRgbLights, SetRamEffect
+from .rgb import RgbLights, ScanRgbLights, SetAuraLeds, SetRamEffect
 from .system import (
     AdvanceSlideshow,
     CheckForUpdate,
@@ -266,6 +266,7 @@ __all__ = [
     "SendFrame",
     "SendImage",
     "SendScreencastFrame",
+    "SetAuraLeds",
     "SetBackground",
     "SetBackgroundMode",
     "SetBrightness",

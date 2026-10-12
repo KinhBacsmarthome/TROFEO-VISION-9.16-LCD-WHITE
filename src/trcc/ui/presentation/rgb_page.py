@@ -32,6 +32,7 @@ from ...core.models import (
     RamEffectSettings,
     RgbFollowMode,
     RgbLight,
+    aura_header,
 )
 from ...core.ram_effects import effect_problem
 from ...core.results import DeviceEntry, Result, RgbFollowResult, RgbLightsResult
@@ -86,6 +87,13 @@ DEFAULT_COLORS: tuple[Rgb, Rgb] = ((255, 32, 64), (32, 128, 255))
 #: The follow choice for "whichever LED cooler sends colours first".
 FIRST_COOLER = ""
 BAD_ADDRESS = "OpenRGB's address is host:port, e.g. 127.0.0.1:6742"
+#: Under the motherboard's lights: what the list means, for anyone.
+BOARD_NOTE = ("TRCC drives ASUS Aura boards itself; give each ARGB header the "
+              "number of LEDs plugged into it.  A board TRCC lists as found "
+              "is driven by its own software -- TRCC leaves it alone.")
+#: Beside an ARGB header's LED count: what to enter, for anyone.
+LEDS_TIP = ("How many LEDs are on the fan or strip plugged into this header "
+            "-- it is on the box or spec sheet.  The board cannot tell.")
 #: Under sticks listed from the settings, before this App looked for them.
 REMEMBERED_NOTE = ("Found at the last search -- press Find lights to check "
                    "again.")
@@ -154,13 +162,23 @@ def strip_legend(strips: Sequence[tuple[str, RamEffectSettings | None]]
 @dataclass(frozen=True, slots=True)
 class LightRow:
     """One light as the list shows it; ``checkable`` -- whether it can take
-    part in following or effects yet."""
+    part in following or effects yet.  ``header`` is set for an ASUS Aura
+    ARGB header, whose LED count (``leds``) the user gives."""
     ref: str
     title: str
     detail: str
     kind: LightKind
     checked: bool
     checkable: bool = True
+    header: int | None = None
+    leds: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderLeds:
+    """Plan: ARGB *header* drives *leds* LEDs (``SetAuraLeds``)."""
+    header: int
+    leds: int
 
 
 #: The kinds a light can be ticked for: following, effects.  A motherboard's
@@ -332,7 +350,10 @@ class RgbPage:
         """The lights of *kind*, with whether each is ticked."""
         rows = tuple(LightRow(light.ref, light.name, _detail(light),
                               light.kind, light.ref in self._checked,
-                              light.kind in TICKABLE)
+                              light.kind in TICKABLE,
+                              aura_header(light.ref)
+                              if light.kind is LightKind.BOARD else None,
+                              light.led_count)
                      for light in self._lights if light.kind is kind)
         log.debug("RgbPage.rows: %s -> %d", kind.value, len(rows))
         return rows

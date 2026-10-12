@@ -895,6 +895,15 @@ class Settings:
         log.debug("aura_argb_leds: %s", counts)
         return counts
 
+    def set_aura_leds(self, header: int, leds: int) -> None:
+        """Remember how many LEDs Aura ARGB *header* drives."""
+        log.info("set_aura_leds: header %d -> %d LED(s)", header, leds)
+        with self._lock:
+            if not isinstance(self._app.aura_argb_leds, dict):
+                self._app.aura_argb_leds = {}
+            self._app.aura_argb_leds[str(header)] = leds
+            self._save()
+
     def rgb_follow_targets(self) -> tuple[str, ...]:
         """The lights that follow (refs); anything not a list of text is all.
 

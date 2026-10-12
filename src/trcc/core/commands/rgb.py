@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 
 from ..events import RgbFollowChanged, RgbLightsChanged
 from ..models import (
+    AURA_HEADER_REF,
+    MAX_ARGB_LEDS,
     EffectDirection,
     EffectSpeed,
     LightKind,
@@ -206,3 +208,40 @@ class SetRamEffect(Command[RgbLightsResult]):
         app.rgb_mirror.configure(RgbFollowMode.OFF, prefs.openrgb_host,
                                  prefs.openrgb_port)
         app.events.publish(RgbFollowChanged(mode=RgbFollowMode.OFF))
+
+
+@dataclass(frozen=True, slots=True)
+class SetAuraLeds(Command[RgbLightsResult]):
+    """How many LEDs an ASUS Aura ARGB header drives -- the board cannot
+    say, its header's data line runs one way.
+
+    Saved, then the board is read again -- its two read requests, no
+    colours -- so every UI lists the new count.  A header the last Find did
+    not list is refused before anything changes.
+    """
+    header: int
+    leds: int
+
+    def execute(self, app: App) -> RgbLightsResult:
+        log.info("SetAuraLeds: header %d -> %d LED(s)", self.header, self.leds)
+        if not 0 <= self.leds <= MAX_ARGB_LEDS:
+            log.warning("SetAuraLeds: refused -- %d LEDs", self.leds)
+            return _lights(app, message=f"an ARGB header drives 0-"
+                           f"{MAX_ARGB_LEDS} LEDs, not {self.leds}", ok=False)
+        ref = AURA_HEADER_REF.format(self.header)
+        if ref not in {light.ref for light in _lights(app).lights
+                       if light.kind is LightKind.BOARD}:
+            log.warning("SetAuraLeds: refused -- no %s listed", ref)
+            return _lights(app, ok=False, message=(
+                f"no ARGB header {self.header} -- press Find lights to list "
+                "the board's headers"))
+        app.settings.set_aura_leds(self.header, self.leds)
+        boards = app.rgb_boards.scan()
+        if not boards.error:
+            app.settings.set_found_lights(LightKind.BOARD, boards.driven)
+            app.settings.set_found_lights(LightKind.FOUND, boards.found)
+        app.events.publish(RgbLightsChanged())
+        message = f"ARGB header {self.header}: {self.leds} LED(s)"
+        if boards.error:
+            message += f" -- saved, but {boards.error}"
+        return _lights(app, message=message, ok=not boards.error)

@@ -156,3 +156,44 @@ def test_no_board_rgb_says_none_found(tmp_path) -> None:  # type: ignore[no-unty
     assert not [light for light in found.lights
                 if light.kind in (LightKind.BOARD, LightKind.FOUND)]
     app.close()
+
+
+# ── An ARGB header's LED count -- the user's to give ───────────────────────
+
+def test_a_headers_led_count_is_saved_and_listed_after_a_restart(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Refused before anything changes for a header not listed or a count
+    out of range; saved and re-read -- read requests only -- otherwise.
+
+    MUTATION CHECK: skip the header check (set any header)."""
+    from trcc.core.commands import SetAuraLeds
+
+    platform = _platform(tmp_path, AURA_INTERFACE)
+    app = App(platform)
+    assert app.dispatch(SetAuraLeds(header=1, leds=8)).message == (
+        "no ARGB header 1 -- press Find lights to list the board's headers")
+    app.dispatch(ScanRgbLights())
+    for header, leds, message in (
+            (9, 8, "no ARGB header 9 -- press Find lights to list the "
+                   "board's headers"),
+            (1, 121, "an ARGB header drives 0-120 LEDs, not 121")):
+        refused = app.dispatch(SetAuraLeds(header=header, leds=leds))
+        assert (refused.ok, refused.message) == (False, message)
+    assert app.settings.aura_argb_leds() == {}
+    result = app.dispatch(SetAuraLeds(header=1, leds=8))
+    assert (result.ok, result.message) == (True, "ARGB header 1: 8 LED(s)")
+    assert {bytes(w[1])[:1] for w in platform.aura.writes} == {b"\x82", b"\xb0"}
+    app.close()
+    again = App(_platform(tmp_path))
+    assert [(light.ref, light.led_count) for light in
+            again.dispatch(RgbLights()).lights
+            if light.kind is LightKind.BOARD][1] == ("aura/argb1", 8)
+    assert again.settings.aura_argb_leds() == {1: 8}
+    again.close()
+
+
+def test_a_damaged_led_count_is_dropped_not_guessed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    app = App(_platform(tmp_path))
+    app.settings.app.aura_argb_leds = {"1": 8, "2": "8", "x": 3, "3": 999,
+                                       "0": 4, "4": -1}
+    assert app.settings.aura_argb_leds() == {1: 8}
+    app.close()

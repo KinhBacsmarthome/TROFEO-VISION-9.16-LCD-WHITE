@@ -2281,3 +2281,15 @@ def test_system_rgb_lists_the_last_find_and_says_so(cli_runner: CliRunner, cli_a
             "again)\n  ram     i2c-3/0x19               Vengeance (i2c-3 0x19) "
             "(10 LEDs)\n") in listed.output
     assert "not searched yet" not in listed.output
+
+
+def test_system_aura_leds_refuses_a_header_no_find_listed(cli_runner: CliRunner, cli_app) -> None:
+    """The CLI dispatches SetAuraLeds; FakePlatform has no board to list."""
+    del cli_app
+    refused = cli_runner.invoke(_app(), ["system", "aura-leds", "1", "8"])
+    assert refused.exit_code == 1
+    assert ("\nno ARGB header 1 -- press Find lights to list the board's "
+            "headers\n  (not searched yet -- `trcc system rgb --scan`)\n"
+            ) in refused.output
+    zero = cli_runner.invoke(_app(), ["system", "aura-leds", "0", "8"])
+    assert zero.exit_code != 0                 # headers count from 1

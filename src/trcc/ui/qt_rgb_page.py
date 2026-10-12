@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -52,6 +54,7 @@ from ..core.events import RgbFollowChanged
 from ..core.led_models import stretch
 from ..core.logs import per_frame
 from ..core.models import (
+    MAX_ARGB_LEDS,
     EffectDirection,
     EffectSpeed,
     FollowColors,
@@ -65,15 +68,18 @@ from ..core.results import DeviceEntry, Result, RgbFollowResult, RgbLightsResult
 from ..services.follow_colors import Rgb, strip_spans
 from .presentation.effect_preview import APPROXIMATE, LEDS, effect_frame
 from .presentation.rgb_page import (
+    BOARD_NOTE,
     COLORS_LABELS,
     DIRECTION_LABELS,
     EFFECT_LABELS,
+    LEDS_TIP,
     MAPPING_LABELS,
     SOURCE_LABELS,
     SPEED_LABELS,
     ApplyPlan,
     EffectPicks,
     FindLights,
+    HeaderLeds,
     LightRow,
     RgbPage,
     RgbSource,
@@ -128,8 +134,8 @@ def _heading(text: str) -> QLabel:
 class _LightCard(QFrame):
     """One light: its tick (does it take part?), its name and where it is."""
 
-    def __init__(self, row: LightRow, toggled: Callable[[str, bool], None]
-                 ) -> None:
+    def __init__(self, row: LightRow, toggled: Callable[[str, bool], None],
+                 leds_set: Callable[[int, int], None] | None = None) -> None:
         super().__init__()
         log.debug("_LightCard.__init__: %s checked=%s", row.ref, row.checked)
         self.setObjectName("rgb-card")
@@ -147,12 +153,44 @@ class _LightCard(QFrame):
             title.setObjectName("rgb-light")
             layout.addWidget(title)
         layout.addWidget(_muted(row.detail))
+        if row.header is not None and leds_set is not None:
+            layout.addLayout(self._leds_box(row, leds_set))
+
+    def _leds_box(self, row: LightRow, leds_set: Callable[[int, int], None]
+                  ) -> QHBoxLayout:
+        """How many LEDs the header drives -- the board cannot say."""
+        log.debug("_LightCard._leds_box: header %s, %d LED(s)", row.header,
+                  row.leds)
+        header = row.header or 0
+        box = QSpinBox(self)
+        box.setObjectName("rgb-leds")
+        box.setRange(0, MAX_ARGB_LEDS)
+        box.setValue(row.leds)
+        box.setToolTip(LEDS_TIP)
+        box.editingFinished.connect(
+            partial(self._on_leds, box, header, row.leds, leds_set))
+        line = QHBoxLayout()
+        line.addWidget(_muted("LEDs on this header"))
+        line.addWidget(box)
+        line.addStretch(1)
+        return line
+
+    @staticmethod
+    def _on_leds(box: QSpinBox, header: int, was: int,
+                 leds_set: Callable[[int, int], None]) -> None:
+        """An edit finished: a new count goes to the App, an unchanged one
+        does not."""
+        log.info("_LightCard._on_leds: header %d %d -> %d", header, was,
+                 box.value())
+        if box.value() != was:
+            leds_set(header, box.value())
 
 
 class _LightsColumn(QWidget):
     """The left column: what TRCC can light, and how to find more."""
 
     find_clicked = Signal()
+    leds_set = Signal(int, int)
 
     def __init__(self, page: RgbPage, access: RamAccessRow,
                  changed: Callable[[], None]) -> None:
@@ -180,6 +218,7 @@ class _LightsColumn(QWidget):
         self._board_box.setObjectName("rgb-openrgb")
         self._board = QVBoxLayout(self._board_box)
         self._board.addWidget(_title("Motherboard"))
+        self._board.addWidget(_muted(BOARD_NOTE))
         self._board_rows = QVBoxLayout()
         self._board.addLayout(self._board_rows)
         self.find_button = QPushButton("Find lights", self)
@@ -221,7 +260,8 @@ class _LightsColumn(QWidget):
         _clear(self._board_rows)
         board = page.rows(LightKind.BOARD) + page.rows(LightKind.FOUND)
         for row in board:
-            self._board_rows.addWidget(_LightCard(row, self._on_light_toggled))
+            self._board_rows.addWidget(_LightCard(row, self._on_light_toggled,
+                                                  self.leds_set.emit))
         self._board_box.setVisible(bool(board))
         reachable = page.ram_reachable
         self._ram_note.setText(page.ram_note if reachable else "")
@@ -793,6 +833,7 @@ class RgbPageView(QWidget):
                                             self._on_changed)
         self._lights_column.setFixedWidth(400)
         self._lights_column.find_clicked.connect(self._on_find)
+        self._lights_column.leds_set.connect(self._on_leds)
         self._sources = QButtonGroup(self)
         self._source_buttons: dict[RgbSource, QRadioButton] = {}
         self._effect = _EffectForm(self.page.effect_picks, self._on_changed)
@@ -816,7 +857,7 @@ class RgbPageView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         # Spaced by hand: a nested layout inherits its parent's spacing.
         layout.setSpacing(0)
-        layout.addWidget(self._lights_column)
+        layout.addWidget(self._scrolling(self._lights_column))
         layout.addSpacing(70)
         layout.addLayout(self._source_column(), 1)
 
@@ -862,6 +903,20 @@ class RgbPageView(QWidget):
         column.addLayout(apply_row)
         return column
 
+    def _scrolling(self, column: QWidget) -> QScrollArea:
+        """*column* in a frameless scroll area: lights outgrow a fixed
+        window -- more sticks, a board's headers -- and must not squeeze."""
+        log.debug("RgbPageView._scrolling")
+        area = QScrollArea(self)
+        area.setObjectName("rgb-lights-scroll")
+        area.setWidget(column)
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setFixedWidth(column.width() + area.verticalScrollBar().sizeHint()
+                           .width())
+        return area
+
     # ── What a skin supplies ─────────────────────────────────────────
 
     def _access_row(self) -> RamAccessRow:
@@ -894,6 +949,12 @@ class RgbPageView(QWidget):
     def _send(self, plan: ApplyPlan) -> Command[Any]:
         """The Command *plan* stands for -- named, not dispatched."""
         log.error("RgbPageView._send: %s names no Command (%s)",
+                  type(self).__name__, plan)
+        raise NotImplementedError
+
+    def _leds(self, plan: HeaderLeds) -> Command[Any]:
+        """``SetAuraLeds`` for *plan* -- named, not dispatched."""
+        log.error("RgbPageView._leds: %s names no Command (%s)",
                   type(self).__name__, plan)
         raise NotImplementedError
 
@@ -963,6 +1024,12 @@ class RgbPageView(QWidget):
             self._on_changed()
             return
         self._run(self._find(plan), reload=True)
+
+    def _on_leds(self, header: int, leds: int) -> None:
+        """A header's LED count: saved, the board read again, the page
+        reloaded -- off the GUI thread, like Find."""
+        log.info("RgbPageView._on_leds: header %d -> %d", header, leds)
+        self._run(self._leds(HeaderLeds(header, leds)), reload=True)
 
     def _on_apply(self) -> None:
         plan = self.page.apply()

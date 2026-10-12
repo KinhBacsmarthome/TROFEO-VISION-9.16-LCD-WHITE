@@ -20,6 +20,7 @@ from ...core.commands import (
     RgbFollow,
     RgbLights,
     ScanRgbLights,
+    SetAuraLeds,
     SetRamEffect,
     SetRgbFollow,
 )
@@ -30,6 +31,7 @@ from ..presentation.rgb_page import (
     ApplyPlan,
     FindLights,
     FollowDevice,
+    HeaderLeds,
     LeaveLights,
     SaveEffect,
 )
@@ -63,6 +65,15 @@ _QSS = f"""
     border-radius: 6px; }}
 #rgb-page QLineEdit#rgb-address {{ background: black; color: {GOLD};
     border: none; font-size: 9pt; padding: 2px 4px; }}
+#rgb-page QScrollBar:vertical {{ background: transparent; width: 8px;
+    margin: 0; }}
+#rgb-page QScrollBar::handle:vertical {{ background: {CARD_BORDER};
+    border-radius: 4px; min-height: 24px; }}
+#rgb-page QScrollBar::add-line:vertical, #rgb-page QScrollBar::sub-line:vertical {{
+    height: 0; }}
+#rgb-page QSpinBox#rgb-leds {{ background: black; color: {GOLD};
+    border: 1px solid {CARD_BORDER}; font-size: 10pt; padding: 2px 4px;
+    min-width: 56px; min-height: 22px; }}
 #rgb-page QComboBox {{ background: #1b1b20; border: 1px solid #5a5a62;
     padding: 4px 10px; }}
 #rgb-page QComboBox QAbstractItemView {{ background: #1b1b20;
@@ -117,6 +128,10 @@ class UCRgbPage(RgbPageView):
     def _find(self, plan: FindLights) -> Command[Any]:
         log.info("UCRgbPage._find: %s", plan)
         return ScanRgbLights(host=plan.host, port=plan.port)
+
+    def _leds(self, plan: HeaderLeds) -> Command[Any]:
+        log.info("UCRgbPage._leds: %s", plan)
+        return SetAuraLeds(header=plan.header, leds=plan.leds)
 
     def _send(self, plan: ApplyPlan) -> Command[Any]:
         log.info("UCRgbPage._send: %s", plan)

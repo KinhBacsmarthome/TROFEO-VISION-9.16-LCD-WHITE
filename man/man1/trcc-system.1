@@ -6,6 +6,28 @@ trcc\-system \- System\-level operations (setup, sensors, info)
 .SH DESCRIPTION
 System\-level operations (setup, sensors, info).
 .SH SUBCOMMANDS
+.SS aura\-leds
+.PP
+\fBtrcc system aura\-leds\fR \fIHEADER\fR \fILEDS\fR
+.PP
+Say how many LEDs an ASUS Aura ARGB header drives. The board cannot tell: the header's data line runs one way. The board is read again after, so the new count is listed.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBHEADER\fR
+The ARGB header, from 1 (see trcc system rgb).
+.TP
+\fBLEDS\fR
+How many LEDs it drives.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
 .SS autostart
 .PP
 Manage auto\-launch\-on\-login (XDG .desktop on Linux).

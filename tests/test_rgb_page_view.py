@@ -13,6 +13,7 @@ from trcc.core.commands import (
     RgbFollow,
     RgbLights,
     ScanRgbLights,
+    SetAuraLeds,
     SetRamEffect,
     SetRgbFollow,
 )
@@ -38,6 +39,9 @@ from trcc.ui.presentation.rgb_page import RgbSource, strip_legend
 LCD = "0402:3922"
 STICKS = (RgbLight("i2c-3/0x19", "Stick A", 10, LightKind.RAM),
           RgbLight("i2c-3/0x1b", "Stick B", 10, LightKind.RAM))
+#: A board header no count was given for -- listed beside the sticks.
+HEADER = RgbLight("aura/argb1", "ASUS Board -- ARGB header 1", 0,
+                  LightKind.BOARD)
 
 
 class _Bus:
@@ -51,8 +55,8 @@ class _Bus:
         match cmd:
             case RamLighting():
                 return RamLightingResult(state=RamAccessState.ON, message="on")
-            case RgbLights() | ScanRgbLights() | SetRamEffect():
-                return RgbLightsResult(lights=STICKS, scanned=True,
+            case RgbLights() | ScanRgbLights() | SetRamEffect() | SetAuraLeds():
+                return RgbLightsResult(lights=(*STICKS, HEADER), scanned=True,
                                        ram_access=RamAccessState.ON,
                                        message="done")
             case RgbFollow() | SetRgbFollow():
@@ -218,3 +222,27 @@ def test_no_sticks_no_preview(view: Any) -> None:
         view._lights_column._on_light_toggled(row.ref, False)
     preview = view._previews[1]
     assert not preview.isVisible() and not preview.strips.animating
+
+
+def test_a_headers_led_count_is_sent_when_the_edit_ends(view: Any,
+                                                        qtbot: Any) -> None:
+    """The box beside an ARGB header sends SetAuraLeds -- once, when the
+    edit ends; an unchanged count sends nothing.  The note says what the
+    list means, to anyone.
+
+    MUTATION CHECK: send on every value change instead."""
+    from PySide6.QtWidgets import QLabel, QSpinBox
+
+    from trcc.ui.presentation.rgb_page import BOARD_NOTE, LEDS_TIP
+
+    (box,) = [b for b in view.findChildren(QSpinBox)
+              if b.objectName() == "rgb-leds"]
+    assert box.toolTip() == LEDS_TIP
+    assert BOARD_NOTE in [label.text() for label in view.findChildren(QLabel)]
+    box.editingFinished.emit()                       # unchanged: nothing
+    box.setValue(7)
+    box.setValue(8)                                  # typing: still nothing
+    assert view._app.commands(SetAuraLeds) == []
+    box.editingFinished.emit()
+    _answered(view, qtbot)
+    assert view._app.commands(SetAuraLeds) == [SetAuraLeds(header=1, leds=8)]

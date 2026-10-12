@@ -2134,3 +2134,14 @@ def test_system_rgb_routes_on_an_os_without_the_bus(api_client: TestClient) -> N
                            json={"effect": "disco"}).status_code == 422
     assert api_client.post("/system/ram-effect", json={
         "effect": "static", "brightness": 999}).status_code == 422
+
+
+def test_system_aura_leds_route(api_client: TestClient) -> None:
+    """Dispatches SetAuraLeds; the schema refuses what the board cannot take."""
+    refused = api_client.post("/system/aura-leds", json={"header": 1, "leds": 8})
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == (
+        "no ARGB header 1 -- press Find lights to list the board's headers")
+    for body in ({"header": 0, "leds": 8}, {"header": 1, "leds": 121},
+                 {"header": 1}):
+        assert api_client.post("/system/aura-leds", json=body).status_code == 422

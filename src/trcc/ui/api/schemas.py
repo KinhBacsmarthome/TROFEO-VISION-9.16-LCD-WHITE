@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel
 from ...core.models import (
     CUTTER_DEFAULT_FPS,
     DEFAULT_REFRESH_INTERVAL_S,
+    MAX_ARGB_LEDS,
     MAX_REFRESH_INTERVAL_S,
     MIN_REFRESH_INTERVAL_S,
     OVERLAY_DEFAULT_CLOCK_SOURCE,
@@ -247,6 +248,12 @@ class RgbScanRequest(BaseModel):
     host: str = Field(default="", max_length=253,
                       pattern=r"^[A-Za-z0-9.:\-]*$")
     port: int = Field(default=0, ge=0, le=65535)
+
+
+class AuraLedsRequest(BaseModel):
+    """How many LEDs ASUS Aura ARGB ``header`` (from 1) drives."""
+    header: int = Field(..., ge=1, le=16)
+    leds: int = Field(..., ge=0, le=MAX_ARGB_LEDS)
 
 
 class RamEffectRequest(BaseModel):
