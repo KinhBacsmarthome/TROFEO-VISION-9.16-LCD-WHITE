@@ -1654,12 +1654,15 @@ class RgbLight:
     ``ref`` names it across scans (a stick's ``i2c-3/0x19``, an OpenRGB
     device's name).  ``effect`` is, for a RAM stick, the effect TRCC last
     saved on it -- what TRCC set, not read back from the stick.
+    ``remembered``: listed from the last Find's record in the settings, not
+    looked for since the App started.
     """
     ref: str
     name: str
     led_count: int
     kind: LightKind
     effect: RamEffectSettings | None = None
+    remembered: bool = False
 
 
 #: The overlay colour editor's recent-colour row: 11 swatches, Silver until

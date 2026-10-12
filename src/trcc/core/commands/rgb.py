@@ -31,15 +31,23 @@ log = logging.getLogger(__name__)
 
 
 def _lights(app: App, message: str = "", *, ok: bool = True) -> RgbLightsResult:
-    """Every light from the last scans, as the page shows them -- no bus."""
+    """Every light from the last scans, as the page shows them -- no bus.
+
+    A kind not looked for since the App started lists what the last Find
+    saved, each light marked ``remembered``."""
     sticks = app.rgb_mirror.ram_sticks()
     openrgb, openrgb_error = app.rgb_mirror.openrgb_lights()
-    lights = [RgbLight(s.ref, s.name, s.led_count, LightKind.RAM,
-                       app.settings.ram_effect(s.ref)) for s in sticks or ()]
-    lights += [RgbLight(d.ref, d.name, d.led_count, LightKind.OPENRGB)
-               for d in openrgb or ()]
-    log.debug("_lights: %d light(s), scanned=%s", len(lights),
-              sticks is not None)
+    lights: list[RgbLight] = []
+    for kind, found in ((LightKind.RAM, sticks), (LightKind.OPENRGB, openrgb)):
+        remembered = found is None
+        devices = app.settings.found_lights(kind) if found is None else found
+        lights += [RgbLight(d.ref, d.name, d.led_count, kind,
+                            app.settings.ram_effect(d.ref)
+                            if kind is LightKind.RAM else None,
+                            remembered=remembered)
+                   for d in devices]
+    log.debug("_lights: %d light(s), scanned=%s, %d remembered", len(lights),
+              sticks is not None, sum(light.remembered for light in lights))
     return RgbLightsResult(
         ok=ok, message=message, lights=tuple(lights),
         scanned=sticks is not None, openrgb_error=openrgb_error,
@@ -90,9 +98,13 @@ class ScanRgbLights(Command[RgbLightsResult]):
             sticks = ()
             ram_error = str(e)
             log.warning("ScanRgbLights: the RAM could not be searched -- %s", e)
+        else:
+            app.settings.set_found_lights(LightKind.RAM, sticks)
         app.rgb_mirror.scan_openrgb(host, port)
-        app.events.publish(RgbLightsChanged())
         openrgb, _error = app.rgb_mirror.openrgb_lights()
+        if openrgb is not None:
+            app.settings.set_found_lights(LightKind.OPENRGB, openrgb)
+        app.events.publish(RgbLightsChanged())
         message = (f"RAM: {ram_error}" if ram_error else
                    f"Found {len(sticks)} RGB memory stick(s)")
         message += (f"; OpenRGB: {len(openrgb)} device(s)" if openrgb is not None

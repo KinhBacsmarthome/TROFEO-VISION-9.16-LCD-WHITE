@@ -620,7 +620,10 @@ def _echo_lights(result: RgbLightsResult) -> None:
     log.debug("_echo_lights: %d", len(result.lights))
     if result.message:
         typer.echo(result.message)
-    if not result.scanned:
+    if any(light.remembered for light in result.lights):
+        typer.echo("  (found at the last search -- `trcc system rgb --scan` "
+                   "to check again)")
+    elif not result.scanned:
         typer.echo("  (not searched yet -- `trcc system rgb --scan`)")
     for light in result.lights:
         effect = (f"  effect: {light.effect.effect.value} (last set by TRCC)"

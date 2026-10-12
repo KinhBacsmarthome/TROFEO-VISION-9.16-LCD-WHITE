@@ -797,6 +797,78 @@ def test_the_lights_are_read_without_the_bus_until_find(tmp_path) -> None:  # ty
     app.close()
 
 
+def test_a_find_is_listed_again_after_a_restart_without_the_bus(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The sticks keep their own effect through a reboot; the page must not
+    forget them.  Read back through the FILE, by a second App.
+
+    MUTATION CHECK: drop ``set_found_lights`` from ScanRgbLights."""
+    from trcc.core.commands import RgbLights, ScanRgbLights
+
+    app, _platform, _seen = _lights_app(tmp_path)
+    app.dispatch(ScanRgbLights())
+    app.close()
+    again, platform, _seen = _lights_app(tmp_path)
+    listed = again.dispatch(RgbLights())
+    assert [(light.ref, light.led_count, light.remembered)
+            for light in listed.lights] == [("i2c-3/0x19", 10, True),
+                                            ("i2c-3/0x1b", 10, True)]
+    assert listed.scanned is False
+    assert platform.ram.touched == []
+    assert all(not light.remembered
+               for light in again.dispatch(ScanRgbLights()).lights)
+    again.close()
+
+
+def test_a_find_replaces_its_own_kind_and_a_failed_one_keeps_it(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A stick taken out is forgotten; a bus that cannot be read forgets
+    nothing; RAM's Find leaves OpenRGB's record alone."""
+    from trcc.core.commands import ScanRgbLights
+    from trcc.core.models import LightKind, RgbMirrorDevice
+
+    app, platform, _seen = _lights_app(tmp_path)
+    fan = RgbMirrorDevice(0, "Fan hub", 8, "Fan hub")
+    app.settings.set_found_lights(LightKind.OPENRGB, (fan,))
+    app.dispatch(ScanRgbLights())
+    del platform.ram.chips[0x1B]
+    app.dispatch(ScanRgbLights())
+    assert [s.ref for s in app.settings.found_lights(LightKind.RAM)] == [
+        "i2c-3/0x19"]
+    assert app.settings.found_lights(LightKind.OPENRGB) == (fan,)
+
+    def stuck() -> tuple[SmBus, ...]:
+        raise OSError("the memory's SPD hub(s) 3-0051 are not answering")
+
+    app.close()
+    platform = _PlatformWithRam(tmp_path)
+    platform.smbuses = stuck  # type: ignore[method-assign]
+    again = App(platform)               # the App takes the bus from here
+    failed = again.dispatch(ScanRgbLights())
+    assert not failed.ok
+    assert [(light.ref, light.remembered) for light in failed.lights] == [
+        ("i2c-3/0x19", True), ("Fan hub", True)]
+    assert [s.ref for s in again.settings.found_lights(LightKind.RAM)] == [
+        "i2c-3/0x19"]
+    again.close()
+
+
+def test_a_damaged_found_light_is_dropped_not_guessed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from trcc.core.models import LightKind
+
+    app, _platform, _seen = _lights_app(tmp_path)
+    app.settings.app.rgb_lights = [
+        {"kind": "ram", "ref": "i2c-3/0x19", "name": "A", "led_count": 10},
+        {"kind": "ram", "ref": "", "name": "no ref", "led_count": 10},
+        {"kind": "ram", "ref": "i2c-3/0x1a", "name": "B", "led_count": "10"},
+        {"kind": "ram", "ref": "i2c-3/0x1b", "name": "C", "led_count": 0},
+        {"ref": "i2c-3/0x1c", "name": "no kind", "led_count": 10},
+        "not even a dict"]
+    assert [(s.index, s.ref) for s in app.settings.found_lights(LightKind.RAM)
+            ] == [(0, "i2c-3/0x19")]
+    app.settings.app.rgb_lights = "not a list"  # type: ignore[assignment]
+    assert app.settings.found_lights(LightKind.RAM) == ()
+    app.close()
+
+
 def test_an_effect_is_saved_on_the_sticks_and_remembered(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from trcc.core.commands import RgbLights, ScanRgbLights, SetRamEffect
     from trcc.core.models import EffectSpeed, RamEffect

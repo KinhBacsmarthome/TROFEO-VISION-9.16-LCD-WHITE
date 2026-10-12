@@ -120,6 +120,21 @@ def test_notes_say_whether_anything_was_looked_for() -> None:
     assert _page(STICK_A).ram_note == ""
 
 
+def test_lights_from_the_last_find_say_so() -> None:
+    """Listed from the settings after a restart: the note says where the
+    list came from, per kind -- RAM searched this run says nothing."""
+    from dataclasses import replace
+
+    from trcc.ui.presentation.rgb_page import REMEMBERED_NOTE
+
+    old_stick = replace(STICK_A, remembered=True)
+    old_fan = replace(FAN, remembered=True)
+    assert _page(old_stick, scanned=False).ram_note == REMEMBERED_NOTE
+    assert _page(old_fan, scanned=False).openrgb_note == REMEMBERED_NOTE
+    assert _page(STICK_A, old_fan).ram_note == ""
+    assert _page(old_stick, FAN).openrgb_note == "1 device(s) found"
+
+
 def test_find_carries_the_address_or_refuses_it() -> None:
     page = _page()
     page.address = "192.168.1.5:6800"

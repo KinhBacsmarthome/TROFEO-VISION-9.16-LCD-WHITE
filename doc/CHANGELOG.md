@@ -25,7 +25,9 @@
   each light gets. Under the two other sources, each stick is drawn running
   its effect -- TRCC's drawing from the effect's settings, since the stick
   runs it itself, so the real one may differ in detail. "Find lights" searches for the memory and for OpenRGB at
-  the address you type. The same is `trcc system rgb`, `trcc system
+  the address you type. What it finds is remembered: after a restart the page
+  lists those lights at once, marked "found at the last search", without
+  reading the bus until you press Find lights again. The same is `trcc system rgb`, `trcc system
   ram-effect` and `trcc system follow --source/--mapping/--target`, or
   `/system/rgb`, `/system/ram-effect` and `/system/rgb-follow` in the API.
   The OpenRGB and RAM switches on the settings panel (classic window) and the

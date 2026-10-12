@@ -86,6 +86,9 @@ DEFAULT_COLORS: tuple[Rgb, Rgb] = ((255, 32, 64), (32, 128, 255))
 #: The follow choice for "whichever LED cooler sends colours first".
 FIRST_COOLER = ""
 BAD_ADDRESS = "OpenRGB's address is host:port, e.g. 127.0.0.1:6742"
+#: Under sticks listed from the settings, before this App looked for them.
+REMEMBERED_NOTE = ("Found at the last search -- press Find lights to check "
+                   "again.")
 
 HINTS: dict[RgbSource, str] = {
     RgbSource.LEAVE: ("TRCC sends nothing to any light.  Each stick keeps the "
@@ -305,6 +308,13 @@ class RgbPage:
         return tuple(light for light in self._lights
                      if light.kind is LightKind.RAM)
 
+    def _remembered(self, kind: LightKind) -> bool:
+        """Whether *kind*'s lights come from the last Find's record."""
+        remembered = any(light.remembered for light in self._lights
+                         if light.kind is kind)
+        log.debug("RgbPage._remembered: %s -> %s", kind.value, remembered)
+        return remembered
+
     def rows(self, kind: LightKind) -> tuple[LightRow, ...]:
         """The lights of *kind*, with whether each is ticked."""
         rows = tuple(LightRow(light.ref, light.name, _detail(light),
@@ -328,11 +338,13 @@ class RgbPage:
 
     @property
     def ram_note(self) -> str:
-        """The line in place of the sticks when there are none to list."""
+        """The line under the sticks: where the list came from, or why it
+        is empty."""
         if self.rows(LightKind.RAM):
-            return ""
-        note = ("Press Find lights to look for RGB memory." if not self.scanned
-                else "No RGB memory found.")
+            note = REMEMBERED_NOTE if self._remembered(LightKind.RAM) else ""
+        else:
+            note = ("Press Find lights to look for RGB memory."
+                    if not self.scanned else "No RGB memory found.")
         log.debug("RgbPage.ram_note: %s", note)
         return note
 
@@ -341,6 +353,8 @@ class RgbPage:
         """The OpenRGB box's status line."""
         if self.openrgb_error:
             note = f"not reachable -- {self.openrgb_error}"
+        elif self._remembered(LightKind.OPENRGB):
+            note = REMEMBERED_NOTE
         elif not self.scanned:
             note = "not searched yet -- press Find lights"
         else:

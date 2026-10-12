@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -39,11 +39,13 @@ from ..core.models import (
     FitMode,
     FollowColors,
     FollowMapping,
+    LightKind,
     OrientationState,
     OverlayElement,
     RamEffect,
     RamEffectSettings,
     RgbFollowMode,
+    RgbMirrorDevice,
     TempUnit,
     parse_device_key,
 )
@@ -117,6 +119,10 @@ class AppSettings:
     # The effect TRCC last saved on each RAM stick, by ref -- what it set,
     # not read back.  Plain JSON; ``ram_effect`` validates it on the way out.
     ram_effects: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # The lights the last Find found -- kind, ref, name and LED count each --
+    # so a restart lists them without reading a bus.  ``found_lights``
+    # validates.
+    rgb_lights: list[dict[str, Any]] = field(default_factory=list)
 
 
 # =========================================================================
@@ -834,6 +840,41 @@ class Settings:
             if not isinstance(self._app.ram_effects, dict):
                 self._app.ram_effects = {}
             self._app.ram_effects[ref] = record
+            self._save()
+
+    def found_lights(self, kind: LightKind) -> tuple[RgbMirrorDevice, ...]:
+        """The lights of *kind* the last Find found -- no bus.  A damaged
+        entry is dropped, never guessed."""
+        records = (self._app.rgb_lights
+                   if isinstance(self._app.rgb_lights, list) else [])
+        lights: list[RgbMirrorDevice] = []
+        for record in records:
+            if not (isinstance(record, dict)
+                    and isinstance(ref := record.get("ref"), str) and ref
+                    and isinstance(name := record.get("name"), str)
+                    and type(count := record.get("led_count")) is int
+                    and count > 0 and isinstance(record.get("kind"), str)):
+                log.warning("found_lights: unreadable entry %r -- dropped",
+                            record)
+            elif record["kind"] == kind.value:
+                lights.append(RgbMirrorDevice(len(lights), name, count, ref))
+        log.debug("found_lights: %s -> %s", kind.value,
+                  [light.ref for light in lights])
+        return tuple(lights)
+
+    def set_found_lights(self, kind: LightKind,
+                         lights: Sequence[RgbMirrorDevice]) -> None:
+        """Remember what a Find found of *kind* -- all of it, so a light that
+        is gone is forgotten; other kinds' records are kept."""
+        log.info("set_found_lights: %s %s", kind.value,
+                 [light.ref for light in lights])
+        with self._lock:
+            kept = [r for r in self._app.rgb_lights
+                    if isinstance(r, dict) and r.get("kind") != kind.value
+                    ] if isinstance(self._app.rgb_lights, list) else []
+            self._app.rgb_lights = kept + [
+                {"kind": kind.value, "ref": light.ref, "name": light.name,
+                 "led_count": light.led_count} for light in lights]
             self._save()
 
     def rgb_follow_targets(self) -> tuple[str, ...]:

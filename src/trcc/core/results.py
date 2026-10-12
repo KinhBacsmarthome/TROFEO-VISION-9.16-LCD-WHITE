@@ -613,8 +613,9 @@ class BootAnimationResult(Result):
 class RgbLightsResult(Result):
     """The lights the RGB page lists, from the last scan -- no bus traffic.
 
-    ``scanned`` is whether the RAM has been looked for yet; ``openrgb_error``
-    why OpenRGB's devices could not be listed, if they could not.
+    ``scanned`` is whether the RAM has been looked for since the App started;
+    ``openrgb_error`` why OpenRGB's devices could not be listed, if they
+    could not.
     """
     lights: tuple[RgbLight, ...] = ()
     scanned: bool = False

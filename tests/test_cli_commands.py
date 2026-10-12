@@ -2266,3 +2266,18 @@ def test_system_rgb_and_ram_effect_on_an_os_without_the_bus(cli_runner: CliRunne
     bad = cli_runner.invoke(_app(), ["system", "ram-effect", "static",
                                      "--color", "300,0"])
     assert bad.exit_code != 0
+
+
+def test_system_rgb_lists_the_last_find_and_says_so(cli_runner: CliRunner, cli_app) -> None:
+    """After a restart the sticks come from the settings -- listed, marked,
+    and no bus touched."""
+    from trcc.core.models import LightKind, RgbMirrorDevice
+
+    cli_app.settings.set_found_lights(LightKind.RAM, (
+        RgbMirrorDevice(0, "Vengeance (i2c-3 0x19)", 10, "i2c-3/0x19"),))
+    listed = cli_runner.invoke(_app(), ["system", "rgb"])
+    assert listed.exit_code == 0, listed.output
+    assert ("  (found at the last search -- `trcc system rgb --scan` to check "
+            "again)\n  ram     i2c-3/0x19               Vengeance (i2c-3 0x19) "
+            "(10 LEDs)\n") in listed.output
+    assert "not searched yet" not in listed.output
