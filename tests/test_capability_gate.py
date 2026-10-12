@@ -60,7 +60,14 @@ def _commands(key: str, tmp: Path) -> list[Command[Any]]:
         C.ConfigureSlideshow(key=key, themes=("a",), interval_s=5.0),
         C.SetSlideshow(key=key, enabled=True),
         C.ExportCurrentTheme(key=key, archive_path=tmp / "out.tr"),
+        C.PlayVisual(key=key, visual="trcc-pipes"),
+        C.StopVisual(key=key),
     ]
+
+
+#: How many rows the table has -- derived, because a literal here sat at 27
+#: while the table grew to 30, so its last rows were never checked.
+_ROWS = range(len(_commands(_LED, Path())))
 
 
 def _gated() -> set[str]:
@@ -84,7 +91,7 @@ def app(tmp_path: Path) -> App:
     return app
 
 
-@pytest.mark.parametrize("index", range(27))
+@pytest.mark.parametrize("index", _ROWS)
 def test_an_led_is_refused_and_nothing_is_written(app: App, tmp_path: Path,
                                                   index: int) -> None:
     """MUTATION CHECK: drop the check in ``App.dispatch`` and these write."""
@@ -99,7 +106,7 @@ def test_an_led_is_refused_and_nothing_is_written(app: App, tmp_path: Path,
     assert _LED not in app.active_themes
 
 
-@pytest.mark.parametrize("index", range(27))
+@pytest.mark.parametrize("index", _ROWS)
 def test_an_lcd_passes_the_gate(app: App, tmp_path: Path, index: int) -> None:
     """Whatever an LCD's answer is, it is not the capability refusal."""
     cmd = _commands(_LCD, tmp_path)[index]

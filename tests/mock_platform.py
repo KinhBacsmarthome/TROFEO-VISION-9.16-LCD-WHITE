@@ -27,8 +27,13 @@ from __future__ import annotations
 
 import errno
 import logging
+import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
+
+import numpy as np
 
 from trcc.adapters.device import _f5
 from trcc.adapters.device.hid_lcd import (
@@ -40,13 +45,19 @@ from trcc.adapters.device.ly_lcd import _PID_LY
 from trcc.adapters.rgb.asus_aura import AURA_VID, MAINBOARD_PIDS, REPORT_ID
 from trcc.adapters.rgb.corsair_dram import crc8
 from trcc.adapters.system._base import disambiguate
+from trcc.adapters.visual.pipes import TrccPipes
+from trcc.adapters.visual.projectm import MilkdropVisual
 from trcc.core.models import (
+    SOUND_CHANNELS,
+    SOUND_RATE,
     BoardIdentity,
     DeviceInfo,
     HidInterface,
     ProductInfo,
     RamAccessState,
     RamAccessStatus,
+    RawFrame,
+    VisualSpec,
     Wire,
 )
 from trcc.core.ports import (
@@ -54,7 +65,9 @@ from trcc.core.ports import (
     RgbHardware,
     SensorEnumerator,
     SmBus,
+    SoundInput,
     Transport,
+    VisualEngine,
     WriteBuffer,
 )
 from trcc.core.protocol import get_profile, pm_to_fbl
@@ -536,6 +549,11 @@ class MockPlatform(FakePlatform):
         log.debug("MockPlatform.rgb_hardware: scripted, not the host's")
         return self.rgb
 
+    def sound_input(self) -> SoundInput:
+        log.debug("MockPlatform.sound_input: scripted, not the host's")
+        return ScriptedSound()
+
+
     def scan_devices(self) -> list[DeviceInfo]:
         """Surface one ``DeviceInfo`` per spec that resolves in the registry."""
         log.info("MockPlatform.scan_devices: %d spec(s)", len(self._specs))
@@ -815,3 +833,80 @@ class ScriptedAuraController(FakeBulkTransport):
         log.debug("ScriptedAuraController.reports: 0x%02x -> %d", opcode,
                   len(found))
         return found
+
+
+# ── Scripted audio visuals: no sound card, no GPU ───────────────────────────
+
+class ScriptedSound(SoundInput):
+    """A steady made-up beat (a kick every half second over a chord), paced
+    in real time as the real input is -- what a test's visual hears."""
+
+    def __init__(self) -> None:
+        log.debug("ScriptedSound.__init__")
+        self._at = 0
+        self.closed = False
+
+    def open(self) -> None:
+        log.info("ScriptedSound.open")
+        self.closed = False
+
+    def read(self, frames: int) -> bytes:
+        if self.closed:
+            return b""
+        t = (np.arange(frames) + self._at) / SOUND_RATE
+        beat = t % 0.5
+        kick = np.sin(2 * np.pi * (55 + 90 * np.exp(-beat * 30)) * beat) * np.exp(-beat * 9)
+        chord = 0.25 * sum(np.sin(2 * np.pi * f * t) for f in (220, 277, 330))
+        mono = (0.7 * kick + 0.3 * chord).astype("<f4")
+        self._at += frames
+        time.sleep(frames / SOUND_RATE)
+        log.debug("ScriptedSound.read: %d frame(s)", frames)
+        return np.repeat(mono, SOUND_CHANNELS).tobytes()
+
+    def close(self) -> None:
+        log.info("ScriptedSound.close")
+        self.closed = True
+
+
+class ScriptedMilkdrop(MilkdropVisual):
+    """projectM's stand-in: the real preset lookup, and a gradient whose
+    brightness follows the sound -- no libprojectM, no GPU."""
+
+    @classmethod
+    def available(cls) -> bool:
+        log.debug("ScriptedMilkdrop.available: scripted")
+        return True
+
+    def __init__(self) -> None:
+        log.debug("ScriptedMilkdrop.__init__")
+        self.spec: VisualSpec | None = None
+        self._level = 0.0
+
+    def open(self, spec: VisualSpec) -> None:
+        log.info("ScriptedMilkdrop.open: %s", spec.preset)
+        if spec.preset is None:
+            raise OSError("a MilkDrop visual needs a preset file")
+        self.spec = spec
+
+    def feed(self, pcm: bytes) -> None:
+        samples = np.frombuffer(pcm, dtype="<f4")
+        self._level = float(np.abs(samples).mean()) if samples.size else 0.0
+        log.debug("ScriptedMilkdrop.feed: %.3f", self._level)
+
+    def render(self) -> RawFrame:
+        assert self.spec is not None
+        w, h = self.spec.width, self.spec.height
+        shade = min(255, int(40 + self._level * 400))
+        log.debug("ScriptedMilkdrop.render: %d", shade)
+        return RawFrame(data=bytes([shade, 0, 255 - shade]) * (w * h),
+                        width=w, height=h)
+
+    def close(self) -> None:
+        log.info("ScriptedMilkdrop.close")
+
+
+#: The visuals a stand-in platform draws: TRCC Pipes as itself (it is CPU
+#: only), MilkDrop scripted.
+SCRIPTED_VISUALS: Mapping[str, type[VisualEngine]] = MappingProxyType({
+    "trcc-pipes": TrccPipes, "milkdrop": ScriptedMilkdrop})
+MockPlatform.VISUALS = SCRIPTED_VISUALS

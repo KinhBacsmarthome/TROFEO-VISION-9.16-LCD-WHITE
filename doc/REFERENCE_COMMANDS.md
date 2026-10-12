@@ -4,7 +4,7 @@
 
 Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
 
-**151 total: 108 Commands and 43 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+**156 total: 112 Commands and 44 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
 
 ## Dispatching one
 
@@ -1647,3 +1647,56 @@ Save one of the memory's own effects on the sticks named by ``refs`` (every stic
 | `colors` | `tuple[tuple[int, int, int], Ellipsis]` | no |
 | `random_colors` | `bool` | no |
 | `brightness` | `int` | no |
+
+## visual
+
+### `CaptureVisualFrame`
+
+One tick of an audio visual: its newest picture, onto the panel.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ListVisuals`
+
+Every audio visual this machine can draw, and the preset files for the ones that draw presets -- the Audio Visuals page's gallery.
+
+*Query* → `VisualsResult`
+
+Takes no arguments.
+
+### `PlayVisual`
+
+Draw the panel's background with the audio visual *visual* (a ``VISUALS`` key), from what is playing.  *preset* is the preset file, relative to the visuals' folder, for a visual that draws presets; *settings* its slider values by name.  Whatever played before stops first.  Refused before anything changes for an unknown visual, a missing preset, or a panel that has not reported its size.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `visual` | `str` | yes |
+| `preset` | `str` | no |
+| `settings` | `dict[str, float]` | no |
+
+### `SetVisualCenter`
+
+The centre picture for audio visuals that show one -- any image the user picks; an empty *path* goes back to TRCC's icon.  A panel playing such a visual picks it up when the visual next starts.
+
+*Command* → `VisualsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `path` | `str` | no |
+
+### `StopVisual`
+
+End the panel's audio visual: the theme's own background returns, its video playing again -- the App decides, no UI reloads a theme.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |

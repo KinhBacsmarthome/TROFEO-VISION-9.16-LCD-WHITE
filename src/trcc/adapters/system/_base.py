@@ -55,6 +55,7 @@ from ...core.registry import ALL_DEVICES
 from ..device._pyusb_find import find as usb_find
 from ..device._pyusb_find import usb_path
 from ..device.transport import PyUsbBulkTransport
+from ..visual import VISUALS as _VISUALS
 
 if TYPE_CHECKING:
     from ...core.models import UsbPowerState
@@ -181,6 +182,9 @@ class BaseOS(Platform):
     abstract (see the module docstring), which is what keeps this class from
     instantiating on its own and what tells a new OS's author what to write.
     """
+
+    #: Every audio visual TRCC has: the ``VISUALS`` registry.
+    VISUALS = _VISUALS
 
     def __init_subclass__(cls, key: str | None = None, **kwargs: Any) -> None:
         """Register the subclass under the ``key=`` it declares.

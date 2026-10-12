@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -128,6 +128,9 @@ class AppSettings:
     # 1 (JSON keys are text).  The board cannot say: the header's data line
     # runs one way.  ``aura_argb_leds`` validates.
     aura_argb_leds: dict[str, int] = field(default_factory=dict)
+    # The user's centre picture for audio visuals -- any image; ``None``
+    # shows TRCC's icon.
+    visual_center: str | None = None
 
 
 # =========================================================================
@@ -516,8 +519,7 @@ class Settings:
             dev = self.for_device(key)
             dev.background_path = path
             if path is not None:   # display-source toggles are mutually exclusive
-                dev.screencast_region = None
-                dev.media_player_uri = None
+                _only_source(dev, "background_path")
             self._save()
 
     def set_screencast_region(
@@ -534,8 +536,7 @@ class Settings:
             dev = self.for_device(key)
             dev.screencast_region = region
             if region is not None:
-                dev.background_path = None
-                dev.media_player_uri = None
+                _only_source(dev, "screencast_region")
             self._save()
 
     def set_screencast_rect(self, key: str, rect: tuple[int, int, int, int],
@@ -567,8 +568,38 @@ class Settings:
             dev = self.for_device(key)
             dev.media_player_uri = uri
             if uri is not None:
-                dev.background_path = None
-                dev.screencast_region = None
+                _only_source(dev, "media_player_uri")
+            self._save()
+
+    def set_visual(self, key: str, visual: str | None, preset: str = "",
+                   settings: Mapping[str, float] | None = None) -> None:
+        """Set (or clear with ``None``) the device's audio visual: its key,
+        its preset file and its slider values.  Mutually exclusive with the
+        other display sources, so setting it clears them."""
+        log.info("set_visual: key=%s visual=%s preset=%r settings=%s", key,
+                 visual, preset, dict(settings or {}))
+        with self._lock:
+            dev = self.for_device(key)
+            dev.visual = visual
+            dev.visual_preset = preset if visual is not None else ""
+            dev.visual_settings = dict(settings or {}) if visual is not None else {}
+            if visual is not None:
+                _only_source(dev, "visual")
+            self._save()
+
+    def visual_center(self) -> Path | None:
+        """The user's centre picture for audio visuals, if they picked one
+        (the visual checks the file when it opens)."""
+        path = self._app.visual_center
+        found = Path(path) if isinstance(path, str) and path else None
+        log.debug("visual_center: %s", found)
+        return found
+
+    def set_visual_center(self, path: str | None) -> None:
+        """Remember the user's centre picture (``None``: TRCC's icon)."""
+        log.info("set_visual_center: %s", path)
+        with self._lock:
+            self._app.visual_center = path
             self._save()
 
     def set_fit_mode(self, key: str, mode: FitMode) -> None:
@@ -1396,6 +1427,20 @@ def _tuple_of(size: int,
             return tuple(item(v) for v in value) if item else tuple(value)
         return value
     return convert
+
+
+#: The display sources -- what fills a panel's background.  One at a time:
+#: setting one clears the rest (``_only_source``).
+_DISPLAY_SOURCES = ("background_path", "screencast_region",
+                    "media_player_uri", "visual")
+
+
+def _only_source(dev: DeviceSettings, keep: str) -> None:
+    """Clear every display source on *dev* but *keep*."""
+    log.debug("_only_source: keep %s", keep)
+    for name in _DISPLAY_SOURCES:
+        if name != keep:
+            setattr(dev, name, None)
 
 
 def _rgb_list(value: Any) -> Any:

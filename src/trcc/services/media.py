@@ -22,8 +22,10 @@ from pathlib import Path
 from ..core import toolchain
 from ..core.errors import ThemeError
 from ..core.logs import per_frame
-from ..core.models import ZT_MAGIC
+from ..core.models import ZT_MAGIC, VisualSpec
+from ..core.ports import SoundInput, VisualEngine
 from .media_stream import StreamReader
+from .visual_stream import VisualReader
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -465,6 +467,8 @@ class MediaService:
     #: The reader a web source gets.  A class attribute so a test swaps in a
     #: fake without ffmpeg or a network (``tests/test_media_stream.py``).
     stream_reader: type[StreamReader] = StreamReader
+    #: The reader an audio visual gets; swapped the same way in a test.
+    visual_reader: type[VisualReader] = VisualReader
 
     def __init__(self, install_hint: Callable[[str], str]
                  = toolchain.generic_install_hint) -> None:
@@ -472,6 +476,7 @@ class MediaService:
         self._install_hint = install_hint
         self._playbacks: dict[str, Playback] = {}
         self._streams: dict[str, StreamReader] = {}
+        self._visuals: dict[str, VisualReader] = {}
 
     def load_video(self, device_key: str, path: Path,
                    size: tuple[int, int] | None,
@@ -575,9 +580,33 @@ class MediaService:
             log.info("close_stream: %s (%s)", device_key, reader.url)
             reader.close()
 
+    def open_visual(self, device_key: str, spec: VisualSpec,
+                    sound: Callable[[], SoundInput],
+                    engine: Callable[[], VisualEngine]) -> VisualReader:
+        """Start the visual *spec* names drawing *device_key*'s background
+        from what is playing, replacing any visual it had."""
+        log.info("open_visual: %s <- %s (%dx%d)", device_key, spec.kind,
+                 spec.width, spec.height)
+        self.close_visual(device_key)
+        reader = self._visuals[device_key] = self.visual_reader(
+            spec, sound, engine)
+        return reader
+
+    def visual(self, device_key: str) -> VisualReader | None:
+        frame_log.debug("visual: key=%s", device_key)
+        return self._visuals.get(device_key)
+
+    def close_visual(self, device_key: str) -> None:
+        """Stop *device_key*'s audio visual, if it has one (idempotent)."""
+        if (reader := self._visuals.pop(device_key, None)) is not None:
+            log.info("close_visual: %s (%s)", device_key, reader.name)
+            reader.close()
+
     def unload(self, device_key: str) -> None:
-        """Drop a playback, freeing its frame buffers -- and end a stream."""
+        """Drop a playback, freeing its frame buffers -- and end a stream
+        or an audio visual."""
         self.close_stream(device_key)
+        self.close_visual(device_key)
         had = self._playbacks.pop(device_key, None)
         if had is not None:
             log.info("unload: dropped %d-frame playback for %s",

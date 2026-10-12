@@ -26,6 +26,8 @@ def describe_source(source: str, background_mode: str,
               source, background_mode, media_player_uri)
     if source == "screencast":
         return "a screen cast"
+    if source == "visual":
+        return "an audio visual"
     if source == "media":
         uri = media_player_uri or ""
         shown = uri if "://" in uri else PurePath(uri).name

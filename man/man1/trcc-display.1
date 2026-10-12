@@ -1184,6 +1184,65 @@ Options:
 \fB\-\-help\fR
 Show this command's help and exit.
 .RE
+.SS visual
+.PP
+\fBtrcc display visual\fR \fIKEY\fR [\fINAME\fR] [\fIOPTIONS\fR]
+.PP
+Draw the panel's background from what is playing, with an audio visual \-\- or stop it.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.TP
+\fBNAME\fR
+The audio visual (see trcc display visuals); '' stops it.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-preset \fIPRESET\fR\fR
+A preset file, for a visual that draws presets.
+.TP
+\fB\-\-set \fISETTING\fR\fR
+NAME=VALUE for one slider; repeat for more.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS visual\-center
+.PP
+\fBtrcc display visual\-center\fR [\fIPATH\fR]
+.PP
+The picture in the middle of the audio visuals that show one.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBPATH\fR
+Any picture for the middle of a visual; '' for TRCC's icon.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS visuals
+.PP
+\fBtrcc display visuals\fR
+.PP
+List the audio visuals this computer can draw, and their presets.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
 .SH SEE ALSO
 \fBtrcc\fR(1)
 .SH REPORTING BUGS

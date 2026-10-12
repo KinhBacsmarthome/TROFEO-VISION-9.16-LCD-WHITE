@@ -33,12 +33,14 @@ from ...core.commands import (
     KeepAliveLoop,
     LcdSnapshot,
     ListMasks,
+    ListVisuals,
     LoadImage,
     LoadTheme,
     LoadVideo,
     LoopVideo,
     PauseVideo,
     PlayVideo,
+    PlayVisual,
     ProbeVideoDuration,
     RenderDcStandalone,
     ResolveOverlay,
@@ -60,10 +62,12 @@ from ...core.commands import (
     SetScreencastRegion,
     SetSlideshow,
     SetSplitMode,
+    SetVisualCenter,
     SleepDevice,
     StartScreencast,
     StopScreencast,
     StopVideo,
+    StopVisual,
     TickDisplay,
     UpdateOverlayElement,
     UploadBootAnimation,
@@ -106,6 +110,8 @@ from ...core.results import (
     VideoDurationResult,
     VideoExportResult,
     VideoResult,
+    VisualResult,
+    VisualsResult,
 )
 from ._shared import (
     admit_ws,
@@ -151,6 +157,8 @@ from .schemas import (
     ThemeRequest,
     ThemeResponse,
     VideoStatusResponse,
+    VisualCenterRequest,
+    VisualRequest,
 )
 
 log = logging.getLogger(__name__)
@@ -648,6 +656,21 @@ def media_player(key: str, body: MediaPlayerRequest,
     result = request.app.state.trcc.dispatch(
         SetMediaPlayer(key=key, uri=uri),
     )
+    http_error_if_failed(result)
+    return result
+
+
+@router.post("/visual")
+def visual(key: str, body: VisualRequest, request: Request) -> VisualResult:
+    """Draw *key*'s background from what is playing with an audio visual --
+    or stop it ('' as the visual).  The preset is checked by the visual,
+    which refuses one outside the visuals' folder."""
+    log.info("api POST /devices/{key}/display/visual: key=%s visual=%s",
+             key, body.visual)
+    command = (PlayVisual(key=key, visual=body.visual, preset=body.preset,
+                          settings=dict(body.sliders))
+               if body.visual else StopVisual(key=key))
+    result = request.app.state.trcc.dispatch(command)
     http_error_if_failed(result)
     return result
 
@@ -1241,6 +1264,25 @@ def upload_mask(key: str, body: MaskUploadRequest,
 
 
 meta_router = APIRouter(prefix="/display", tags=["display"])
+
+
+@meta_router.get("/visuals")
+def list_visuals(request: Request) -> VisualsResult:
+    """The audio visuals this computer can draw, their sliders and presets,
+    and the centre picture."""
+    log.info("api GET /display/visuals")
+    return request.app.state.trcc.dispatch(ListVisuals())
+
+
+@meta_router.post("/visual-center")
+def visual_center(body: VisualCenterRequest, request: Request) -> VisualsResult:
+    """The picture in the middle of the visuals that show one -- a file in
+    TRCC's own folders; '' for TRCC's icon."""
+    log.info("api POST /display/visual-center: %s", bool(body.path))
+    path = str(owned_path(request, body.path)) if body.path else ""
+    result = request.app.state.trcc.dispatch(SetVisualCenter(path=path))
+    http_error_if_failed(result)
+    return result
 
 
 @meta_router.get("/video-duration")

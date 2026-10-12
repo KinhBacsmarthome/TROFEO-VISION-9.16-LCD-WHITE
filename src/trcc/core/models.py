@@ -764,6 +764,15 @@ class DeviceSettings:
     # SaveTheme can bake it into a theme's ``media_player`` ref and a reload can
     # resume it.  Mutually exclusive with the other display-source toggles.
     media_player_uri: str | None = None
+    # Active audio visual -- its registry key (``VISUALS``), drawing the
+    # background from what is playing.  ``None`` = none.  Mutually exclusive
+    # with the other display sources, and resumed on a reconnect like the
+    # media player.  ``visual_preset`` is the preset file (relative to the
+    # visuals' folder) for a visual that draws presets; ``visual_settings``
+    # the slider values by name.
+    visual: str | None = None
+    visual_preset: str = ""
+    visual_settings: dict[str, float] = field(default_factory=dict)
     # Show / hide the mask overlay regardless of which mask source is active.
     mask_visible: bool = True
     # Background mode — what fills the LCD behind overlays.  Mirrors
@@ -1303,6 +1312,50 @@ SCREENCAST_DEFAULT_RECT: tuple[int, int, int, int] = (0, 0, 240, 320)
 #: The media player's cadence for a web source: 62.5 ms, the C# player's own
 #: step (``UCBoFangQiKongZhi.cs:1129``, ``nowTimerVal += 62.5``) -- 16 fps.
 STREAM_TICK_S = 0.0625
+#: What an audio visual hears: interleaved stereo float32 at this rate --
+#: what projectM takes (``projectm_pcm_add_float``).
+SOUND_RATE = 44100
+SOUND_CHANNELS = 2
+#: How often an audio visual draws: projectM's own default frame rate.  Its
+#: reader is paced by the sound itself -- 1/VISUAL_FPS of audio per frame.
+VISUAL_FPS = 30
+
+
+@dataclass(frozen=True, slots=True)
+class VisualAdjustment:
+    """One slider a visual offers; the Audio Visuals page draws it from
+    this, so a new visual needs no UI code."""
+    name: str
+    label: str
+    minimum: float
+    maximum: float
+    default: float
+
+
+@dataclass(frozen=True, slots=True)
+class VisualInfo:
+    """What an audio visual is, for the gallery: its registry key, its
+    title and category, whether it draws preset files or a centre picture,
+    and its sliders."""
+    kind: str
+    title: str
+    category: str
+    uses_presets: bool = False
+    uses_center: bool = False
+    adjustments: tuple[VisualAdjustment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VisualSpec:
+    """Everything an audio visual needs to start: which one, its preset
+    file (if it draws presets), the panel's size, the user's centre picture,
+    and the slider values by name."""
+    kind: str
+    width: int
+    height: int
+    preset: Path | None = None
+    center: Path | None = None
+    settings: Mapping[str, float] = field(default_factory=dict)
 
 #: The URL schemes the media player will open.  An allow-list, not a deny-list:
 #: ``file:///…`` contains ``://`` too, and would read any local file past the

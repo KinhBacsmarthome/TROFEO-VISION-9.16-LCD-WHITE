@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         RgbHardware,
         ScsiTransport,
         SmBus,
+        SoundInput,
     )
 
 from _refuse import refuse_while_trcc_runs
@@ -514,6 +515,8 @@ def _build_dev_platform(specs: list[dict] | None = None, *,
         ScriptedAuraController,
         ScriptedRamAccess,
         ScriptedRgbHardware,
+        SCRIPTED_VISUALS,
+        ScriptedSound,
         is_aura,
         scripted_bulk_transport,
         scripted_ram,
@@ -616,6 +619,14 @@ def _build_dev_platform(specs: list[dict] | None = None, *,
         def rgb_hardware(self) -> RgbHardware:
             log.debug("DevMockPlatform.rgb_hardware: scripted, not the host's")
             return self.rgb
+
+        # Audio visuals: a scripted beat, never the host's sound, and a
+        # scripted MilkDrop, never the host's GPU.
+        def sound_input(self) -> SoundInput:
+            log.debug("DevMockPlatform.sound_input: scripted, not the host's")
+            return ScriptedSound()
+
+        VISUALS = SCRIPTED_VISUALS
 
     log.info("DevMockPlatform: %d simulated device(s) on real %s base",
              len(parsed), host_cls.__name__)

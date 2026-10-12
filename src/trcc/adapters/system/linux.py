@@ -45,6 +45,7 @@ from ..sensors.gpu_detect import (
     detect_gpu_vendors,
     install_matching_gpu_extras,
 )
+from ..visual.sound import MonitorSoundInput
 from ._base import RELEASES_URL, BaseOS, BasePaths, download_and_install
 from ._desktop_entry import XdgDesktopEntry
 from ._polkit_install import POLKIT_POLICY
@@ -625,6 +626,9 @@ class LinuxOS(BaseOS, key="linux"):
 
     #: Find spots RGB controllers from sysfs -- no device is opened.
     RGB_HARDWARE = SysfsRgbHardware
+    #: Audio visuals: what is playing (the PulseAudio/PipeWire monitor),
+    #: drawn by projectM on an off-screen EGL surface.
+    SOUND_INPUT = MonitorSoundInput
 
     # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
 

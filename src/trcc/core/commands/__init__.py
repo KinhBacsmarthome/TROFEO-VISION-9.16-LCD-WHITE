@@ -167,6 +167,13 @@ from .theme import (
     SaveTheme,
     UploadCustomMask,
 )
+from .visual import (
+    CaptureVisualFrame,
+    ListVisuals,
+    PlayVisual,
+    SetVisualCenter,
+    StopVisual,
+)
 
 __all__ = [
     "AddOverlayElement",
@@ -175,6 +182,7 @@ __all__ = [
     "BuildPreview",
     "CaptureScreencastFrame",
     "CaptureStreamFrame",
+    "CaptureVisualFrame",
     "CheckForUpdate",
     "Command",
     "ConfigureSlideshow",
@@ -226,6 +234,7 @@ __all__ = [
     "ListMemorySlots",
     "ListSensors",
     "ListThemes",
+    "ListVisuals",
     "ListWebThemes",
     "LoadCloudTheme",
     "LoadImage",
@@ -235,6 +244,7 @@ __all__ = [
     "MarkFirstRunDone",
     "PauseVideo",
     "PlayVideo",
+    "PlayVisual",
     "PreviewSize",
     "ProbeVideoDuration",
     "ProvideApiTls",
@@ -307,12 +317,14 @@ __all__ = [
     "SetSplitMode",
     "SetTempUnit",
     "SetTimeFormat",
+    "SetVisualCenter",
     "SetWeekStart",
     "SleepDevice",
     "StartScreencast",
     "StopDaemon",
     "StopScreencast",
     "StopVideo",
+    "StopVisual",
     "TickDisplay",
     "TickGameMode",
     "ToggleLed",

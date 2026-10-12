@@ -74,6 +74,10 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "scoped: StreamDriver turns it; every UI reaches the capability "
         "through SetMediaPlayer with a web URL"
     )),
+    "CaptureVisualFrame": (frozenset(), (
+        "scoped: VisualDriver turns it; every UI reaches the capability "
+        "through PlayVisual / StopVisual"
+    )),
     "AdvanceSlideshow": (frozenset(), (
         "scoped: SlideshowDriver turns it; every UI reaches the capability "
         "through SetSlideshow, which owns the driver (2026-09-29) -- the gui's "
@@ -222,6 +226,22 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "dispatch was its window TEARDOWN, which blanked the daemon's panels "
         "for every UI and undid disconnects (removed 2026-09-29); App.close "
         "blanks on shutdown"
+    )),
+    "ListVisuals": (frozenset({"cli", "api"}), (
+        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
+        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
+    )),
+    "PlayVisual": (frozenset({"cli", "api"}), (
+        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
+        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
+    )),
+    "StopVisual": (frozenset({"cli", "api"}), (
+        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
+        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
+    )),
+    "SetVisualCenter": (frozenset({"cli", "api"}), (
+        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
+        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
     )),
     "ResetDevice": (frozenset({"cli", "api"}), (
         "gap: power-cycle + restore. It sat in exactly this blind spot, which is "

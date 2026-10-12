@@ -1688,6 +1688,8 @@ class _DeviceRenderObserver:
           against a 2 s sensor tick the panel alternated ~13 screen frames
           with one theme frame: the "blinking metrics mask" (2026-09-14).
         * **video** — the animation tick already sends at the video's fps.
+        * **stream / visual** — a web source or an audio visual: its driver
+          sends at its own rate, the theme's overlay composited on top.
           Measured on the mock 320x320 panel: 40 composites and 40 wire writes
           per 40 ``SensorsUpdated``, on top of the tick's own.
 
@@ -1714,6 +1716,8 @@ class _DeviceRenderObserver:
             return "screencast"
         if self._app.media.stream(key) is not None:
             return "stream"
+        if self._app.media.visual(key) is not None:
+            return "visual"
         playback = self._app.media.playback(key)
         if playback is not None and not playback.paused:
             return "video"

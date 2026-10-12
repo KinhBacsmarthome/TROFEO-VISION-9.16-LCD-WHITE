@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 
 from ._frames import pad_rows
@@ -61,6 +62,8 @@ if TYPE_CHECKING:
         SensorReading,
         Theme,
         UsbPowerState,
+        VisualInfo,
+        VisualSpec,
         WebPreviewInfo,
         Wire,
     )
@@ -1413,6 +1416,12 @@ class Paths(ABC):
         log.debug("theme_dir: %dx%d variant=%r", width, height, variant)
         return self.data_dir() / f"theme{width}{height}{variant}"
 
+    def visuals_dir(self) -> Path:
+        """Audio-visual presets (projectM / MilkDrop ``.milk``), any panel
+        size -- a preset draws at whatever size it is given."""
+        log.debug("visuals_dir")
+        return self.data_dir() / "visuals"
+
     def user_theme_dir(self, width: int, height: int) -> Path:
         """Per-resolution user-saved theme dir.
 
@@ -2426,6 +2435,89 @@ class CloudCatalog(ABC):
 # =========================================================================
 
 
+class SoundInput(ABC):
+    """What an audio visual hears: the computer's sound, live.
+
+    Concrete: ``MonitorSoundInput`` (``adapters/visual/sound.py``) -- what is
+    playing, through ffmpeg.  Interleaved stereo float32 at ``SOUND_RATE``.
+    ``read`` blocks until *frames* sample frames have arrived, so a reader
+    asking for 1/30 s of sound per picture is paced by the sound itself.
+    """
+
+    @abstractmethod
+    def open(self) -> None:
+        """Start listening; ``OSError`` when there is nothing to listen to."""
+
+    @abstractmethod
+    def read(self, frames: int) -> bytes:
+        """The next *frames* sample frames; ``b""`` once the sound has
+        ended."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Stop listening (idempotent); a blocked ``read`` returns."""
+
+
+class VisualEngine(ABC):
+    """Turns sound into pictures: one audio visual.
+
+    Concrete: the ``VISUALS`` registry (``adapters/visual/_base.py``) --
+    ``TrccPipes``, ``MilkdropVisual``.  Every call comes from ONE thread: a
+    visual may draw with OpenGL, whose context belongs to the thread that
+    made it.
+
+    The class answers what the gallery asks -- ``INFO``, whether this
+    machine can draw it, its preset files, whether a picture will do -- so
+    the Commands never touch a file: a visual that reads files does so here,
+    in its adapter.
+    """
+
+    #: What the visual is, for the gallery; every concrete visual sets it.
+    INFO: ClassVar[VisualInfo]
+
+    @classmethod
+    def available(cls) -> bool:
+        """Whether this machine has what the visual needs."""
+        log.debug("%s.available: yes", cls.__name__)
+        return True
+
+    @classmethod
+    def presets(cls, folder: Path) -> tuple[str, ...]:
+        """The preset files under *folder* this visual draws, relative to it;
+        none for a visual without presets."""
+        log.debug("%s.presets: none", cls.__name__)
+        return ()
+
+    @classmethod
+    def preset(cls, folder: Path, name: str) -> Path | None:
+        """*name* as one of this visual's presets under *folder*, or None."""
+        log.debug("%s.preset: %r -- none", cls.__name__, name)
+        return None
+
+    @classmethod
+    def picture_problem(cls, path: Path) -> str:
+        """Why *path* cannot be the centre picture; "" when it can."""
+        log.debug("%s.picture_problem: %s -- fine", cls.__name__, path)
+        return ""
+
+    @abstractmethod
+    def open(self, spec: VisualSpec) -> None:
+        """Start drawing *spec*; ``OSError`` when the engine or the graphics
+        it needs are missing."""
+
+    @abstractmethod
+    def feed(self, pcm: bytes) -> None:
+        """Sound for the next picture (``SoundInput.read``'s shape)."""
+
+    @abstractmethod
+    def render(self) -> RawFrame:
+        """The next picture, RGB24, top row first."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Free the engine and its graphics (idempotent)."""
+
+
 class CaptureNotReady(OSError):
     """The capture source is starting up and will answer later.
 
@@ -3013,6 +3105,41 @@ class Platform(ABC):
     #: ``BaseOS._transport_openers`` is, so an OS names it without a method
     #: of its own.  None: TRCC has no way to look on this OS yet.
     RGB_HARDWARE: ClassVar[type[RgbHardware] | None] = None
+
+    #: The OS adapter's ``SoundInput`` class -- a table entry like
+    #: ``RGB_HARDWARE``.  None: no sound for audio visuals on this OS yet.
+    SOUND_INPUT: ClassVar[type[SoundInput] | None] = None
+
+    def sound_input(self) -> SoundInput:
+        """What an audio visual hears.  ``OSError`` on an OS without one; a
+        stand-in platform scripts it, so no test hears the host."""
+        made = type(self).SOUND_INPUT
+        log.debug("sound_input: %s -> %s", type(self).__name__,
+                  getattr(made, "__name__", None))
+        if made is None:
+            raise OSError(f"audio visuals are not available on "
+                          f"{type(self).__name__} yet")
+        return made()
+
+    #: The audio visuals, by key -- a table entry like ``RGB_HARDWARE``:
+    #: the OS adapter names the ``VISUALS`` registry, a stand-in platform a
+    #: scripted one, so no test reaches the GPU.  Empty: none on this OS yet.
+    VISUALS: ClassVar[Mapping[str, type[VisualEngine]]] = MappingProxyType({})
+
+    def visual_class(self, kind: str) -> type[VisualEngine]:
+        """The audio visual registered as *kind*; ``OSError`` for none."""
+        table = type(self).VISUALS
+        log.debug("visual_class: %s in %s", kind, sorted(table))
+        if kind not in table:
+            raise OSError(f"no audio visual {kind!r} on {type(self).__name__}")
+        return table[kind]
+
+    def visual_catalog(self) -> tuple[VisualInfo, ...]:
+        """Every audio visual this machine can draw -- the gallery."""
+        infos = tuple(cls.INFO for cls in type(self).VISUALS.values()
+                      if cls.available())
+        log.debug("visual_catalog: %s", [i.kind for i in infos])
+        return infos
 
     def rgb_hardware(self) -> RgbHardware:
         """What Find reads to spot RGB controllers -- it opens nothing.  A

@@ -29,6 +29,7 @@ from .models import (
     RgbFollowMode,
     RgbLight,
     SensorReading,
+    VisualInfo,
     WebPreviewInfo,
 )
 
@@ -589,6 +590,26 @@ class ScreencastResult(Result):
 
 
 @dataclass(frozen=True, slots=True)
+class VisualResult(Result):
+    """Result of ``PlayVisual`` / ``StopVisual``: the audio visual on a
+    panel.  ``preset`` is relative to the visuals' folder; ``playing`` is
+    True while one draws the background."""
+    key: str = ""
+    preset: str = ""
+    playing: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VisualsResult(Result):
+    """``ListVisuals``: every audio visual this machine can draw, the preset
+    files (relative to the visuals' folder) for those that draw presets, and
+    the user's centre picture ("" for TRCC's icon)."""
+    visuals: tuple[VisualInfo, ...] = ()
+    presets: tuple[str, ...] = ()
+    center: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class MediaPlayerResult(Result):
     """Result of ``SetMediaPlayer`` — the media-player source (a local URI or a
     web URL/stream).  ``playing`` is True when the source started: a local file
@@ -821,7 +842,8 @@ class LcdSnapshotResult(Result):
     #: (background / screencast / video player, ``FormCZTV.ThemeSetting``).
     #: Derived once, here, from the three exclusive settings, so every UI's
     #: switches agree.  ``background_mode`` says whether a background is drawn.
-    display_source: Literal["background", "screencast", "media"] = "background"
+    display_source: Literal["background", "screencast", "media",
+                            "visual"] = "background"
     #: What the media player plays -- a local file or a web URL -- or None.
     media_player_uri: str | None = None
     #: The device's screencast region on screen, cast or not (the theme's, or

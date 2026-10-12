@@ -3428,6 +3428,7 @@ class LcdSnapshot(Query[LcdSnapshotResult]):
             screencast_region=s.screencast_region,
             display_source=("screencast" if s.screencast_region is not None
                             else "media" if s.media_player_uri
+                            else "visual" if s.visual
                             else "background"),
             media_player_uri=s.media_player_uri,
             screencast_rect=screencast_box(app, self.key),

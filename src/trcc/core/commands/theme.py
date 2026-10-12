@@ -1983,7 +1983,14 @@ class RestoreDeviceState(Command[ThemeResult]):
             )
 
         s = app.settings.for_device(self.key)
-        if s.media_player_uri:
+        if s.visual:
+            from .visual import PlayVisual
+            log.info("RestoreDeviceState: %s resuming its audio visual %s %r",
+                     self.key, s.visual, s.visual_preset)
+            app.dispatch(PlayVisual(key=self.key, visual=s.visual,
+                                    preset=s.visual_preset,
+                                    settings=dict(s.visual_settings)))
+        elif s.media_player_uri:
             log.info("RestoreDeviceState: %s resuming its media player %s",
                      self.key, s.media_player_uri)
             app.dispatch(SetMediaPlayer(key=self.key, uri=s.media_player_uri))

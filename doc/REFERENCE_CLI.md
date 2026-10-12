@@ -1111,6 +1111,44 @@ trcc display video-status KEY
 |---|---|
 | `KEY` | Device key, e.g. 0402:3922 |
 
+### `trcc display visual`
+
+Draw the panel's background from what is playing, with an audio visual -- or stop it.
+
+```bash
+trcc display visual [OPTIONS] KEY [NAME]
+```
+
+| Argument | Description |
+|---|---|
+| `KEY` | Device key, e.g. 0402:3922 |
+| `NAME` | The audio visual (see `trcc display visuals`); '' stops it. *(optional)* |
+
+| Option | Description |
+|---|---|
+| `--preset` `PRESET` | A preset file, for a visual that draws presets. |
+| `--set` `SETTING` | NAME=VALUE for one slider; repeat for more. |
+
+### `trcc display visual-center`
+
+The picture in the middle of the audio visuals that show one.
+
+```bash
+trcc display visual-center [PATH]
+```
+
+| Argument | Description |
+|---|---|
+| `PATH` | Any picture for the middle of a visual; '' for TRCC's icon. *(optional)* |
+
+### `trcc display visuals`
+
+List the audio visuals this computer can draw, and their presets.
+
+```bash
+trcc display visuals
+```
+
 ## `trcc led`
 
 RGB LED control.

@@ -22,12 +22,14 @@ from ...core.commands import (
     KeepAliveLoop,
     LcdSnapshot,
     ListMasks,
+    ListVisuals,
     LoadImage,
     LoadTheme,
     LoadVideo,
     LoopVideo,
     PauseVideo,
     PlayVideo,
+    PlayVisual,
     ProbeVideoDuration,
     RenderDcStandalone,
     ResolveOverlay,
@@ -48,10 +50,12 @@ from ...core.commands import (
     SetScreencastRegion,
     SetSlideshow,
     SetSplitMode,
+    SetVisualCenter,
     SleepDevice,
     StartScreencast,
     StopScreencast,
     StopVideo,
+    StopVisual,
     TickDisplay,
     ToggleVideo,
     UpdateOverlayElement,
@@ -1296,6 +1300,64 @@ def media_player(
     typer.echo(result.message)
     if not result.ok:
         raise typer.Exit(code=1)
+
+
+@app.command("visuals")
+def visuals() -> None:
+    """List the audio visuals this computer can draw, and their presets."""
+    log.info("cli display visuals")
+    result = get_app().dispatch(ListVisuals())
+    for info in result.visuals:
+        sliders = ", ".join(f"{a.name} {a.minimum:g}-{a.maximum:g}"
+                            for a in info.adjustments)
+        typer.echo(f"  {info.kind:<12} {info.title}  ({sliders})")
+    for name in result.presets:
+        typer.echo(f"    preset: {name}")
+    typer.echo(f"  centre picture: {result.center or 'TRCC icon'}")
+
+
+def _visual_settings(pairs: list[str]) -> dict[str, float]:
+    """``NAME=VALUE`` pairs as slider values."""
+    log.debug("_visual_settings: %s", pairs)
+    values: dict[str, float] = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        try:
+            values[name.strip()] = float(value)
+        except ValueError:
+            raise typer.BadParameter(f"a setting is NAME=VALUE -- got {pair!r}") from None
+        if not sep or not name.strip():
+            raise typer.BadParameter(f"a setting is NAME=VALUE -- got {pair!r}")
+    return values
+
+
+@app.command("visual")
+def visual(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    name: str = typer.Argument(
+        "", help="The audio visual (see `trcc display visuals`); '' stops it."),
+    preset: str = typer.Option(
+        "", "--preset", help="A preset file, for a visual that draws presets."),
+    setting: list[str] | None = typer.Option(
+        None, "--set", help="NAME=VALUE for one slider; repeat for more."),
+) -> None:
+    """Draw the panel's background from what is playing, with an audio
+    visual -- or stop it."""
+    log.info("cli display visual: key=%s name=%r preset=%r", key, name, preset)
+    command = (PlayVisual(key=key, visual=name, preset=preset,
+                          settings=_visual_settings(setting or []))
+               if name else StopVisual(key=key))
+    dispatch_echo(command)
+
+
+@app.command("visual-center")
+def visual_center(
+    path: str = typer.Argument(
+        "", help="Any picture for the middle of a visual; '' for TRCC's icon."),
+) -> None:
+    """The picture in the middle of the audio visuals that show one."""
+    log.info("cli display visual-center: %r", path)
+    dispatch_echo(SetVisualCenter(path=path))
 
 
 @app.command("snapshot")
