@@ -1141,6 +1141,24 @@ trcc display visual-center [PATH]
 |---|---|
 | `PATH` | Any picture for the middle of a visual; '' for TRCC's icon. *(optional)* |
 
+### `trcc display visual-tile`
+
+Save a visual's gallery tile: what it draws for noise.
+
+```bash
+trcc display visual-tile [OPTIONS] NAME
+```
+
+| Argument | Description |
+|---|---|
+| `NAME` | The audio visual (see `trcc display visuals`). |
+
+| Option | Description |
+|---|---|
+| `--output`, `-o` `OUTPUT` | Where to write the PNG. |
+| `--preset` `PRESET` | A preset, for a visual that draws presets. |
+| `--size` `SIZE` | Pixels a side. |
+
 ### `trcc display visuals`
 
 List the audio visuals this computer can draw, and their presets.

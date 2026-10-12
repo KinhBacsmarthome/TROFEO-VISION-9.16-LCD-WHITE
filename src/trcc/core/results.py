@@ -610,6 +610,16 @@ class VisualsResult(Result):
 
 
 @dataclass(frozen=True, slots=True)
+class VisualTileResult(Result):
+    """``VisualTile``: a visual's gallery tile, PNG-encoded -- what it draws
+    for noise, so the tile is the same whatever is playing."""
+    visual: str = ""
+    preset: str = ""
+    image: bytes = field(default=b"", repr=False)
+    media_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class MediaPlayerResult(Result):
     """Result of ``SetMediaPlayer`` — the media-player source (a local URI or a
     web URL/stream).  ``playing`` is True when the source started: a local file

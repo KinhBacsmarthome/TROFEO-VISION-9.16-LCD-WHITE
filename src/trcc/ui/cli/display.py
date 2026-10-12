@@ -62,6 +62,7 @@ from ...core.commands import (
     UploadBootAnimation,
     UploadCustomMask,
     VideoStatus,
+    VisualTile,
 )
 from ...core.errors import TrccError
 from ...core.models import CUTTER_DEFAULT_FPS, MEDIA, FitMode, MediaKind
@@ -1348,6 +1349,24 @@ def visual(
                           settings=_visual_settings(setting or []))
                if name else StopVisual(key=key))
     dispatch_echo(command)
+
+
+@app.command("visual-tile")
+def visual_tile(
+    name: str = typer.Argument(..., help="The audio visual (see `trcc display visuals`)."),
+    output: Path = typer.Option(..., "--output", "-o", help="Where to write the PNG."),
+    preset: str = typer.Option("", "--preset", help="A preset, for a visual that draws presets."),
+    size: int = typer.Option(120, "--size", help="Pixels a side."),
+) -> None:
+    """Save a visual's gallery tile: what it draws for noise."""
+    log.info("cli display visual-tile: %s %r size=%d -> %s", name, preset,
+             size, output)
+    result = get_app().dispatch(VisualTile(visual=name, preset=preset, size=size))
+    if not result.ok:
+        typer.echo(result.message)
+        raise typer.Exit(code=1)
+    output.write_bytes(result.image)
+    typer.echo(f"Saved {output} ({len(result.image)} bytes)")
 
 
 @app.command("visual-center")

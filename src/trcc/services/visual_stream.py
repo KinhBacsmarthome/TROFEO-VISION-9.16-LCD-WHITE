@@ -16,8 +16,16 @@ import logging
 import threading
 from collections.abc import Callable
 
+import numpy as np
+
 from ..core.logs import per_frame
-from ..core.models import SOUND_RATE, VISUAL_FPS, RawFrame, VisualSpec
+from ..core.models import (
+    SOUND_CHANNELS,
+    SOUND_RATE,
+    VISUAL_FPS,
+    RawFrame,
+    VisualSpec,
+)
 from ..core.ports import CaptureNotReady, SoundInput, VisualEngine
 
 log = logging.getLogger(__name__)
@@ -96,3 +104,31 @@ class VisualReader:
                 engine.close()
             if self._sound is not None:
                 self._sound.close()
+
+
+#: The gallery tile: this many pictures of noise in bursts, a burst every
+#: _TILE_BEAT pictures lasting _TILE_HIT -- the last picture is mid-burst.
+_TILE_FRAMES = 3 * 16 + 7          # ends 7 pictures into the 4th burst
+_TILE_BEAT = 16
+_TILE_HIT = 8
+
+
+def snapshot(spec: VisualSpec, engine: VisualEngine) -> RawFrame:
+    """What *engine* draws for noise -- the gallery's tile, the same
+    whatever the computer is playing.  White noise in bursts, like beats,
+    since a visual that answers hits draws nothing for a steady hiss."""
+    log.info("snapshot: %s at %dx%d", spec.preset.name if spec.preset
+             else spec.kind, spec.width, spec.height)
+    noise = np.random.default_rng(7)
+    size = SOUND_RATE // VISUAL_FPS * SOUND_CHANNELS
+    engine.open(spec)
+    try:
+        frame = engine.render()
+        for i in range(_TILE_FRAMES):
+            loud = 0.8 if i % _TILE_BEAT < _TILE_HIT else 0.05
+            engine.feed((noise.standard_normal(size) * loud)
+                        .astype("<f4").tobytes())
+            frame = engine.render()
+    finally:
+        engine.close()
+    return frame

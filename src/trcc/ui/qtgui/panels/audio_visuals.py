@@ -1,0 +1,129 @@
+"""AudioVisualsPanel -- the audio visuals gallery, next to Cloud themes.
+
+The same gallery as the gui skin's Eq tab, from the same Query: one tile per
+visual (and per preset), each the App's picture of what it draws for noise,
+TRCC Pipes first.  Pick a device and double-click a tile -- or Play -- and
+it becomes that panel's background; any other background ends it.
+"""
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon, QImage, QPixmap
+from PySide6.QtWidgets import (
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidgetItem,
+    QPushButton,
+    QVBoxLayout,
+)
+
+from ....core.commands import ListVisuals, PlayVisual, VisualTile
+from ....core.results import VisualsResult
+from ...presentation.visual_gallery import VisualItem, gallery_items
+from ...qt_background import dispatch_in_background
+from ...qt_visual_tiles import VisualTiles
+from ..device_picker import DevicePickerWidget
+from ._browser_base import AssetBrowserPanel
+
+if TYPE_CHECKING:
+    from PySide6.QtGui import QShowEvent
+
+log = logging.getLogger(__name__)
+
+#: Tile size asked of the App -- the grid's icon size.
+_TILE = 96
+
+
+class AudioVisualsPanel(AssetBrowserPanel):
+    """Pick an audio visual as a panel's background."""
+
+    def _setup_ui(self) -> None:
+        log.debug("AudioVisualsPanel._setup_ui")
+        self._listed = False
+        self._tiles = VisualTiles(self.app, self._tile_query, self._show_tile)
+        self._picker = DevicePickerWidget(
+            self.app, self._bus, kind_filter="lcd",
+            parent=self, selection=self._selection,
+        )
+        form = QFormLayout()
+        form.addRow("Device key:", self._picker)
+
+        self._list = self._build_asset_list()
+
+        self._play_btn = QPushButton("Play on this panel", self)
+        self._play_btn.clicked.connect(self._on_apply)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self._play_btn)
+        buttons.addStretch(1)
+
+        self._status = QLabel(
+            "What your computer is playing, drawn as the panel's background. "
+            "Pick one and press Play.", self)
+        self._status.setWordWrap(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(8)
+        root.addLayout(form)
+        root.addWidget(self._list, stretch=1)
+        root.addLayout(buttons)
+        root.addWidget(self._status)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """The gallery is listed the first time it is shown."""
+        log.debug("AudioVisualsPanel.showEvent: listed=%s", self._listed)
+        super().showEvent(event)
+        if not self._listed:
+            self.refresh()
+
+    def refresh(self) -> None:
+        """Ask the App for the visuals; the tiles follow, one at a time."""
+        log.info("AudioVisualsPanel.refresh")
+        self._listed = True
+        dispatch_in_background(self.app, ListVisuals(), self._on_listed)
+
+    def _on_listed(self, listed: VisualsResult) -> None:
+        log.info("AudioVisualsPanel._on_listed: ok=%s %s", listed.ok,
+                 listed.message)
+        self._list.clear()
+        items = gallery_items(listed) if listed.ok else []
+        for item in items:
+            row = QListWidgetItem(item.name)
+            row.setData(Qt.ItemDataRole.UserRole, item)
+            self._list.addItem(row)
+        if not listed.ok:
+            self._status.setText(listed.message)
+        self._tiles.fetch(items)
+
+    def _tile_query(self, item: VisualItem) -> VisualTile:
+        """The Query for *item*'s tile, at this grid's icon size."""
+        log.debug("AudioVisualsPanel._tile_query: %s", item.name)
+        return VisualTile(visual=item.visual, preset=item.preset, size=_TILE)
+
+    def _show_tile(self, item: VisualItem, png: bytes) -> None:
+        """A tile arrived from the App: onto its entry."""
+        log.debug("AudioVisualsPanel._show_tile: %s", item.name)
+        image = QImage.fromData(png)
+        for i in range(self._list.count()):
+            row = self._list.item(i)
+            if row.data(Qt.ItemDataRole.UserRole) == item and not image.isNull():
+                row.setIcon(QIcon(QPixmap.fromImage(image)))
+
+    def _on_apply(self) -> None:
+        """Play the picked visual on the picked panel."""
+        log.info("AudioVisualsPanel._on_apply")
+        row = self._list.currentItem()
+        if row is None:
+            self._status.setText("Pick an audio visual first.")
+            return
+        key = self._device_key()
+        if key is None:
+            return
+        item: VisualItem = row.data(Qt.ItemDataRole.UserRole)
+        result = self.dispatch(PlayVisual(key=key, visual=item.visual,
+                                          preset=item.preset))
+        self._status.setText(result.message)

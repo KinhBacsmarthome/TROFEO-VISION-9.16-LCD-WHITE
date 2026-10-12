@@ -104,6 +104,7 @@ from .uc_theme_mask import UCThemeMask
 from .uc_theme_setting import UCThemeSetting
 from .uc_theme_web import UCThemeWeb
 from .uc_video_cut import UCVideoCut
+from .uc_visuals import UCVisuals
 
 if TYPE_CHECKING:
     from ...core.ports import CommandBus
@@ -1031,6 +1032,10 @@ class TRCCApp(QMainWindow):
         self._set_panel_bg(self.uc_theme_mask, Assets.THEME_MASK_BG)
         self.panel_stack.addWidget(self.uc_theme_mask)
 
+        self.uc_visuals = UCVisuals(app=self._app)
+        self._set_panel_bg(self.uc_visuals, Assets.THEME_WEB_BG)
+        self.panel_stack.addWidget(self.uc_visuals)                # idx 4
+
         # Activity sidebar
         self.uc_activity_sidebar = UCActivitySidebar(self.form_container)
         self.uc_activity_sidebar.setGeometry(532, 128, 250, 500)
@@ -1110,6 +1115,8 @@ class TRCCApp(QMainWindow):
             (Layout.TAB_LOCAL, Assets.TAB_LOCAL, Assets.TAB_LOCAL_ACTIVE, 0, "Local themes"),
             (Layout.TAB_MASK, Assets.TAB_MASK, Assets.TAB_MASK_ACTIVE, 3, "Cloud masks"),
             (Layout.TAB_CLOUD, Assets.TAB_CLOUD, Assets.TAB_CLOUD_ACTIVE, 1, "Cloud backgrounds"),
+            (Layout.TAB_VISUALS, Assets.TAB_VISUALS, Assets.TAB_VISUALS_ACTIVE, 4,
+             "Audio visuals"),
             (Layout.TAB_SETTINGS, Assets.TAB_SETTINGS, Assets.TAB_SETTINGS_ACTIVE, 2, "Settings"),
         ]
         for rect, normal_img, active_img, panel_idx, tooltip in tab_configs:
@@ -1344,6 +1351,8 @@ class TRCCApp(QMainWindow):
 
         x, y, w, h, pt = ONLINE_THEME_POS
         _lbl(self.uc_theme_mask, tr('Cloud Masks', lang), x, y, w, h, pt, 'Cloud Masks')
+        _lbl(self.uc_visuals, tr('Audio visuals', lang), x, y, w, h, pt,
+             'Audio visuals')
 
         x, y, w, h, pt = GALLERY_TITLE_POS
         _lbl(self.uc_theme_web, tr('Gallery', lang), x, y, w, h, pt, 'Gallery')
@@ -1421,11 +1430,11 @@ class TRCCApp(QMainWindow):
             self._show_panel(panel_idx)
 
     def _show_panel(self, index: int) -> None:
+        log.info("_show_panel: %d", index)
         self.panel_stack.setCurrentIndex(index)
-        panel_to_button = {0: 0, 1: 2, 2: 3, 3: 1}
-        active_btn = panel_to_button.get(index, 0)
-        for i, btn in enumerate(self.mode_buttons):
-            btn.setChecked(i == active_btn)
+        # Each tab carries the panel it opens, so no second table can drift.
+        for btn in self.mode_buttons:
+            btn.setChecked(btn.property('panel_idx') == index)
         if index != 2:
             self.uc_activity_sidebar.setVisible(False)
 
@@ -1512,6 +1521,7 @@ class TRCCApp(QMainWindow):
         self.uc_theme_web.download_started.connect(self._on_theme_download_started)
         self.uc_theme_web.download_finished.connect(self._on_theme_download_finished)
         self.uc_theme_mask.mask_selected.connect(self._on_mask_clicked)
+        self.uc_visuals.theme_selected.connect(self._on_visual_clicked)
         self.uc_theme_mask.download_started.connect(self._on_mask_download_started)
         self.uc_theme_mask.download_finished.connect(self._on_mask_download_finished)
 
@@ -1697,6 +1707,15 @@ class TRCCApp(QMainWindow):
             )
             return
         h.select_cloud_theme(theme_info)
+
+    def _on_visual_clicked(self, item: Any) -> None:
+        log.info("_on_visual_clicked: %s %r", item.visual, item.preset)
+        h = self._active_lcd()
+        if h is None:
+            log.warning("_on_visual_clicked: no active LCD handler "
+                        "(active_key=%r) — click dropped", self._active_key)
+            return
+        h.play_visual(item.visual, item.preset)
 
     def _on_mask_clicked(self, mask_info: Any) -> None:
         log.debug("_on_mask_clicked: %s", getattr(mask_info, 'name', mask_info))

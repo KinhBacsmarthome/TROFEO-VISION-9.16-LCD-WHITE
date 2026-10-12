@@ -4,7 +4,7 @@
 
 Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
 
-**156 total: 112 Commands and 44 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+**157 total: 112 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
 
 ## Dispatching one
 
@@ -1700,3 +1700,15 @@ End the panel's audio visual: the theme's own background returns, its video play
 | Field | Type | Required |
 |---|---|---|
 | `key` | `str` | yes |
+
+### `VisualTile`
+
+The gallery tile for *visual* (and its *preset*): what it draws for noise, *size* pixels a side, as PNG -- the same whatever is playing, so every UI's gallery shows each visual the same way.
+
+*Query* → `VisualTileResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `visual` | `str` | yes |
+| `preset` | `str` | no |
+| `size` | `int` | no |

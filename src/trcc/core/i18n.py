@@ -251,6 +251,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         'Select all': '全選',
     },
     'en': {
+        'Audio visuals': 'Audio visuals',
         'Layer Mask': 'Layer Mask',
         'Masks': 'Masks',
         'Upload': 'Upload',

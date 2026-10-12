@@ -173,6 +173,7 @@ from .visual import (
     PlayVisual,
     SetVisualCenter,
     StopVisual,
+    VisualTile,
 )
 
 __all__ = [
@@ -334,4 +335,5 @@ __all__ = [
     "UploadBootAnimation",
     "UploadCustomMask",
     "VideoStatus",
+    "VisualTile",
 ]

@@ -227,14 +227,6 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "for every UI and undid disconnects (removed 2026-09-29); App.close "
         "blanks on shutdown"
     )),
-    "ListVisuals": (frozenset({"cli", "api"}), (
-        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
-        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
-    )),
-    "PlayVisual": (frozenset({"cli", "api"}), (
-        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
-        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
-    )),
     "StopVisual": (frozenset({"cli", "api"}), (
         "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
         "backgrounds) is the next step; CLI + API land first (2026-10-12)"

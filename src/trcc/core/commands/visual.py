@@ -17,9 +17,14 @@ from typing import TYPE_CHECKING, ClassVar
 
 from ..errors import DeviceNotFoundError
 from ..events import ErrorOccurred
-from ..models import Capability, VisualSpec
+from ..models import Capability, VisualInfo, VisualSpec
 from ..ports import CaptureNotReady
-from ..results import ScreencastResult, VisualResult, VisualsResult
+from ..results import (
+    ScreencastResult,
+    VisualResult,
+    VisualsResult,
+    VisualTileResult,
+)
 from ._base import Command, Query
 from .device import PlayVideo, SendScreencastFrame, StopVideo, _publish_background
 
@@ -27,6 +32,26 @@ if TYPE_CHECKING:
     from ...app import App
 
 log = logging.getLogger(__name__)
+
+#: The largest gallery tile a client may ask for, in pixels a side.
+MAX_TILE = 512
+
+
+def _resolve(app: App, visual: str,
+             preset: str) -> tuple[VisualInfo | None, Path | None, str]:
+    """The visual *visual* names and its *preset* file: ``(info, path,
+    problem)``, *problem* "" when both are there."""
+    info = next((v for v in app.platform.visual_catalog()
+                 if v.kind == visual), None)
+    path = (app.platform.visual_class(visual).preset(
+        app.platform.paths().visuals_dir(), preset)
+        if info is not None and info.uses_presets else None)
+    problem = (f"no audio visual {visual!r} on this computer" if info is None
+               else f"no preset {preset!r} in the visuals' folder"
+               if info.uses_presets and path is None else "")
+    log.debug("_resolve: %s %r -> %s %r", visual, preset, path, problem)
+    return info, path, problem
+
 
 @dataclass(frozen=True, slots=True)
 class ListVisuals(Query[VisualsResult]):
@@ -65,21 +90,13 @@ class PlayVisual(Command[VisualResult]):
 
         log.info("PlayVisual: %s <- %s %r %s", self.key, self.visual,
                  self.preset, self.settings)
-        info = next((v for v in app.platform.visual_catalog()
-                     if v.kind == self.visual), None)
-        preset = (app.platform.visual_class(self.visual).preset(
-            app.platform.paths().visuals_dir(), self.preset)
-            if info is not None and info.uses_presets else None)
+        info, preset, problem = _resolve(app, self.visual, self.preset)
         try:
             profile = app.get(self.key).profile
         except DeviceNotFoundError as e:
             return self._refuse(str(e))
-        problem = (f"no audio visual {self.visual!r} on this computer"
-                   if info is None
-                   else f"no preset {self.preset!r} in the visuals' folder"
-                   if info.uses_presets and preset is None
-                   else "the panel has not reported its size yet"
-                   if profile is None else "")
+        if not problem and profile is None:
+            problem = "the panel has not reported its size yet"
         if problem:
             return self._refuse(problem)
         assert info is not None and profile is not None
@@ -201,3 +218,37 @@ class SetVisualCenter(Command[VisualsResult]):
                              presets=listed.presets, center=listed.center,
                              message=("centre picture set" if self.path
                                       else "centre picture: TRCC's icon"))
+
+
+@dataclass(frozen=True, slots=True)
+class VisualTile(Query[VisualTileResult]):
+    """The gallery tile for *visual* (and its *preset*): what it draws for
+    noise, *size* pixels a side, as PNG -- the same whatever is playing, so
+    every UI's gallery shows each visual the same way."""
+    visual: str
+    preset: str = ""
+    size: int = 120
+
+    def execute(self, app: App) -> VisualTileResult:
+        from ...services.visual_stream import snapshot
+
+        log.info("VisualTile: %s %r at %d", self.visual, self.preset, self.size)
+        _info, preset, problem = _resolve(app, self.visual, self.preset)
+        if not 16 <= self.size <= MAX_TILE:
+            problem = f"a tile is 16 to {MAX_TILE} pixels a side"
+        if not problem:
+            spec = VisualSpec(self.visual, self.size, self.size, preset=preset,
+                              center=app.settings.visual_center())
+            try:
+                frame = snapshot(spec, app.platform.visual_class(self.visual)())
+            except OSError as e:
+                problem = f"{self.visual} could not draw: {e}"
+        if problem:
+            log.warning("VisualTile: %s %r refused: %s", self.visual,
+                        self.preset, problem)
+            return VisualTileResult(ok=False, visual=self.visual,
+                                    preset=self.preset, message=problem)
+        png = app.renderer.encode_png(app.renderer.from_raw_rgb24(frame))
+        return VisualTileResult(ok=True, visual=self.visual, preset=self.preset,
+                                image=png, media_type="image/png",
+                                message=f"{len(png)} bytes")

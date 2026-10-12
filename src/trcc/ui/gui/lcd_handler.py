@@ -37,6 +37,7 @@ from ...core.commands import (
     ListThemes,
     LoadCloudTheme,
     LoadTheme,
+    PlayVisual,
     PreviewSize,
     ResolveOverlay,
     ResolveThemeDirectories,
@@ -527,6 +528,15 @@ class LCDHandler(BaseHandler):
         if not persist or not self._device_key:
             self.log.warning("_select_theme_from_path: not persisting (persist=%s, key=%s)",
                              persist, self._device_key)
+
+    def play_visual(self, visual: str, preset: str) -> None:
+        """Make an audio visual this panel's background -- the App plays
+        it; picking any other background ends it."""
+        self.log.info("play_visual: %s %s %r", self._device_key, visual, preset)
+        result = self._app.dispatch(PlayVisual(
+            key=self._device_key, visual=visual, preset=preset))
+        if not result.ok:
+            self.log.warning("play_visual: %s", result.message)
 
     def select_cloud_theme(self, theme_info: Any) -> None:
         """Handle cloud theme selection — a BACKGROUND swap, not a

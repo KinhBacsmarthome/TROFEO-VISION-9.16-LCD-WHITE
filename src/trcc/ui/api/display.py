@@ -73,6 +73,7 @@ from ...core.commands import (
     UploadBootAnimation,
     UploadCustomMask,
     VideoStatus,
+    VisualTile,
 )
 from ...core.logs import per_frame
 from ...core.models import MEDIA, MediaKind
@@ -1272,6 +1273,20 @@ def list_visuals(request: Request) -> VisualsResult:
     and the centre picture."""
     log.info("api GET /display/visuals")
     return request.app.state.trcc.dispatch(ListVisuals())
+
+
+@meta_router.get("/visual-tile")
+def visual_tile(request: Request, visual: str, preset: str = "",
+                size: int = 120) -> Response:
+    """A visual's gallery tile as PNG -- what it draws for noise, the same
+    whatever is playing.  The preset is checked by the visual, which refuses
+    one outside the visuals' folder."""
+    log.info("api GET /display/visual-tile: %s size=%d", visual, size)
+    result = request.app.state.trcc.dispatch(
+        VisualTile(visual=visual, preset=preset, size=size))
+    if not result.ok:
+        raise HTTPException(404, result.message)
+    return Response(content=result.image, media_type=result.media_type)
 
 
 @meta_router.post("/visual-center")

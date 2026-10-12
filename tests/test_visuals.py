@@ -33,6 +33,7 @@ from trcc.core.commands import (
     SetMediaPlayer,
     SetVisualCenter,
     StopVisual,
+    VisualTile,
 )
 from trcc.core.events import ErrorOccurred
 from trcc.core.models import SOUND_RATE, VISUAL_FPS, RawFrame, VisualSpec
@@ -322,3 +323,48 @@ def test_the_api_plays_lists_and_confines_the_centre_picture(
     stopped = client.post(f"/devices/{_KEY}/display/visual", json={"visual": ""})
     assert stopped.status_code == 200
     assert app.settings.for_device(_KEY).visual is None
+
+
+
+def test_the_gallery_lists_trcc_pipes_first_and_one_tile_per_preset() -> None:
+    """Both windows build their tiles here, so they cannot list differently."""
+    from trcc.core.models import VisualInfo
+    from trcc.core.results import VisualsResult
+    from trcc.ui.presentation.visual_gallery import VisualItem, gallery_items
+
+    listed = VisualsResult(ok=True, visuals=(
+        VisualInfo("trcc-pipes", "TRCC Pipes", "TRCC"),
+        VisualInfo("milkdrop", "MilkDrop", "MilkDrop", uses_presets=True)),
+        presets=("geiss/Swirl.milk", "Flexi - Rain.milk"))
+    assert gallery_items(listed) == [
+        VisualItem("trcc-pipes", "", "TRCC Pipes"),
+        VisualItem("milkdrop", "geiss/Swirl.milk", "Swirl"),
+        VisualItem("milkdrop", "Flexi - Rain.milk", "Flexi - Rain")]
+
+
+def test_a_tile_is_what_the_visual_draws_for_noise(app: App) -> None:
+    tile = app.dispatch(VisualTile(visual="trcc-pipes", size=64))
+    assert (tile.ok, tile.media_type) == (True, "image/png")
+    image = QImage.fromData(tile.image)
+    assert (image.width(), image.height()) == (64, 64)
+    lit = {image.pixel(x, y) for x in range(0, 64, 4) for y in range(0, 64, 4)}
+    assert len(lit) > 8                                # pipes, not a blank tile
+
+
+def test_a_tile_is_refused_for_an_unknown_visual_or_size(app: App) -> None:
+    assert app.dispatch(VisualTile(visual="nope")).message == (
+        "no audio visual 'nope' on this computer")
+    assert app.dispatch(VisualTile(visual="trcc-pipes", size=4096)).message == (
+        "a tile is 16 to 512 pixels a side")
+
+
+def test_the_api_serves_a_tile_as_png(app: App) -> None:
+    from tests.conftest import loopback_client
+    from trcc.ui.api.main import build_app
+
+    client = loopback_client(build_app(app))
+    tile = client.get("/display/visual-tile", params={"visual": "trcc-pipes",
+                                                      "size": 32})
+    assert (tile.status_code, tile.headers["content-type"]) == (200, "image/png")
+    assert client.get("/display/visual-tile",
+                      params={"visual": "nope"}).status_code == 404
