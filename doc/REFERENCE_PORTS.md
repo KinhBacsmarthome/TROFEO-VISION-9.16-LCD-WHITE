@@ -41,7 +41,7 @@ Ordered **cheapest to extend first** — the ports at the top are where this cod
 | [`RamAccess`](#ramaccess) | 3 | 0 | 2 |
 | [`RgbMirror`](#rgbmirror) | 3 | 0 | 3 |
 | [`SendScheduler`](#sendscheduler) | 3 | 0 | 2 |
-| [`SoundInput`](#soundinput) | 3 | 0 | 1 |
+| [`SoundInput`](#soundinput) | 3 | 0 | 2 |
 | [`VoltageSource`](#voltagesource) | 3 | 0 | 1 |
 | [`_SharedRotatingFileHandler`](#_sharedrotatingfilehandler) | 3 | 4 | 2 |
 | [`CloudCatalog`](#cloudcatalog) | 4 | 0 | 1 |
@@ -577,7 +577,7 @@ open() -> None
 read(frames: 'int') -> bytes
 ```
 
-**Implementations (1):** `MonitorSoundInput`
+**Implementations (2):** `LoopbackSoundInput` · `MonitorSoundInput`
 
 ## VoltageSource
 

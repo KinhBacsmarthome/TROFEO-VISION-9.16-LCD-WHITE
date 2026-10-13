@@ -67,6 +67,9 @@ dependencies = [
     "prompt_toolkit>=3.0.0",
     "sounddevice>=0.4.6",
     "wmi>=1.5.1; sys_platform == 'win32'",
+    # Windows audio visuals: what is playing, by WASAPI loopback (ffmpeg has no
+    # WASAPI input).  BSD-3, pure Python over cffi (~44 KB), numpy already here.
+    "soundcard>=0.4.6; sys_platform == 'win32'",
     "certifi>=2023.7.22",
     # Linux hotplug: live device attach/detach + boot-time coldplug.  Without
     # it the udev monitor can't start, so a device plugged in after launch (or

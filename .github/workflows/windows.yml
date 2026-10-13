@@ -82,6 +82,7 @@ jobs:
             --hidden-import PySide6.QtSvg `
             --hidden-import pynvml `
             --hidden-import wmi `
+            --hidden-import soundcard `
             --collect-submodules trcc `
             --noconfirm `
             src/trcc/__main__.py
@@ -99,6 +100,7 @@ jobs:
             --hidden-import PySide6.QtSvg `
             --hidden-import pynvml `
             --hidden-import wmi `
+            --hidden-import soundcard `
             --collect-submodules trcc `
             --noconfirm `
             src/trcc/__main__.py

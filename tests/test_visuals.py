@@ -625,3 +625,100 @@ def test_the_reader_knows_silence_from_sound(
         assert reader.hearing is hearing
     finally:
         reader.close()
+
+
+# ── Windows: WASAPI loopback through soundcard ───────────────────────
+
+class _FakeRecorder:
+    """soundcard's recorder: frames x channels float32, as it returns."""
+
+    def __init__(self, fail: str = "") -> None:
+        self.fail, self.entered, self.exited = fail, False, False
+
+    def __enter__(self) -> _FakeRecorder:
+        if self.fail == "enter":
+            raise RuntimeError("Error 0x88890008")
+        self.entered = True
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.exited = True
+
+    def record(self, numframes: int) -> np.ndarray:
+        if self.fail == "record":
+            raise RuntimeError("Error 0x88890004")
+        left = np.arange(numframes, dtype=np.float32)
+        return np.stack([left, -left], axis=1)
+
+
+def _fake_soundcard(monkeypatch: pytest.MonkeyPatch,
+                    recorder: _FakeRecorder) -> list[tuple[str, bool]]:
+    import sys
+    import types
+
+    asked: list[tuple[str, bool]] = []
+    speaker = types.SimpleNamespace(id="{0.0.0.00000000}.{speakers}",
+                                    name="Speakers")
+
+    def get_microphone(id: str, include_loopback: bool = False) -> object:
+        asked.append((id, include_loopback))
+        return types.SimpleNamespace(recorder=lambda samplerate, channels:
+                                     recorder)
+
+    module = types.ModuleType("soundcard")
+    module.default_speaker = lambda: speaker            # type: ignore[attr-defined]
+    module.get_microphone = get_microphone              # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "soundcard", module)
+    from trcc.adapters.visual import loopback
+    monkeypatch.setattr(loopback.importlib.util, "find_spec",
+                        lambda name: object())
+    return asked
+
+
+def test_windows_hears_the_default_output_by_loopback(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.adapters.visual.loopback import LoopbackSoundInput
+
+    recorder = _FakeRecorder()
+    asked = _fake_soundcard(monkeypatch, recorder)
+    sound = LoopbackSoundInput()
+    sound.open()
+    pcm = sound.read(3)
+    sound.close()
+
+    assert asked == [("{0.0.0.00000000}.{speakers}", True)]     # by id, loopback
+    assert np.frombuffer(pcm, "<f4").tolist() == [0, -0, 1, -1, 2, -2]
+    assert recorder.entered and recorder.exited
+
+
+@pytest.mark.parametrize(("fail", "message"), [
+    ("enter", "Windows would not share its sound: Error 0x88890008"),
+    ("record", "Windows stopped sharing its sound: Error 0x88890004"),
+])
+def test_a_windows_sound_failure_is_an_oserror_the_reader_reports(
+        monkeypatch: pytest.MonkeyPatch, fail: str, message: str) -> None:
+    """The reader catches OSError -- soundcard raises RuntimeError."""
+    from trcc.adapters.visual.loopback import LoopbackSoundInput
+
+    _fake_soundcard(monkeypatch, _FakeRecorder(fail))
+    sound = LoopbackSoundInput()
+    with pytest.raises(OSError, match=message):
+        sound.open()
+        sound.read(3)
+
+
+def test_windows_without_soundcard_says_so(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.adapters.visual import loopback
+
+    monkeypatch.setattr(loopback.importlib.util, "find_spec", lambda name: None)
+    assert loopback.LoopbackSoundInput.problem() == (
+        "soundcard is not installed -- it is what hears the music for an "
+        "audio visual (pip install soundcard)")
+
+
+def test_windows_is_a_platform_that_hears() -> None:
+    from trcc.adapters.system.windows import WindowsPlatform
+    from trcc.adapters.visual.loopback import LoopbackSoundInput
+
+    assert WindowsPlatform.SOUND_INPUT is LoopbackSoundInput
