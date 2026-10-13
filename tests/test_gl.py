@@ -218,3 +218,46 @@ def test_burning_pipes_flame_in_fire_colours(tmp_path: Path) -> None:
     assert flames.sum() > 200
     assert (hot[flames][:, 0] >= hot[flames][:, 1]).all()
     assert (hot[flames][:, 1] >= hot[flames][:, 2]).all()
+
+
+class _CoreProfile(gl_module.EglSurface):
+    """macOS's kind of context, on EGL: a core profile, nothing older."""
+
+    def __init__(self) -> None:
+        super().__init__(core=True)
+
+
+@pytest.mark.skipif(_HOST_PIPES.SURFACE is not gl_module.EglSurface,  # type: ignore[attr-defined]
+                    reason="a core profile on demand is EGL's")
+def test_pipes_draw_the_same_in_macos_glsl_on_a_core_profile(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """macOS offers OpenGL only as a core profile, which takes no GLSL
+    1.30: there the shaders compile as 1.50.  Here, on EGL's core profile
+    with only the 1.50 headers allowed, TRCC Pipes -- tubes, balls, fire
+    and picture -- draws the frame it draws everywhere else.  The macOS
+    context itself (CGL) needs a Mac; this is everything after it.  What it
+    proves is that the 1.50 dialect draws -- not that a Mac refuses 1.30:
+    Linux core profiles take 1.30 and ``gl_FragColor`` too (NVIDIA and
+    Mesa, measured), Apple's do not.  MUTATION CHECK: leave the 1.50
+    header's ``trcc_colour`` undeclared -- both drivers refuse it."""
+    picture = tmp_path / "white.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB888)
+    image.fill(0xFFFFFF)
+    image.save(str(picture))
+
+    def frame(pipes: type) -> np.ndarray:
+        random.seed(5)
+        engine = pipes()
+        engine.open(VisualSpec("trcc-pipes", 96, 96, center=picture,
+                               center_fire=1.0))
+        try:
+            drawn = _music(engine, 24)
+        finally:
+            engine.close()
+        return np.frombuffer(drawn.data, np.uint8).reshape(96, 96, 3).astype(int)  # type: ignore[attr-defined]
+
+    usual = frame(_HOST_PIPES)
+    monkeypatch.setattr(gl_module, "_HEADERS", gl_module._HEADERS[1:])
+    core = frame(drawn_on(_CoreProfile)["trcc-pipes"])
+    assert (usual.max(axis=2) > 30).sum() > 500           # it drew something
+    assert np.abs(usual - core).max() <= 1

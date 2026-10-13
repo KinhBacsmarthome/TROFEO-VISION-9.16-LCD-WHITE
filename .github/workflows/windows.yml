@@ -174,6 +174,26 @@ jobs:
           }
           Write-Host "PASSED — the frozen trcc.exe runs"
 
+      - name: Smoke-draw TRCC Pipes in the frozen app
+        # TRCC Pipes draws with OpenGL.  This runner has no graphics card --
+        # Windows offers only its own OpenGL 1.1 ("GDI Generic"), which TRCC
+        # refuses -- so the tile draws only if WglSurface.open finds the
+        # software OpenGL Qt ships (opengl32sw.dll) beside PySide6 in the
+        # bundle.  That is the case of every VM, Remote Desktop session and
+        # box without its graphics driver.  Drawing a gallery tile needs no
+        # sound card and no panel.
+        timeout-minutes: 5
+        run: |
+          $tile = Join-Path $env:RUNNER_TEMP "pipes.png"
+          $out = & dist\trcc\trcc.exe display visual-tile trcc-pipes -o $tile --size 64 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tile)) {
+            Get-ChildItem "dist/trcc/_internal/PySide6/opengl32sw.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  bundled: $($_.FullName)" }
+            Write-Error "FAILED — the frozen app could not draw TRCC Pipes (exit $LASTEXITCODE)"
+            exit 1
+          }
+          Write-Host "PASSED — the frozen app draws TRCC Pipes without a graphics card"
+
       - name: Extract version
         id: version
         run: |
