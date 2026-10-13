@@ -612,6 +612,8 @@ class VisualsResult(Result):
     playing: str = ""
     preset: str = ""
     sliders: dict[str, float] = field(default_factory=dict)
+    #: Whether that panel's visual hears any sound right now.
+    hearing: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -28,7 +28,7 @@ from ....core.commands import (
     SetVisualSettings,
     VisualTile,
 )
-from ....core.events import BackgroundChanged
+from ....core.events import BackgroundChanged, VisualHearingChanged
 from ....core.results import VisualsResult
 from ...presentation.visual_gallery import VisualItem, gallery_items
 from ...qt_background import dispatch_in_background
@@ -127,7 +127,8 @@ class AudioVisualsPanel(AssetBrowserPanel):
     def _on_settings_changed(self, event: object) -> None:
         """Another UI -- or this one -- changed the picked panel's
         background: show what it plays now."""
-        if (isinstance(event, BackgroundChanged) and self._listed
+        if (isinstance(event, (BackgroundChanged, VisualHearingChanged))
+                and self._listed
                 and event.key == self._picker.current_key()):
             log.debug("AudioVisualsPanel._on_settings_changed: %s", event.key)
             self._ask_playing()

@@ -1322,7 +1322,9 @@ def visuals(
         sliders = ", ".join(f"{n} {v:g}" for n, v in result.sliders.items())
         typer.echo(f"  {key} plays: {result.playing or 'no audio visual'}"
                    + (f" {result.preset}" if result.preset else "")
-                   + (f" ({sliders})" if sliders else ""))
+                   + (f" ({sliders})" if sliders else "")
+                   + (" -- hearing nothing" if result.playing
+                      and not result.hearing else ""))
 
 
 def _visual_settings(pairs: list[str]) -> dict[str, float]:

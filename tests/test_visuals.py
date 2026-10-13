@@ -8,6 +8,7 @@ host's sound card or GPU.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -175,6 +176,7 @@ class _FakeReader:
     def __init__(self, spec: VisualSpec, sound: Any, engine: Any) -> None:
         self.spec, self.name, self.closed = spec, spec.kind, False
         self.fail, self.ready = "", True
+        self.hearing = self.announced = True
 
     def latest(self) -> RawFrame:
         if self.fail:
@@ -540,3 +542,53 @@ def test_the_reader_hands_sliders_to_its_engine_between_pictures() -> None:
         reader.close()
     assert seen[-1] == ("trcc-visual", {"fire": 1.0})
     assert dict(reader.spec.settings) == {"fire": 1.0}
+
+
+# ── hearing nothing ─────────────────────────────────────────────────
+
+def test_the_uis_hear_when_the_visual_stops_and_starts_hearing(
+        app: App) -> None:
+    """On the change only -- never a line per tick.  MUTATION CHECK: drop
+    the ``!= reader.announced`` guard and this hears every tick."""
+    from trcc.core.events import VisualHearingChanged
+
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes"))
+    reader = _reader(app)
+    heard: list[VisualHearingChanged] = []
+    app.events.subscribe(VisualHearingChanged, heard.append)
+
+    app.dispatch(CaptureVisualFrame(key=_KEY))
+    reader.hearing = False
+    for _ in range(3):
+        app.dispatch(CaptureVisualFrame(key=_KEY))
+    assert not app.dispatch(ListVisuals(key=_KEY)).hearing
+    reader.hearing = True
+    app.dispatch(CaptureVisualFrame(key=_KEY))
+
+    assert [(e.key, e.hearing) for e in heard] == [(_KEY, False), (_KEY, True)]
+    assert app.dispatch(ListVisuals(key=_KEY)).hearing
+
+
+class _Silence(ScriptedSound):
+    """Paced like the real input, and nothing playing."""
+
+    def read(self, frames: int) -> bytes:
+        super().read(frames)
+        return bytes(frames * 4 * 2)
+
+
+@pytest.mark.parametrize(("sound", "hearing"), [(_Silence, False),
+                                                (ScriptedSound, True)])
+def test_the_reader_knows_silence_from_sound(
+        monkeypatch: pytest.MonkeyPatch, sound: type, hearing: bool) -> None:
+    """The real reader: silence is how a blocked capture looks on every OS."""
+    from trcc.services import visual_stream
+    from trcc.services.visual_stream import VisualReader
+
+    monkeypatch.setattr(visual_stream, "_SILENCE_S", 0.3)
+    reader = VisualReader(VisualSpec("trcc-pipes", 32, 32), sound, TrccPipes)
+    try:
+        time.sleep(0.6)
+        assert reader.hearing is hearing
+    finally:
+        reader.close()

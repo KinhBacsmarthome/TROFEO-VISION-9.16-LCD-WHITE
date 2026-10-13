@@ -22,7 +22,7 @@ from ...core.commands import (
     SetVisualSettings,
     VisualTile,
 )
-from ...core.events import BackgroundChanged
+from ...core.events import BackgroundChanged, VisualHearingChanged
 from ...core.results import VisualsResult
 from ..presentation.visual_gallery import VisualItem, gallery_items
 from ..qt_background import dispatch_in_background
@@ -127,9 +127,10 @@ class UCVisuals(BaseThemeBrowser):
 
     def on_settings_changed(self, event: object) -> None:
         """Another UI -- or this one -- changed the active panel's
-        background: show what it plays now."""
-        if (isinstance(event, BackgroundChanged) and event.key == self._key
-                and self._listed):
+        background, or its visual started or stopped hearing sound: show
+        what it plays now."""
+        if (isinstance(event, (BackgroundChanged, VisualHearingChanged))
+                and event.key == self._key and self._listed):
             log.debug("UCVisuals.on_settings_changed: %s", event.key)
             self._ask_playing()
 

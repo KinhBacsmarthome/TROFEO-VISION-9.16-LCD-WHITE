@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 
@@ -33,6 +34,12 @@ log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
 
 
+#: Below this a sample is silence; this long of nothing else is "hearing
+#: nothing".
+_QUIET = 1e-4
+_SILENCE_S = 3.0
+
+
 class VisualReader:
     """The visual *spec* names, drawn from what *sound* hears; the newest
     picture, on demand."""
@@ -48,6 +55,9 @@ class VisualReader:
         self._sound: SoundInput | None = None
         self._lock = threading.Lock()
         self._adjusted: Mapping[str, float] | None = None
+        self._heard_at = time.monotonic()
+        #: What the App last told the UIs -- ``CaptureVisualFrame`` keeps it.
+        self.announced = True
         self._latest: RawFrame | None = None
         self._error = ""
         self._stop = threading.Event()
@@ -64,6 +74,13 @@ class VisualReader:
             raise CaptureNotReady(f"{self.name}: starting")
         frame_log.debug("VisualReader.latest: %s", self.name)
         return self._latest
+
+    @property
+    def hearing(self) -> bool:
+        """Whether it heard anything above silence in the last few seconds."""
+        hearing = time.monotonic() - self._heard_at < _SILENCE_S
+        frame_log.debug("VisualReader.hearing: %s %s", self.name, hearing)
+        return hearing
 
     def adjust(self, settings: Mapping[str, float]) -> None:
         """New slider values: the engine takes them on its own thread before
@@ -104,6 +121,8 @@ class VisualReader:
                     adjusted, self._adjusted = self._adjusted, None
                 if adjusted is not None:
                     engine.adjust(adjusted)
+                if np.abs(np.frombuffer(pcm, dtype="<f4")).max(initial=0.0) > _QUIET:
+                    self._heard_at = time.monotonic()
                 engine.feed(pcm)
                 self._latest = engine.render()
                 pictures += 1

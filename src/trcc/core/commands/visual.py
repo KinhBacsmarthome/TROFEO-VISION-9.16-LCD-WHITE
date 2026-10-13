@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from ..errors import DeviceNotFoundError
-from ..events import ErrorOccurred
+from ..events import ErrorOccurred, VisualHearingChanged
 from ..models import Capability, VisualInfo, VisualSpec
 from ..ports import CaptureNotReady
 from ..results import (
@@ -90,6 +90,7 @@ class ListVisuals(Query[VisualsResult]):
                         for name in app.platform.visual_class(v.kind).presets(base))
         center = app.settings.visual_center()
         s = app.settings.for_device(self.key) if self.key else None
+        reader = app.media.visual(self.key) if self.key else None
         log.info("ListVisuals: %s, %d preset(s), centre %s, %s plays %s",
                  [v.kind for v in visuals], len(presets), center,
                  self.key or "-", s.visual if s else None)
@@ -97,7 +98,8 @@ class ListVisuals(Query[VisualsResult]):
                              center=str(center or ""),
                              playing=(s.visual or "") if s else "",
                              preset=s.visual_preset if s else "",
-                             sliders=dict(s.visual_settings) if s else {})
+                             sliders=dict(s.visual_settings) if s else {},
+                             hearing=reader is not None and reader.hearing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +265,12 @@ class CaptureVisualFrame(Command[ScreencastResult]):
             app.events.publish(ErrorOccurred(message=str(e), kind="video",
                                              key=self.key))
             return ScreencastResult(ok=False, key=self.key, message=str(e))
+        if (hearing := reader.hearing) != reader.announced:
+            reader.announced = hearing
+            log.info("CaptureVisualFrame: %s %s", self.key,
+                     "hears sound again" if hearing else "hears nothing")
+            app.events.publish(VisualHearingChanged(key=self.key,
+                                                    hearing=hearing))
         return app.dispatch(SendScreencastFrame(key=self.key, frame=frame))
 
 

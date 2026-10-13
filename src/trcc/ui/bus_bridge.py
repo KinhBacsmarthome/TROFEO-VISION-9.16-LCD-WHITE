@@ -76,6 +76,7 @@ from ..core.events import (
     VideoPauseChanged,
     VideoStarted,
     VideoStopped,
+    VisualHearingChanged,
 )
 from ..core.logs import per_frame, recurring_warning
 
@@ -248,6 +249,7 @@ class BusBridge(QObject):
             (FitModeChanged, self.settings_changed),
             (OverlayChanged, self.settings_changed),
             (BackgroundChanged, self.settings_changed),
+            (VisualHearingChanged, self.settings_changed),
             (MaskApplied, self.settings_changed),
             (MaskPositionChanged, self.settings_changed),
             (MaskVisibilityChanged, self.settings_changed),

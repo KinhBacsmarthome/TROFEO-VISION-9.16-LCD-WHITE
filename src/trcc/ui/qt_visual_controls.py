@@ -96,6 +96,9 @@ class VisualControls(QWidget):
         self._hint.setText(
             "Pick an audio visual above -- its sliders show here."
             if info is None else
+            "Hearing nothing -- play some music.  If music IS playing, TRCC "
+            "cannot hear this computer's sound output."
+            if not listed.hearing else
             "Let go of a slider and the visual changes as it plays.")
 
     def _add_slider(self, row: int, adjustment: VisualAdjustment,
