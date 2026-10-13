@@ -172,6 +172,7 @@ from .visual import (
     ListVisuals,
     PlayVisual,
     SetVisualCenter,
+    SetVisualSettings,
     StopVisual,
     VisualTile,
 )
@@ -319,6 +320,7 @@ __all__ = [
     "SetTempUnit",
     "SetTimeFormat",
     "SetVisualCenter",
+    "SetVisualSettings",
     "SetWeekStart",
     "SleepDevice",
     "StartScreencast",

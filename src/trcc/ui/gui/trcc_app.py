@@ -512,6 +512,7 @@ class TRCCApp(QMainWindow):
         # answers is already logged at INFO by the App.
         log.debug("_on_bus_settings_changed: %s key=%s",
                   type(event).__name__, event.key)
+        self.uc_visuals.on_settings_changed(event)
         handler = self._handlers.get(event.key)
         if handler is not None:
             handler.follow_app()
@@ -781,6 +782,7 @@ class TRCCApp(QMainWindow):
             'theme_local': self.uc_theme_local,
             'theme_web': self.uc_theme_web,
             'theme_mask': self.uc_theme_mask,
+            'visuals': self.uc_visuals,
             'image_cut': self.uc_image_cut,
             'video_cut': self.uc_video_cut,
             'rotation_combo': self.rotation_combo,

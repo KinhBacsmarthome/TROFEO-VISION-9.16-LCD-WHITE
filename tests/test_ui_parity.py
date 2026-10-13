@@ -231,10 +231,6 @@ KNOWN_UI_ASYMMETRY: dict[str, tuple[frozenset[str], str]] = {
         "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
         "backgrounds) is the next step; CLI + API land first (2026-10-12)"
     )),
-    "SetVisualCenter": (frozenset({"cli", "api"}), (
-        "gap: audio visuals -- the Audio Visuals page (the EQ tab beside Cloud "
-        "backgrounds) is the next step; CLI + API land first (2026-10-12)"
-    )),
     "ResetDevice": (frozenset({"cli", "api"}), (
         "gap: power-cycle + restore. It sat in exactly this blind spot, which is "
         "why nobody noticed it was DisconnectDevice byte-for-byte for the "

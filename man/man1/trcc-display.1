@@ -1231,6 +1231,28 @@ Options:
 \fB\-\-help\fR
 Show this command's help and exit.
 .RE
+.SS visual\-set
+.PP
+\fBtrcc display visual\-set\fR \fIKEY\fR [\fIOPTIONS\fR]
+.PP
+Move the playing audio visual's sliders \-\- live, it keeps playing.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-set \fISETTING\fR\fR
+NAME=VALUE for one slider; repeat for more.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
 .SS visual\-tile
 .PP
 \fBtrcc display visual\-tile\fR \fINAME\fR [\fIOPTIONS\fR]
@@ -1261,9 +1283,16 @@ Show this command's help and exit.
 .RE
 .SS visuals
 .PP
-\fBtrcc display visuals\fR
+\fBtrcc display visuals\fR [\fIKEY\fR]
 .PP
 List the audio visuals this computer can draw, and their presets.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+A device key: also show what it plays.
+.RE
 .PP
 Options:
 .RS 4

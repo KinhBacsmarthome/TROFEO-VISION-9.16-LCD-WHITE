@@ -2518,6 +2518,11 @@ class VisualEngine(ABC):
         """Sound for the next picture (``SoundInput.read``'s shape)."""
 
     @abstractmethod
+    def adjust(self, settings: Mapping[str, float]) -> None:
+        """New slider values while it plays -- called on its own thread,
+        between pictures; it keeps playing."""
+
+    @abstractmethod
     def render(self) -> RawFrame:
         """The next picture, RGB24, top row first."""
 

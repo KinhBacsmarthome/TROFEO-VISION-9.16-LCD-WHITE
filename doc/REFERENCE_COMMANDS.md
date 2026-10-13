@@ -4,7 +4,7 @@
 
 Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
 
-**157 total: 112 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+**158 total: 113 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
 
 ## Dispatching one
 
@@ -1662,11 +1662,13 @@ One tick of an audio visual: its newest picture, onto the panel.
 
 ### `ListVisuals`
 
-Every audio visual this machine can draw, and the preset files for the ones that draw presets -- the Audio Visuals page's gallery.
+Every audio visual this machine can draw, and the preset files for the ones that draw presets -- the Audio Visuals page's gallery.  With a *key*, also what that panel plays and its slider values, so a window shows the same truth every other UI does.
 
 *Query* → `VisualsResult`
 
-Takes no arguments.
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | no |
 
 ### `PlayVisual`
 
@@ -1683,13 +1685,24 @@ Draw the panel's background with the audio visual *visual* (a ``VISUALS`` key), 
 
 ### `SetVisualCenter`
 
-The centre picture for audio visuals that show one -- any image the user picks; an empty *path* goes back to TRCC's icon.  A panel playing such a visual picks it up when the visual next starts.
+The centre picture for audio visuals that show one -- any image the user picks; an empty *path* goes back to TRCC's icon.  Every panel playing such a visual starts it again, so the picture shows at once.
 
 *Command* → `VisualsResult`
 
 | Field | Type | Required |
 |---|---|---|
 | `path` | `str` | no |
+
+### `SetVisualSettings`
+
+New slider values for the panel's audio visual -- live: it keeps playing and takes them before its next picture.  Only the sliders named change; each is kept within its range; a name the visual has no slider for is refused.  Saved, so a restart plays them.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `settings` | `dict[str, float]` | no |
 
 ### `StopVisual`
 

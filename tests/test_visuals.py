@@ -32,6 +32,7 @@ from trcc.core.commands import (
     RestoreDeviceState,
     SetMediaPlayer,
     SetVisualCenter,
+    SetVisualSettings,
     StopVisual,
     VisualTile,
 )
@@ -185,6 +186,9 @@ class _FakeReader:
 
     def close(self) -> None:
         self.closed = True
+
+    def adjust(self, settings: Any) -> None:
+        self.adjusted = dict(settings)
 
 
 @pytest.fixture
@@ -448,3 +452,91 @@ def test_the_gallery_carries_why_a_visual_cannot_play() -> None:
     listed = VisualsResult(ok=True, visuals=(
         VisualInfo("trcc-pipes", "TRCC Pipes", "TRCC", problem="no sound"),))
     assert [i.problem for i in gallery_items(listed)] == ["no sound"]
+
+
+
+# ── live sliders, from every UI ──────────────────────────────────────
+
+def test_sliders_change_the_playing_visual_live(app: App) -> None:
+    """Merged with what was set, kept in range, saved, handed to the reader
+    -- which keeps playing -- and announced so every UI follows."""
+    from trcc.core.events import BackgroundChanged
+
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes",
+                            settings={"growth": 2.0}))
+    reader = _reader(app)
+    heard: list[BackgroundChanged] = []
+    app.events.subscribe(BackgroundChanged, heard.append)
+
+    moved = app.dispatch(SetVisualSettings(key=_KEY, settings={"fire": 9.0}))
+
+    assert moved.ok and moved.playing
+    assert reader.adjusted == {"growth": 2.0, "fire": 1.0}       # clamped
+    assert _reader(app) is reader                                # not restarted
+    assert app.settings.for_device(_KEY).visual_settings == reader.adjusted
+    assert [e.key for e in heard] == [_KEY]
+    listed = app.dispatch(ListVisuals(key=_KEY))
+    assert (listed.playing, listed.sliders) == ("trcc-pipes", reader.adjusted)
+
+
+def test_a_slider_the_visual_lacks_is_refused_out_loud(app: App) -> None:
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes"))
+    heard: list[ErrorOccurred] = []
+    app.events.subscribe(ErrorOccurred, heard.append)
+
+    refused = app.dispatch(SetVisualSettings(key=_KEY, settings={"warp": 1.0}))
+
+    assert (refused.ok, refused.message) == (
+        False, "TRCC Pipes has no slider warp")
+    assert [e.message for e in heard] == [refused.message]
+    assert app.settings.for_device(_KEY).visual_settings == {}
+
+
+def test_sliders_need_a_playing_visual(app: App) -> None:
+    refused = app.dispatch(SetVisualSettings(key=_KEY, settings={"fire": 1.0}))
+    assert (refused.ok, refused.message) == (
+        False, f"no audio visual plays on {_KEY}")
+
+
+def test_a_new_centre_picture_shows_at_once(app: App, tmp_path: Path) -> None:
+    """The playing visual starts again with it, sliders kept."""
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes",
+                            settings={"fire": 0.5}))
+    before = _reader(app)
+    picture = tmp_path / "bob.png"
+    QImage(4, 4, QImage.Format.Format_ARGB32).save(str(picture))
+
+    assert app.dispatch(SetVisualCenter(path=str(picture))).ok
+
+    after = _reader(app)
+    assert after is not before and before.closed
+    assert (after.spec.center, dict(after.spec.settings)) == (picture,
+                                                               {"fire": 0.5})
+
+
+def test_the_reader_hands_sliders_to_its_engine_between_pictures() -> None:
+    """On the engine's own thread, before the next picture -- never while
+    it draws.  The real VisualReader, a scripted beat, a recording engine."""
+    import threading
+
+    from trcc.services.visual_stream import VisualReader
+
+    seen: list[tuple[str, object]] = []
+    adjusted = threading.Event()
+
+    class Recording(TrccPipes):
+        def adjust(self, settings: Any) -> None:
+            seen.append((threading.current_thread().name, dict(settings)))
+            super().adjust(settings)
+            if seen[-1][1] == {"fire": 1.0}:
+                adjusted.set()
+
+    reader = VisualReader(VisualSpec("trcc-pipes", 64, 64), ScriptedSound,
+                          Recording)
+    try:
+        reader.adjust({"fire": 1.0})
+        assert adjusted.wait(5)
+    finally:
+        reader.close()
+    assert seen[-1] == ("trcc-visual", {"fire": 1.0})
+    assert dict(reader.spec.settings) == {"fire": 1.0}

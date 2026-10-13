@@ -62,6 +62,7 @@ def _commands(key: str, tmp: Path) -> list[Command[Any]]:
         C.ExportCurrentTheme(key=key, archive_path=tmp / "out.tr"),
         C.PlayVisual(key=key, visual="trcc-pipes"),
         C.StopVisual(key=key),
+        C.SetVisualSettings(key=key, settings={"fire": 1.0}),
     ]
 
 

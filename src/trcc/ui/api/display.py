@@ -63,6 +63,7 @@ from ...core.commands import (
     SetSlideshow,
     SetSplitMode,
     SetVisualCenter,
+    SetVisualSettings,
     SleepDevice,
     StartScreencast,
     StopScreencast,
@@ -160,6 +161,7 @@ from .schemas import (
     VideoStatusResponse,
     VisualCenterRequest,
     VisualRequest,
+    VisualSettingsRequest,
 )
 
 log = logging.getLogger(__name__)
@@ -672,6 +674,18 @@ def visual(key: str, body: VisualRequest, request: Request) -> VisualResult:
                           settings=dict(body.sliders))
                if body.visual else StopVisual(key=key))
     result = request.app.state.trcc.dispatch(command)
+    http_error_if_failed(result)
+    return result
+
+
+@router.post("/visual/settings")
+def visual_settings(key: str, body: VisualSettingsRequest,
+                    request: Request) -> VisualResult:
+    """Move *key*'s playing audio visual's sliders -- live."""
+    log.info("api POST /devices/{key}/display/visual/settings: key=%s %s",
+             key, sorted(body.sliders))
+    result = request.app.state.trcc.dispatch(
+        SetVisualSettings(key=key, settings=dict(body.sliders)))
     http_error_if_failed(result)
     return result
 
@@ -1268,11 +1282,12 @@ meta_router = APIRouter(prefix="/display", tags=["display"])
 
 
 @meta_router.get("/visuals")
-def list_visuals(request: Request) -> VisualsResult:
+def list_visuals(request: Request, key: str = "") -> VisualsResult:
     """The audio visuals this computer can draw, their sliders and presets,
-    and the centre picture."""
-    log.info("api GET /display/visuals")
-    return request.app.state.trcc.dispatch(ListVisuals())
+    and the centre picture -- with ``?key=``, also what that panel plays and
+    its slider values."""
+    log.info("api GET /display/visuals: key=%r", key)
+    return request.app.state.trcc.dispatch(ListVisuals(key=key))
 
 
 @meta_router.get("/visual-tile")

@@ -64,10 +64,22 @@ def _sound_problem(app: App) -> str:
     return problem
 
 
+def _refused(app: App, command: str, key: str, preset: str,
+             problem: str) -> VisualResult:
+    """*command* refused before anything changed -- and said where the user
+    is looking: every open UI hears the ``ErrorOccurred``."""
+    log.warning("%s: %s refused: %s", command, key, problem)
+    app.events.publish(ErrorOccurred(message=problem, kind="visual", key=key))
+    return VisualResult(ok=False, key=key, preset=preset, message=problem)
+
+
 @dataclass(frozen=True, slots=True)
 class ListVisuals(Query[VisualsResult]):
     """Every audio visual this machine can draw, and the preset files for
-    the ones that draw presets -- the Audio Visuals page's gallery."""
+    the ones that draw presets -- the Audio Visuals page's gallery.  With a
+    *key*, also what that panel plays and its slider values, so a window
+    shows the same truth every other UI does."""
+    key: str = ""
 
     def execute(self, app: App) -> VisualsResult:
         problem = _sound_problem(app)
@@ -77,10 +89,15 @@ class ListVisuals(Query[VisualsResult]):
         presets = tuple(name for v in visuals if v.uses_presets
                         for name in app.platform.visual_class(v.kind).presets(base))
         center = app.settings.visual_center()
-        log.info("ListVisuals: %s, %d preset(s), centre %s",
-                 [v.kind for v in visuals], len(presets), center)
+        s = app.settings.for_device(self.key) if self.key else None
+        log.info("ListVisuals: %s, %d preset(s), centre %s, %s plays %s",
+                 [v.kind for v in visuals], len(presets), center,
+                 self.key or "-", s.visual if s else None)
         return VisualsResult(ok=True, visuals=visuals, presets=presets,
-                             center=str(center or ""))
+                             center=str(center or ""),
+                             playing=(s.visual or "") if s else "",
+                             preset=s.visual_preset if s else "",
+                             sliders=dict(s.visual_settings) if s else {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,14 +150,8 @@ class PlayVisual(Command[VisualResult]):
                             message=f"{info.title} on {self.key}")
 
     def _refuse(self, app: App, problem: str) -> VisualResult:
-        """Refused before anything changed -- and said where the user is
-        looking: every open UI hears the ``ErrorOccurred``."""
-        log.warning("PlayVisual: %s refused %s: %s", self.key, self.visual,
-                    problem)
-        app.events.publish(ErrorOccurred(message=problem, kind="visual",
-                                         key=self.key))
-        return VisualResult(ok=False, key=self.key, preset=self.preset,
-                            message=problem)
+        log.debug("PlayVisual._refuse: %s", self.visual)
+        return _refused(app, "PlayVisual", self.key, self.preset, problem)
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +180,46 @@ class StopVisual(Command[VisualResult]):
         _publish_background(app, self.key)
         return VisualResult(ok=True, key=self.key,
                             message=f"audio visual ended on {self.key}")
+
+
+@dataclass(frozen=True, slots=True)
+class SetVisualSettings(Command[VisualResult]):
+    """New slider values for the panel's audio visual -- live: it keeps
+    playing and takes them before its next picture.  Only the sliders named
+    change; each is kept within its range; a name the visual has no slider
+    for is refused.  Saved, so a restart plays them."""
+    USES_DEVICE: ClassVar[bool] = True
+    REQUIRES: ClassVar[Capability | None] = Capability.BACKGROUND
+    key: str
+    settings: dict[str, float] = field(default_factory=dict)
+
+    def execute(self, app: App) -> VisualResult:
+        log.info("SetVisualSettings: %s %s", self.key, self.settings)
+        s = app.settings.for_device(self.key)
+        info = next((v for v in app.platform.visual_catalog()
+                     if v.kind == s.visual), None)
+        if s.visual is None or info is None:
+            return _refused(app, "SetVisualSettings", self.key, "",
+                            f"no audio visual plays on {self.key}")
+        sliders = {a.name: a for a in info.adjustments}
+        if unknown := sorted(set(self.settings) - set(sliders)):
+            return _refused(app, "SetVisualSettings", self.key,
+                            s.visual_preset,
+                            f"{info.title} has no slider {', '.join(unknown)}")
+        values = {**s.visual_settings,
+                  **{name: min(max(float(value), sliders[name].minimum),
+                               sliders[name].maximum)
+                     for name, value in self.settings.items()}}
+        app.settings.set_visual(self.key, s.visual, s.visual_preset, values)
+        reader = app.media.visual(self.key)
+        if reader is not None:
+            reader.adjust(values)
+        _publish_background(app, self.key)
+        return VisualResult(ok=True, key=self.key, preset=s.visual_preset,
+                            playing=reader is not None,
+                            message=f"{info.title}: "
+                                    + ", ".join(f"{n} {v:g}"
+                                                for n, v in values.items()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,8 +269,8 @@ class CaptureVisualFrame(Command[ScreencastResult]):
 @dataclass(frozen=True, slots=True)
 class SetVisualCenter(Command[VisualsResult]):
     """The centre picture for audio visuals that show one -- any image the
-    user picks; an empty *path* goes back to TRCC's icon.  A panel playing
-    such a visual picks it up when the visual next starts."""
+    user picks; an empty *path* goes back to TRCC's icon.  Every panel
+    playing such a visual starts it again, so the picture shows at once."""
     path: str = ""
 
     def execute(self, app: App) -> VisualsResult:
@@ -232,6 +283,15 @@ class SetVisualCenter(Command[VisualsResult]):
             log.warning("SetVisualCenter: refused -- %s", problem)
             return VisualsResult(ok=False, message=problem)
         app.settings.set_visual_center(self.path or None)
+        centred = {v.kind for v in app.platform.visual_catalog() if v.uses_center}
+        for key in list(app.devices):
+            s = app.settings.for_device(key)
+            if s.visual in centred and app.media.visual(key) is not None:
+                log.info("SetVisualCenter: %s plays %s -- starting it again",
+                         key, s.visual)
+                app.dispatch(PlayVisual(key=key, visual=s.visual,
+                                        preset=s.visual_preset,
+                                        settings=dict(s.visual_settings)))
         listed = app.dispatch(ListVisuals())
         return VisualsResult(ok=True, visuals=listed.visuals,
                              presets=listed.presets, center=listed.center,

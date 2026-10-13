@@ -1141,6 +1141,22 @@ trcc display visual-center [PATH]
 |---|---|
 | `PATH` | Any picture for the middle of a visual; '' for TRCC's icon. *(optional)* |
 
+### `trcc display visual-set`
+
+Move the playing audio visual's sliders -- live, it keeps playing.
+
+```bash
+trcc display visual-set [OPTIONS] KEY
+```
+
+| Argument | Description |
+|---|---|
+| `KEY` | Device key, e.g. 0402:3922 |
+
+| Option | Description |
+|---|---|
+| `--set` `SETTING` | NAME=VALUE for one slider; repeat for more. |
+
 ### `trcc display visual-tile`
 
 Save a visual's gallery tile: what it draws for noise.
@@ -1164,8 +1180,12 @@ trcc display visual-tile [OPTIONS] NAME
 List the audio visuals this computer can draw, and their presets.
 
 ```bash
-trcc display visuals
+trcc display visuals [KEY]
 ```
+
+| Argument | Description |
+|---|---|
+| `KEY` | A device key: also show what it plays. *(optional)* |
 
 ## `trcc led`
 

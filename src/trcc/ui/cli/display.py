@@ -51,6 +51,7 @@ from ...core.commands import (
     SetSlideshow,
     SetSplitMode,
     SetVisualCenter,
+    SetVisualSettings,
     SleepDevice,
     StartScreencast,
     StopScreencast,
@@ -1304,10 +1305,12 @@ def media_player(
 
 
 @app.command("visuals")
-def visuals() -> None:
+def visuals(
+    key: str = typer.Argument("", help="A device key: also show what it plays."),
+) -> None:
     """List the audio visuals this computer can draw, and their presets."""
-    log.info("cli display visuals")
-    result = get_app().dispatch(ListVisuals())
+    log.info("cli display visuals: key=%r", key)
+    result = get_app().dispatch(ListVisuals(key=key))
     for info in result.visuals:
         sliders = ", ".join(f"{a.name} {a.minimum:g}-{a.maximum:g}"
                             for a in info.adjustments)
@@ -1315,6 +1318,11 @@ def visuals() -> None:
     for name in result.presets:
         typer.echo(f"    preset: {name}")
     typer.echo(f"  centre picture: {result.center or 'TRCC icon'}")
+    if key:
+        sliders = ", ".join(f"{n} {v:g}" for n, v in result.sliders.items())
+        typer.echo(f"  {key} plays: {result.playing or 'no audio visual'}"
+                   + (f" {result.preset}" if result.preset else "")
+                   + (f" ({sliders})" if sliders else ""))
 
 
 def _visual_settings(pairs: list[str]) -> dict[str, float]:
@@ -1349,6 +1357,17 @@ def visual(
                           settings=_visual_settings(setting or []))
                if name else StopVisual(key=key))
     dispatch_echo(command)
+
+
+@app.command("visual-set")
+def visual_set(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    setting: list[str] = typer.Option(
+        ..., "--set", help="NAME=VALUE for one slider; repeat for more."),
+) -> None:
+    """Move the playing audio visual's sliders -- live, it keeps playing."""
+    log.info("cli display visual-set: key=%s %s", key, setting)
+    dispatch_echo(SetVisualSettings(key=key, settings=_visual_settings(setting)))
 
 
 @app.command("visual-tile")

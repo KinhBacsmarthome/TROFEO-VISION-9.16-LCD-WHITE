@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -245,14 +246,9 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         log.info("TrccPipes.open: %dx%d centre=%s settings=%s", spec.width,
                  spec.height, spec.center, dict(spec.settings))
         self._w, self._h = spec.width, spec.height
-        values = {a.name: a.default for a in self.INFO.adjustments}
-        values.update(spec.settings)
-        self._growth = float(values["growth"])
-        self._thickness = float(values["thickness"])
-        self._center_size = float(values["center_size"])
-        self._fire = float(values["fire"])
+        self.adjust(spec.settings)
         picture = spec.center if spec.center is not None else DEFAULT_CENTER
-        if self._center_size > 0 and picture.is_file():
+        if picture.is_file():
             from PySide6.QtGui import QImage
             image = QImage(str(picture))
             if image.isNull():
@@ -260,6 +256,16 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
             else:
                 self._center = image
         self._new_round()
+
+    def adjust(self, settings: Mapping[str, float]) -> None:
+        """The sliders: each at *settings*' value, else its default."""
+        values = {a.name: a.default for a in self.INFO.adjustments}
+        values.update(settings)
+        log.info("TrccPipes.adjust: %s", values)
+        self._growth = float(values["growth"])
+        self._thickness = float(values["thickness"])
+        self._center_size = float(values["center_size"])
+        self._fire = float(values["fire"])
 
     def feed(self, pcm: bytes) -> None:
         samples = np.frombuffer(pcm, dtype="<f4")
@@ -297,7 +303,8 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._redraw()
         gain = 1.0 + 0.35 * min(self._beat, 1.0)
         out = self._color * gain
-        layer = self._picture_layer() if self._center is not None else None
+        layer = (self._picture_layer()
+                 if self._center is not None and self._center_size > 0 else None)
         if self._fire > 0:
             # The pipes burn as the picture does: red-hot, flames rising off
             # every pipe and off the picture's outline.

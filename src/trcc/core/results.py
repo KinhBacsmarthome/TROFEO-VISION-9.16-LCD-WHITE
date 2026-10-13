@@ -607,6 +607,11 @@ class VisualsResult(Result):
     visuals: tuple[VisualInfo, ...] = ()
     presets: tuple[str, ...] = ()
     center: str = ""
+    #: Asked for one panel (``ListVisuals(key=...)``): the visual it plays
+    #: ("" for none), that visual's preset and its slider values.
+    playing: str = ""
+    preset: str = ""
+    sliders: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

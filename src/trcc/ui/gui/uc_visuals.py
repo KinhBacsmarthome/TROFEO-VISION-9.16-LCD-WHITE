@@ -16,13 +16,20 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
 
-from ...core.commands import ListVisuals, VisualTile
+from ...core.commands import (
+    ListVisuals,
+    SetVisualCenter,
+    SetVisualSettings,
+    VisualTile,
+)
+from ...core.events import BackgroundChanged
 from ...core.results import VisualsResult
 from ..presentation.visual_gallery import VisualItem, gallery_items
 from ..qt_background import dispatch_in_background
+from ..qt_visual_controls import VisualControls
 from ..qt_visual_tiles import VisualTiles
 from .base import BaseThemeBrowser, BaseThumbnail
-from .constants import Colors, Sizes
+from .constants import Colors, Sizes, Styles
 
 if TYPE_CHECKING:
     from PySide6.QtGui import QShowEvent
@@ -69,17 +76,62 @@ class VisualThumbnail(BaseThumbnail):
             Qt.TransformationMode.SmoothTransformation)))
 
 
+#: The gallery above, the playing visual's controls below (within the
+#: 732x652 panel).
+_GALLERY = (0, 50, 732, 430)
+_CONTROLS = (24, 492, 684, 150)
+#: The controls in the classic skin's colours; the groove shows on the dark
+#: panel, which the shared slider style leaves transparent.
+_CONTROLS_STYLE = (
+    f"QLabel {{ color: {Colors.TEXT}; background: transparent; }}"
+    f"QPushButton {{ background: {Colors.BUTTON_BG}; color: "
+    f"{Colors.BUTTON_TEXT}; border: 1px solid {Colors.HOVER_BORDER}; "
+    f"padding: 4px 12px; }}"
+    + Styles.SLIDER
+    + f"QSlider::groove:horizontal {{ background: {Colors.BUTTON_BG}; "
+      f"height: 6px; border-radius: 3px; }}")
+
+
 class UCVisuals(BaseThemeBrowser):
-    """The Audio visuals gallery.  ``theme_selected`` carries the clicked
+    """The Audio visuals gallery, and the controls of the visual the active
+    panel plays.  ``theme_selected`` carries the clicked
     :class:`VisualItem`."""
 
     def __init__(self, parent=None, app: CommandBus | None = None) -> None:
         log.info("UCVisuals.__init__: app=%s", app is not None)
         self._app = app
+        self._key = ""
         self._listed = False
         self._tiles = (VisualTiles(app, self._tile_query, self._show_tile)
                        if app is not None else None)
+        self._controls: VisualControls | None = None
         super().__init__(parent)
+
+    def _setup_ui(self) -> None:
+        """The cloud gallery's grid, shorter, with the controls below it."""
+        log.debug("UCVisuals._setup_ui")
+        super()._setup_ui()
+        self.scroll_area.setGeometry(*_GALLERY)
+        if self._app is not None:
+            self._controls = VisualControls(self._app, self._sliders_command,
+                                            self._center_command, self)
+            self._controls.setGeometry(*_CONTROLS)
+            self._controls.setStyleSheet(_CONTROLS_STYLE)
+
+    def set_device_key(self, key: str) -> None:
+        """The panel the window works on -- its visual's controls show."""
+        log.info("UCVisuals.set_device_key: %s -> %s", self._key, key)
+        self._key = key
+        if self._listed:
+            self._ask_playing()
+
+    def on_settings_changed(self, event: object) -> None:
+        """Another UI -- or this one -- changed the active panel's
+        background: show what it plays now."""
+        if (isinstance(event, BackgroundChanged) and event.key == self._key
+                and self._listed):
+            log.debug("UCVisuals.on_settings_changed: %s", event.key)
+            self._ask_playing()
 
     def _create_thumbnail(self, item_info: VisualItem) -> VisualThumbnail:
         log.debug("UCVisuals._create_thumbnail: %s", item_info.name)
@@ -103,7 +155,8 @@ class UCVisuals(BaseThemeBrowser):
             return
         log.info("UCVisuals.refresh")
         self._listed = True
-        dispatch_in_background(self._app, ListVisuals(), self._on_listed)
+        dispatch_in_background(self._app, ListVisuals(key=self._key),
+                               self._on_listed)
 
     def _on_listed(self, listed: VisualsResult) -> None:
         log.info("UCVisuals._on_listed: ok=%s %s", listed.ok, listed.message)
@@ -112,6 +165,37 @@ class UCVisuals(BaseThemeBrowser):
         self._populate_grid(items)
         if self._tiles is not None:
             self._tiles.fetch(items)
+        self._on_playing(listed)
+
+    def _ask_playing(self) -> None:
+        """What the active panel plays -- for the controls and the tile."""
+        if self._app is None:
+            log.debug("UCVisuals._ask_playing: no App")
+            return
+        log.debug("UCVisuals._ask_playing: %s", self._key)
+        dispatch_in_background(self._app, ListVisuals(key=self._key),
+                               self._on_playing)
+
+    def _on_playing(self, listed: VisualsResult) -> None:
+        """Its tile selected, its controls shown."""
+        log.debug("UCVisuals._on_playing: %s %r", listed.playing, listed.preset)
+        playing = next((w.item_info for w in self.item_widgets
+                        if isinstance(w, VisualThumbnail)
+                        and (w.item_info.visual, w.item_info.preset)
+                        == (listed.playing, listed.preset)), None)
+        self._select_item(playing)
+        if self._controls is not None:
+            self._controls.show_for(listed)
+
+    def _sliders_command(self, values: dict[str, float]) -> SetVisualSettings:
+        """The Command for new slider values, for the active panel."""
+        log.debug("UCVisuals._sliders_command: %s %s", self._key, values)
+        return SetVisualSettings(key=self._key, settings=values)
+
+    def _center_command(self, path: str) -> SetVisualCenter:
+        """The Command for a new centre picture ("" for TRCC's icon)."""
+        log.debug("UCVisuals._center_command: %r", path)
+        return SetVisualCenter(path=path)
 
     def _tile_query(self, item: VisualItem) -> VisualTile:
         """The Query for *item*'s tile, at this grid's tile size."""

@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar
 
@@ -244,6 +245,13 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
         lib.projectm_set_beat_sensitivity(
             self._handle, float(spec.settings.get("beat_sensitivity", 1.0)))
         lib.projectm_load_preset_file(self._handle, str(preset).encode(), False)
+
+    def adjust(self, settings: Mapping[str, float]) -> None:
+        """Beat sensitivity: how hard the preset answers the beat."""
+        value = float(settings.get("beat_sensitivity", 1.0))
+        log.info("MilkdropVisual.adjust: beat sensitivity %.2f", value)
+        if self._lib is not None and self._handle:
+            self._lib.projectm_set_beat_sensitivity(self._handle, value)
 
     def feed(self, pcm: bytes) -> None:
         if self._lib is None or not self._handle or not pcm:

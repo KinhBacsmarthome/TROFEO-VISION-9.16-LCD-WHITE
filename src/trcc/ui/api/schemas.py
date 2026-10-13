@@ -648,6 +648,12 @@ class VisualRequest(BaseModel):
     sliders: dict[str, float] = Field(default_factory=dict, max_length=16)
 
 
+class VisualSettingsRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/visual/settings``: slider
+    values by name for the playing visual."""
+    sliders: dict[str, float] = Field(default_factory=dict, max_length=16)
+
+
 class VisualCenterRequest(BaseModel):
     """Body for ``POST /display/visual-center``: a picture in TRCC's own
     folders; '' for TRCC's icon."""

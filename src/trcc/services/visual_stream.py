@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 
 import numpy as np
 
@@ -45,6 +46,8 @@ class VisualReader:
                  spec.height)
         self._make_sound, self._make_engine = sound, engine
         self._sound: SoundInput | None = None
+        self._lock = threading.Lock()
+        self._adjusted: Mapping[str, float] | None = None
         self._latest: RawFrame | None = None
         self._error = ""
         self._stop = threading.Event()
@@ -61,6 +64,14 @@ class VisualReader:
             raise CaptureNotReady(f"{self.name}: starting")
         frame_log.debug("VisualReader.latest: %s", self.name)
         return self._latest
+
+    def adjust(self, settings: Mapping[str, float]) -> None:
+        """New slider values: the engine takes them on its own thread before
+        its next picture, and keeps playing."""
+        log.info("VisualReader.adjust: %s %s", self.name, dict(settings))
+        with self._lock:
+            self.spec = replace(self.spec, settings=dict(settings))
+            self._adjusted = dict(settings)
 
     def close(self) -> None:
         """Stop listening and drawing (idempotent)."""
@@ -89,6 +100,10 @@ class VisualReader:
                         log.warning("VisualReader: %s -- %s",
                                     self.name, self._error)
                     break
+                with self._lock:
+                    adjusted, self._adjusted = self._adjusted, None
+                if adjusted is not None:
+                    engine.adjust(adjusted)
                 engine.feed(pcm)
                 self._latest = engine.render()
                 pictures += 1

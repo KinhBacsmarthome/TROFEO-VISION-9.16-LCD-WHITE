@@ -21,10 +21,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ....core.commands import ListVisuals, PlayVisual, VisualTile
+from ....core.commands import (
+    ListVisuals,
+    PlayVisual,
+    SetVisualCenter,
+    SetVisualSettings,
+    VisualTile,
+)
+from ....core.events import BackgroundChanged
 from ....core.results import VisualsResult
 from ...presentation.visual_gallery import VisualItem, gallery_items
 from ...qt_background import dispatch_in_background
+from ...qt_visual_controls import VisualControls
 from ...qt_visual_tiles import VisualTiles
 from ..device_picker import DevicePickerWidget
 from ._browser_base import AssetBrowserPanel
@@ -53,6 +61,11 @@ class AudioVisualsPanel(AssetBrowserPanel):
         form.addRow("Device key:", self._picker)
 
         self._list = self._build_asset_list()
+        self._controls = VisualControls(self.app, self._sliders_command,
+                                        self._center_command, self)
+        self._picker.key_changed.connect(self._on_key_changed)
+        self._bus.settings_changed.connect(
+            self._on_settings_changed, type=Qt.ConnectionType.QueuedConnection)
 
         self._play_btn = QPushButton("Play on this panel", self)
         self._play_btn.clicked.connect(self._on_apply)
@@ -71,6 +84,7 @@ class AudioVisualsPanel(AssetBrowserPanel):
         root.addLayout(form)
         root.addWidget(self._list, stretch=1)
         root.addLayout(buttons)
+        root.addWidget(self._controls)
         root.addWidget(self._status)
 
     def showEvent(self, event: QShowEvent) -> None:
@@ -84,7 +98,9 @@ class AudioVisualsPanel(AssetBrowserPanel):
         """Ask the App for the visuals; the tiles follow, one at a time."""
         log.info("AudioVisualsPanel.refresh")
         self._listed = True
-        dispatch_in_background(self.app, ListVisuals(), self._on_listed)
+        dispatch_in_background(
+            self.app, ListVisuals(key=self._picker.current_key() or ""),
+            self._on_listed)
 
     def _on_listed(self, listed: VisualsResult) -> None:
         log.info("AudioVisualsPanel._on_listed: ok=%s %s", listed.ok,
@@ -101,6 +117,47 @@ class AudioVisualsPanel(AssetBrowserPanel):
         if not listed.ok:
             self._status.setText(listed.message)
         self._tiles.fetch(items)
+        self._on_playing(listed)
+
+    def _on_key_changed(self, key: str) -> None:
+        log.info("AudioVisualsPanel._on_key_changed: %s", key)
+        if self._listed:
+            self._ask_playing()
+
+    def _on_settings_changed(self, event: object) -> None:
+        """Another UI -- or this one -- changed the picked panel's
+        background: show what it plays now."""
+        if (isinstance(event, BackgroundChanged) and self._listed
+                and event.key == self._picker.current_key()):
+            log.debug("AudioVisualsPanel._on_settings_changed: %s", event.key)
+            self._ask_playing()
+
+    def _ask_playing(self) -> None:
+        """What the picked panel plays -- for the controls and the list."""
+        key = self._picker.current_key() or ""
+        log.debug("AudioVisualsPanel._ask_playing: %s", key)
+        dispatch_in_background(self.app, ListVisuals(key=key), self._on_playing)
+
+    def _on_playing(self, listed: VisualsResult) -> None:
+        """Its entry selected, its controls shown."""
+        log.debug("AudioVisualsPanel._on_playing: %s %r", listed.playing,
+                  listed.preset)
+        for i in range(self._list.count()):
+            item: VisualItem = self._list.item(i).data(Qt.ItemDataRole.UserRole)
+            if (item.visual, item.preset) == (listed.playing, listed.preset):
+                self._list.setCurrentRow(i)
+        self._controls.show_for(listed)
+
+    def _sliders_command(self, values: dict[str, float]) -> SetVisualSettings:
+        """The Command for new slider values, for the picked panel."""
+        key = self._picker.current_key() or ""
+        log.debug("AudioVisualsPanel._sliders_command: %s %s", key, values)
+        return SetVisualSettings(key=key, settings=values)
+
+    def _center_command(self, path: str) -> SetVisualCenter:
+        """The Command for a new centre picture ("" for TRCC's icon)."""
+        log.debug("AudioVisualsPanel._center_command: %r", path)
+        return SetVisualCenter(path=path)
 
     def _tile_query(self, item: VisualItem) -> VisualTile:
         """The Query for *item*'s tile, at this grid's icon size."""
