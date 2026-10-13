@@ -1,4 +1,4 @@
-"""The Audio visuals gallery -- the Eq tab, right of Cloud backgrounds.
+"""The Audio visuals gallery -- the audio bars tab, right of Cloud backgrounds.
 
 The same grid and tiles as the cloud backgrounds: one tile per visual (and
 per preset), each the App's picture of what that visual draws for noise

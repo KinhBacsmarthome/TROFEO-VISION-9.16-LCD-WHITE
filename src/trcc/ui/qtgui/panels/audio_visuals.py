@@ -1,6 +1,6 @@
 """AudioVisualsPanel -- the audio visuals gallery, next to Cloud themes.
 
-The same gallery as the gui skin's Eq tab, from the same Query: one tile per
+The same gallery as the gui skin's audio bars tab, from the same Query: one tile per
 visual (and per preset), each the App's picture of what it draws for noise,
 TRCC Pipes first.  Pick a device and double-click a tile -- or Play -- and
 it becomes that panel's background; any other background ends it.

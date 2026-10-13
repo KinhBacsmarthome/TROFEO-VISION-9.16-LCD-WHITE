@@ -194,7 +194,7 @@ class Layout:
     TAB_LOCAL = (542, 90, 50, 38)
     TAB_MASK = (612, 90, 50, 38)
     TAB_CLOUD = (682, 90, 50, 38)
-    TAB_VISUALS = (752, 90, 50, 38)     # the Eq tab: TRCC's, not the C#'s
+    TAB_VISUALS = (752, 90, 50, 38)     # the audio bars tab: TRCC's, not the C#'s
     TAB_SETTINGS = (882, 90, 50, 38)
 
     # Device fingerprint line — selectable/copyable, beneath the rotation row
