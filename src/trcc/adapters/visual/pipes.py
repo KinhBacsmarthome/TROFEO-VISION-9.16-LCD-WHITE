@@ -38,6 +38,7 @@ import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -66,10 +67,23 @@ _RING = 1.5                   # where the pipes start: right at the centre
 _ZENITH_CELLS = 6.2           # how far out a pipe reaches at full volume, in cells
 _STEPS = 14                   # spheres per cell of pipe
 _ROLL = 20 * VISUAL_FPS       # frames, at least, between new rounds
+#: The motion below was tuned by eye at 30 frames a second.  At another rate
+#: a per-frame KEEP becomes keep ** _STEP and a per-frame STEP step * _STEP,
+#: so the pipes build, fall and glow at the same speed in real time.
+_TUNED_FPS = 30
+_STEP = _TUNED_FPS / VISUAL_FPS
+
+
+def _keep(kept: float) -> float:
+    """What is kept of a value per frame now, given *kept* at 30 fps."""
+    frame_log.debug("_keep: %.4f at %d fps", kept, VISUAL_FPS)
+    return kept ** _STEP
+
+
 _FFT = 8192                   # FFT size: 5.4 Hz bins, so the 40-57 Hz band has some
 _LIFT = 2.0                   # a hit this far over the band's average is the zenith
-_BUILD = 1.0 / 7.0            # most a pipe grows in a frame: built out, not shot
-_FALL = 0.12                  # how fast a pipe falls back toward the centre
+_BUILD = _STEP / 7.0          # most a pipe grows in a frame: built out, not shot
+_FALL = 1 - _keep(0.88)       # how fast a pipe falls back toward the centre
 _ELBOW = math.radians(45.0)   # each pipe turns this far at its one elbow ...
 _BEND = (0.3, 0.5)            # ... somewhere in this part of its length
 _LEAN = math.radians(30.0)    # how far the whole wheel leans, a new way each round
@@ -235,7 +249,8 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._tick = 0.0
         self._turn = random.uniform(0.0, 2 * math.pi)
         self._w = self._h = 0
-        self._center = None
+        self._center: Any = None          # the picture, as loaded
+        self._shown: Any = None           # ... as drawn: red-hot with Fire up
         self._growth = self._thickness = 1.0
         self._center_size = 0.3
         self._fire = 0.0
@@ -255,6 +270,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 log.warning("TrccPipes.open: %s is not a picture", picture)
             else:
                 self._center = image
+        self._prepare_center()
         self._new_round()
 
     def adjust(self, settings: Mapping[str, float]) -> None:
@@ -265,7 +281,9 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._growth = float(values["growth"])
         self._thickness = float(values["thickness"])
         self._center_size = float(values["center_size"])
-        self._fire = float(values["fire"])
+        fire, self._fire = self._fire, float(values["fire"])
+        if self._center is not None and fire != self._fire:
+            self._prepare_center()
 
     def feed(self, pcm: bytes) -> None:
         samples = np.frombuffer(pcm, dtype="<f4")
@@ -284,17 +302,21 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 levels[i] = float(spectrum[inside].mean())
         # Each band against its own recent peak, so the treble is not
         # drowned by the bass and a quiet song still grows pipes.
-        self._band_peak = np.maximum(levels, self._band_peak * 0.996)
-        self._bands = (0.55 * self._bands
-                       + 0.45 * levels / np.maximum(self._band_peak, 1e-6))
+        self._band_peak = np.maximum(levels, self._band_peak * _keep(0.996))
+        held = _keep(0.55)
+        self._bands = (held * self._bands
+                       + (1 - held) * levels / np.maximum(self._band_peak, 1e-6))
         # ... and its recent average, about a second: a pipe goes out when
         # its band rises over that -- a hit -- not merely because it is loud.
-        self._band_avg = 0.96 * self._band_avg + 0.04 * self._bands
+        usual = _keep(0.96)
+        self._band_avg = usual * self._band_avg + (1 - usual) * self._bands
         bass = float(levels[:3].mean())
-        self._peak_bass = max(bass, self._peak_bass * 0.995)
+        self._peak_bass = max(bass, self._peak_bass * _keep(0.995))
         bass_now = bass / self._peak_bass
-        self._beat = max(bass_now - self._bass, 0.0) * 2.5 + self._beat * 0.8
-        self._bass = 0.6 * self._bass + 0.4 * bass_now
+        self._beat = (max(bass_now - self._bass, 0.0) * 2.5
+                      + self._beat * _keep(0.8))
+        kept = _keep(0.6)
+        self._bass = kept * self._bass + (1 - kept) * bass_now
 
     def render(self) -> RawFrame:
         frame_log.debug("TrccPipes.render: frame %d", self._frame)
@@ -303,26 +325,26 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._redraw()
         gain = 1.0 + 0.35 * min(self._beat, 1.0)
         out = self._color * gain
-        layer = (self._picture_layer()
-                 if self._center is not None and self._center_size > 0 else None)
+        placed = (self._center_placement()
+                  if self._shown is not None and self._center_size > 0 else None)
         if self._fire > 0:
             # The pipes burn as the picture does: red-hot, flames rising off
             # every pipe and off the picture's outline.
             pipes = np.isfinite(self._depth)
-            seed = pipes.astype(np.float32) * _PIPE_HEAT
-            if layer is not None:
-                seed = np.maximum(seed, layer[..., 3])
+            seed = pipes[::2, ::2].astype(np.float32) * _PIPE_HEAT
+            if placed is not None:
+                seed = np.maximum(seed, self._picture_outline(placed))
             burning = self._burn(out[pipes], _PIPE_GLOW)
             out = np.maximum(out, self._flames(seed))
             out[pipes] = burning            # the pipe itself, in front
-        if layer is not None:
-            out = self._with_center(out, layer)
-        data = np.clip(out * 255.0, 0, 255).astype(np.uint8).tobytes()
+        frame = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+        data = (self._with_center(frame, placed) if placed is not None
+                else frame.tobytes())
         return RawFrame(data=data, width=self._w, height=self._h)
 
     def close(self) -> None:
         log.info("TrccPipes.close")
-        self._center = None
+        self._center = self._shown = None
 
     # ── the screen saver ─────────────────────────────────────────────
 
@@ -387,7 +409,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 pipe.reach += (target - pipe.reach) * _FALL
             # The peak marker hangs at the highest reach, then sinks back --
             # as an old stereo's graphic equaliser did.
-            pipe.peak = max(pipe.reach, pipe.peak - 0.012)
+            pipe.peak = max(pipe.reach, pipe.peak - 0.012 * _STEP)
         quiet = all(p.reach < 0.12 for p in self._pipes)
         if quiet and self._frame - self._rolled > _ROLL:
             self._new_round()
@@ -488,14 +510,21 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._color[cy0:cy1, cx0:cx1][hit] = lit[sl][hit]
         zbuf[hit] = depth[hit]
 
-    def _with_center(self, scene: np.ndarray, layer: np.ndarray) -> np.ndarray:
-        """The centre picture *layer* on top of *scene* -- red-hot with Fire
-        up."""
+    def _with_center(self, frame: np.ndarray, placed: Any) -> bytes:
+        """The centre picture drawn onto the finished *frame* by Qt --
+        already red-hot with Fire up (``_shown``)."""
+        from PySide6.QtCore import QRectF
+        from PySide6.QtGui import QImage, QPainter
         frame_log.debug("_with_center: fire=%.2f", self._fire)
-        alpha = layer[..., 3:4]
-        picture = (self._burn(layer[..., :3], 1.0) if self._fire > 0
-                   else layer[..., :3])
-        return scene * (1 - alpha) + picture * alpha
+        transform, size = placed
+        image = QImage(frame.data, self._w, self._h, 3 * self._w,
+                       QImage.Format.Format_RGB888)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setTransform(transform)
+        painter.drawImage(QRectF(-size / 2, -size / 2, size, size), self._shown)
+        painter.end()
+        return frame.tobytes()
 
     def _burn(self, rgb: np.ndarray, share: float) -> np.ndarray:
         """*rgb* glowing red-hot, as far as Fire is up times *share*: its
@@ -506,31 +535,64 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         glow = rgb.mean(axis=-1, keepdims=True) * 0.7 + 0.3
         return rgb * (1 - heat) + hot * glow * heat * 1.25
 
-    def _picture_layer(self) -> np.ndarray:
-        """The centre picture, placed and rocked, as float RGBA."""
-        from PySide6.QtCore import QRectF, Qt
-        from PySide6.QtGui import QImage, QPainter, QTransform
-        frame_log.debug("_picture_layer")
-        img = QImage(self._w, self._h, QImage.Format.Format_RGBA8888)
-        img.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        size = (min(self._w, self._h) * self._center_size
-                * (1.0 + 0.22 * min(self._bass, 1.5)))
+    def _center_placement(self) -> tuple[Any, float]:
+        """This frame's place for the picture: rocking toward the viewer and
+        away, swelling with the bass -- a transform, and the picture's size."""
+        from PySide6.QtGui import QTransform
         self._tick += 1.6 / VISUAL_FPS
         tilt = 0.35 + 0.65 * abs(math.cos(self._tick))
-        painter.setTransform(QTransform().translate(self._w / 2, self._h / 2)
-                             .scale(tilt, 1.0))
-        assert self._center is not None
-        painter.drawImage(QRectF(-size / 2, -size / 2, size, size), self._center)
+        size = (min(self._w, self._h) * self._center_size
+                * (1.0 + 0.22 * min(self._bass, 1.5)))
+        frame_log.debug("_center_placement: tilt %.2f size %.0f", tilt, size)
+        return (QTransform().translate(self._w / 2, self._h / 2).scale(tilt, 1.0),
+                size)
+
+    def _picture_outline(self, placed: tuple[Any, float]) -> np.ndarray:
+        """Where the picture covers, at the fire's half resolution -- what
+        the flames rise from."""
+        from PySide6.QtCore import QRectF, Qt
+        from PySide6.QtGui import QImage, QPainter, QTransform
+        transform, size = placed
+        height, width = (self._h + 1) // 2, (self._w + 1) // 2
+        mask = QImage(width, height, QImage.Format.Format_Alpha8)
+        mask.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(mask)
+        painter.setTransform(transform * QTransform().scale(0.5, 0.5))
+        painter.drawImage(QRectF(-size / 2, -size / 2, size, size), self._shown)
         painter.end()
-        rgba = np.frombuffer(img.constBits(), dtype=np.uint8)
-        return rgba[: self._w * self._h * 4].reshape(
-            self._h, self._w, 4).astype(np.float32) / 255.0
+        alpha = np.frombuffer(mask.constBits(), dtype=np.uint8)
+        frame_log.debug("_picture_outline: %dx%d", width, height)
+        return alpha.reshape(height, mask.bytesPerLine())[:, :width] / np.float32(255)
+
+    def _prepare_center(self) -> None:
+        """The picture as it is drawn: red-hot as far as Fire is up --
+        worked out when the picture or the Fire slider changes, never per
+        frame."""
+        from PySide6.QtGui import QImage
+        if self._center is None:
+            log.debug("_prepare_center: no picture")
+            self._shown = None
+            return
+        if self._fire <= 0:
+            log.debug("_prepare_center: as it is")
+            self._shown = self._center
+            return
+        source = self._center.convertToFormat(QImage.Format.Format_RGBA8888)
+        w, h = source.width(), source.height()
+        rgba = np.frombuffer(source.constBits(), dtype=np.uint8).reshape(
+            h, source.bytesPerLine())[:, :w * 4].reshape(h, w, 4)
+        hot = self._burn(rgba[..., :3] / np.float32(255), 1.0)
+        burned = np.concatenate(
+            [np.clip(hot * 255, 0, 255).astype(np.uint8), rgba[..., 3:]], axis=2)
+        self._burned_pixels = np.ascontiguousarray(burned)
+        self._shown = QImage(self._burned_pixels.data, w, h, 4 * w,
+                             QImage.Format.Format_RGBA8888).copy()
+        log.debug("_prepare_center: %dx%d red-hot at fire %.2f", w, h, self._fire)
 
     def _flames(self, seed: np.ndarray) -> np.ndarray:
         """The demoscene fire: heat from the picture's outline rises, spreads
-        and cools, coloured black, red, orange, yellow, white."""
+        and cools, coloured black, red, orange, yellow, white -- worked at
+        half resolution (*seed* is), a quarter of the work."""
         frame_log.debug("_flames")
         heat = getattr(self, "_heat", None)
         if heat is None or heat.shape != seed.shape:
@@ -538,11 +600,14 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         flicker = np.random.random(seed.shape).astype(np.float32)
         heat = np.maximum(heat, seed * (0.6 + 0.4 * flicker)
                           * (0.7 + 0.5 * min(self._bass, 1.3)))
-        rise = np.roll(heat, -2, axis=0)
-        rise[-2:] = 0
+        lift = max(1, round(2 * _STEP))
+        rise = np.roll(heat, -lift, axis=0)
+        rise[-lift:] = 0
         spread = (rise + np.roll(rise, 1, axis=1) + np.roll(rise, -1, axis=1)
                   + np.roll(rise, -1, axis=0)) / 4.0
-        self._heat = heat = spread * (0.955 - 0.03 * flicker)
+        self._heat = heat = spread * (0.955 - 0.03 * flicker) ** _STEP
         t = np.clip(heat * 1.4, 0.0, 1.0)[..., None] * self._fire
-        return np.concatenate([np.clip(t * 3.0, 0, 1), np.clip(t * 3.0 - 1, 0, 1),
-                               np.clip(t * 3.0 - 2, 0, 1)], axis=2)
+        colour = np.concatenate([np.clip(t * 3.0, 0, 1), np.clip(t * 3.0 - 1, 0, 1),
+                                 np.clip(t * 3.0 - 2, 0, 1)], axis=2)
+        # Simulated at half resolution -- flames are blurry -- shown at full.
+        return colour.repeat(2, axis=0).repeat(2, axis=1)[:self._h, :self._w]

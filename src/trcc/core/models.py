@@ -1316,9 +1316,11 @@ STREAM_TICK_S = 0.0625
 #: what projectM takes (``projectm_pcm_add_float``).
 SOUND_RATE = 44100
 SOUND_CHANNELS = 2
-#: How often an audio visual draws: projectM's own default frame rate.  Its
+#: How often an audio visual draws: the media player's pace, the C# player's
+#: 62.5 ms step -- 16 fps.  A panel shows no more, so drawing faster only
+#: burned CPU (it was 30, "projectM's default": half a core for Pipes).  The
 #: reader is paced by the sound itself -- 1/VISUAL_FPS of audio per frame.
-VISUAL_FPS = 30
+VISUAL_FPS = round(1 / STREAM_TICK_S)
 
 
 @dataclass(frozen=True, slots=True)
