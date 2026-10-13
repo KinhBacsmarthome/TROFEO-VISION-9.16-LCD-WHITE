@@ -91,14 +91,14 @@ KNOWN_FIELD_ASYMMETRY: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "unclassified: measured 2026-09-22, not traced"
     )),
     ("PlayVisual", "gui"): (frozenset({"settings"}), (
-        "gap: the window's audio visuals gallery plays a visual at its "
-        "default sliders -- one click, as the user asked (2026-10-12); the "
-        "sliders are CLI/API only until the window gets them"
+        "scoped: a gallery click starts the visual at its default sliders "
+        "-- one click, as the user asked (2026-10-12) -- and the window's "
+        "sliders then move it live with SetVisualSettings"
     )),
     ("PlayVisual", "qtgui"): (frozenset({"settings"}), (
-        "gap: the window's audio visuals gallery plays a visual at its "
-        "default sliders -- one click, as the user asked (2026-10-12); the "
-        "sliders are CLI/API only until the window gets them"
+        "scoped: a gallery click starts the visual at its default sliders "
+        "-- one click, as the user asked (2026-10-12) -- and the window's "
+        "sliders then move it live with SetVisualSettings"
     )),
     ("ImportTheme", "gui"): (frozenset({"name"}), (
         "scoped: the C# import has no name field -- the theme is named after "
