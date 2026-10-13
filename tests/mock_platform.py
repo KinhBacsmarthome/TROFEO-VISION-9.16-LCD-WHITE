@@ -549,10 +549,6 @@ class MockPlatform(FakePlatform):
         log.debug("MockPlatform.rgb_hardware: scripted, not the host's")
         return self.rgb
 
-    def sound_input(self) -> SoundInput:
-        log.debug("MockPlatform.sound_input: scripted, not the host's")
-        return ScriptedSound()
-
 
     def scan_devices(self) -> list[DeviceInfo]:
         """Surface one ``DeviceInfo`` per spec that resolves in the registry."""
@@ -910,3 +906,6 @@ class ScriptedMilkdrop(MilkdropVisual):
 SCRIPTED_VISUALS: Mapping[str, type[VisualEngine]] = MappingProxyType({
     "trcc-pipes": TrccPipes, "milkdrop": ScriptedMilkdrop})
 MockPlatform.VISUALS = SCRIPTED_VISUALS
+#: A scripted beat, never the host's sound -- the same table a real
+#: platform fills, so the App reads it the same way.
+MockPlatform.SOUND_INPUT = ScriptedSound

@@ -94,6 +94,9 @@ class AudioVisualsPanel(AssetBrowserPanel):
         for item in items:
             row = QListWidgetItem(item.name)
             row.setData(Qt.ItemDataRole.UserRole, item)
+            if item.problem:
+                row.setToolTip(item.problem)
+                row.setForeground(self.palette().placeholderText())
             self._list.addItem(row)
         if not listed.ok:
             self._status.setText(listed.message)

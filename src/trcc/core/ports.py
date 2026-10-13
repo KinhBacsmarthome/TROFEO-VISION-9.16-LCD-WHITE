@@ -2457,6 +2457,14 @@ class SoundInput(ABC):
     def close(self) -> None:
         """Stop listening (idempotent); a blocked ``read`` returns."""
 
+    @classmethod
+    def problem(cls) -> str:
+        """Why this computer's sound cannot be heard -- "" when it can.
+        Asked before a visual starts, so the user hears why up front
+        instead of a visual that never moves."""
+        log.debug("SoundInput.problem: %s has none", cls.__name__)
+        return ""
+
 
 class VisualEngine(ABC):
     """Turns sound into pictures: one audio visual.

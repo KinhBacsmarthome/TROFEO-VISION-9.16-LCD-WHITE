@@ -11,7 +11,7 @@ ends the visual within a tick, and a restart resumes it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -53,13 +53,26 @@ def _resolve(app: App, visual: str,
     return info, path, problem
 
 
+def _sound_problem(app: App) -> str:
+    """Why this computer's sound cannot be heard -- "" when it can.  Every
+    audio visual hears it, so this is every visual's problem."""
+    made = type(app.platform).SOUND_INPUT
+    problem = (f"TRCC cannot hear this computer's sound on "
+               f"{app.platform.distro_name()} yet" if made is None
+               else made.problem())
+    log.debug("_sound_problem: %r", problem)
+    return problem
+
+
 @dataclass(frozen=True, slots=True)
 class ListVisuals(Query[VisualsResult]):
     """Every audio visual this machine can draw, and the preset files for
     the ones that draw presets -- the Audio Visuals page's gallery."""
 
     def execute(self, app: App) -> VisualsResult:
-        visuals = app.platform.visual_catalog()
+        problem = _sound_problem(app)
+        visuals = tuple(replace(v, problem=problem)
+                        for v in app.platform.visual_catalog())
         base = app.platform.paths().visuals_dir()
         presets = tuple(name for v in visuals if v.uses_presets
                         for name in app.platform.visual_class(v.kind).presets(base))
@@ -94,11 +107,13 @@ class PlayVisual(Command[VisualResult]):
         try:
             profile = app.get(self.key).profile
         except DeviceNotFoundError as e:
-            return self._refuse(str(e))
+            return self._refuse(app, str(e))
         if not problem and profile is None:
             problem = "the panel has not reported its size yet"
+        if not problem:
+            problem = _sound_problem(app)
         if problem:
-            return self._refuse(problem)
+            return self._refuse(app, problem)
         assert info is not None and profile is not None
         width, height = profile.resolution
         spec = VisualSpec(self.visual, width, height, preset=preset,
@@ -117,9 +132,13 @@ class PlayVisual(Command[VisualResult]):
                             playing=True,
                             message=f"{info.title} on {self.key}")
 
-    def _refuse(self, problem: str) -> VisualResult:
+    def _refuse(self, app: App, problem: str) -> VisualResult:
+        """Refused before anything changed -- and said where the user is
+        looking: every open UI hears the ``ErrorOccurred``."""
         log.warning("PlayVisual: %s refused %s: %s", self.key, self.visual,
                     problem)
+        app.events.publish(ErrorOccurred(message=problem, kind="visual",
+                                         key=self.key))
         return VisualResult(ok=False, key=self.key, preset=self.preset,
                             message=problem)
 

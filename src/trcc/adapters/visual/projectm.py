@@ -22,6 +22,7 @@ import ctypes
 import ctypes.util
 import logging
 from pathlib import Path
+from typing import ClassVar
 
 from ...core._safe import is_under
 from ...core.logs import per_frame
@@ -164,12 +165,40 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
         adjustments=(VisualAdjustment("beat_sensitivity", "Beat sensitivity",
                                       0.0, 5.0, 1.0),))
 
+    #: Whether libprojectM can draw on this computer -- tried once.
+    _draws: ClassVar[bool | None] = None
+
     @classmethod
     def available(cls) -> bool:
-        """Only where libprojectM 4 is installed."""
-        found = ctypes.util.find_library(_LIBRARY[0]) is not None
-        log.debug("MilkdropVisual.available: %s", found)
-        return found
+        """Only where libprojectM 4 is installed AND starts in the OpenGL
+        this computer has -- tried once, so a library built for OpenGL ES
+        (Arch's), or no OpenGL at all, hides MilkDrop rather than failing
+        when the user picks it."""
+        if cls._draws is None:
+            cls._draws = cls._starts()
+        log.debug("MilkdropVisual.available: %s", cls._draws)
+        return cls._draws
+
+    @classmethod
+    def _starts(cls) -> bool:
+        """Load libprojectM, make a surface, start projectM, put it away."""
+        if ctypes.util.find_library(_LIBRARY[0]) is None:
+            log.info("MilkdropVisual: libprojectM 4 is not installed")
+            return False
+        try:
+            lib, surface = load_projectm(), _EglSurface(16, 16)
+        except OSError as e:
+            log.warning("MilkdropVisual: cannot draw here -- %s", e)
+            return False
+        try:
+            handle = lib.projectm_create()
+            if handle:
+                lib.projectm_destroy(handle)
+        finally:
+            surface.close()
+        log.info("MilkdropVisual: projectM %s here",
+                 "starts" if handle else "did not start")
+        return bool(handle)
 
     @classmethod
     def presets(cls, folder: Path) -> tuple[str, ...]:

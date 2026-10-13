@@ -20,20 +20,23 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class VisualItem:
-    """One gallery tile: the visual, its preset ("" for none), and the name
-    under the tile."""
+    """One gallery tile: the visual, its preset ("" for none), the name
+    under the tile, and why it cannot play here ("" when it can)."""
     visual: str
     preset: str
     name: str
+    problem: str = ""
 
 
 def gallery_items(listed: VisualsResult) -> list[VisualItem]:
     """Every tile *listed* makes, in the App's order."""
     items = [item for info in listed.visuals
-             for item in ([VisualItem(info.kind, preset, PurePath(preset).stem)
+             for item in ([VisualItem(info.kind, preset, PurePath(preset).stem,
+                                      info.problem)
                            for preset in listed.presets]
                           if info.uses_presets
-                          else [VisualItem(info.kind, "", info.title)])]
+                          else [VisualItem(info.kind, "", info.title,
+                                           info.problem)])]
     log.info("gallery_items: %d tile(s) from %d visual(s)", len(items),
              len(listed.visuals))
     return items

@@ -22,7 +22,7 @@ from ..presentation.visual_gallery import VisualItem, gallery_items
 from ..qt_background import dispatch_in_background
 from ..qt_visual_tiles import VisualTiles
 from .base import BaseThemeBrowser, BaseThumbnail
-from .constants import Sizes
+from .constants import Colors, Sizes
 
 if TYPE_CHECKING:
     from PySide6.QtGui import QShowEvent
@@ -33,7 +33,18 @@ log = logging.getLogger(__name__)
 
 
 class VisualThumbnail(BaseThumbnail):
-    """A visual's tile: its name until the App's picture of it arrives."""
+    """A visual's tile: its name until the App's picture of it arrives.  A
+    visual that cannot play here says why in its tooltip, its name dimmed;
+    a click still asks, and the App's refusal reaches the user."""
+
+    def __init__(self, item_info: VisualItem, parent=None) -> None:
+        super().__init__(item_info, parent)
+        log.debug("VisualThumbnail.__init__: %s problem=%r", item_info.name,
+                  item_info.problem)
+        if item_info.problem:
+            self.setToolTip(item_info.problem)
+            self.name_label.setStyleSheet(
+                f"{self.name_label.styleSheet()} color: {Colors.EMPTY_TEXT};")
 
     def _get_display_name(self, info: VisualItem) -> str:
         log.debug("VisualThumbnail._get_display_name: %s", info.name)

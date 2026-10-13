@@ -1343,6 +1343,9 @@ class VisualInfo:
     uses_presets: bool = False
     uses_center: bool = False
     adjustments: tuple[VisualAdjustment, ...] = ()
+    #: Why it cannot play on this computer -- "" when it can.  Filled by
+    #: ``ListVisuals``; a class's own ``INFO`` leaves it empty.
+    problem: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -52,14 +52,54 @@ def test_every_visual_registers_by_the_key_in_its_class_line() -> None:
     assert all(VISUALS[k].INFO.kind == k for k in VISUALS)
 
 
-def test_milkdrop_is_offered_only_where_libprojectm_is_installed(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+class _FakeProjectM:
+    """libprojectM that starts (or not) without OpenGL."""
+
+    def __init__(self, starts: bool) -> None:
+        self.starts, self.destroyed = starts, 0
+
+    def projectm_create(self) -> int:
+        return 7 if self.starts else 0
+
+    def projectm_destroy(self, handle: int) -> None:
+        self.destroyed += 1
+
+
+class _FakeSurface:
+    closed = 0
+
+    def __init__(self, width: int, height: int) -> None:
+        pass
+
+    def close(self) -> None:
+        _FakeSurface.closed += 1
+
+
+@pytest.mark.parametrize(("installed", "loads", "starts", "offered"), [
+    (False, True, True, False),      # no libprojectM 4
+    (True, False, True, False),      # installed, but no OpenGL to draw with
+    (True, True, False, False),      # e.g. a GLES build in a GL core context
+    (True, True, True, True),
+])
+def test_milkdrop_is_offered_only_where_projectm_can_draw(
+        monkeypatch: pytest.MonkeyPatch, installed: bool, loads: bool,
+        starts: bool, offered: bool) -> None:
+    """MUTATION CHECK: return ``find_library(...) is not None`` again."""
+    lib = _FakeProjectM(starts)
+
+    def load() -> _FakeProjectM:
+        if not loads:
+            raise OSError("OpenGL (EGL) is not available")
+        return lib
+
+    monkeypatch.setattr(projectm_module.MilkdropVisual, "_draws", None)
     monkeypatch.setattr(projectm_module.ctypes.util, "find_library",
-                        lambda name: None)
-    assert [info.kind for info in catalog()] == ["trcc-pipes"]
-    monkeypatch.setattr(projectm_module.ctypes.util, "find_library",
-                        lambda name: "libprojectM-4.so.4")
-    assert [info.kind for info in catalog()] == ["trcc-pipes", "milkdrop"]
+                        lambda name: "libprojectM-4.so.4" if installed else None)
+    monkeypatch.setattr(projectm_module, "load_projectm", load)
+    monkeypatch.setattr(projectm_module, "_EglSurface", _FakeSurface)
+    kinds = [info.kind for info in catalog()]
+    assert kinds == (["trcc-pipes", "milkdrop"] if offered else ["trcc-pipes"])
+    assert lib.destroyed == (1 if offered else 0)
 
 
 # ── TRCC Pipes ───────────────────────────────────────────────────────
@@ -368,3 +408,43 @@ def test_the_api_serves_a_tile_as_png(app: App) -> None:
     assert (tile.status_code, tile.headers["content-type"]) == (200, "image/png")
     assert client.get("/display/visual-tile",
                       params={"visual": "nope"}).status_code == 404
+
+
+def test_a_computer_that_cannot_hear_says_so_up_front(
+        app: App, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows/macOS/BSD before their sound inputs: the gallery says why on
+    every tile, and a click is refused -- out loud -- before anything
+    changes.  MUTATION CHECK: drop the sound check in PlayVisual."""
+    monkeypatch.setattr(MockPlatform, "SOUND_INPUT", None)
+    why = (f"TRCC cannot hear this computer's sound on "
+           f"{app.platform.distro_name()} yet")
+    assert {v.problem for v in app.dispatch(ListVisuals()).visuals} == {why}
+    heard: list[ErrorOccurred] = []
+    app.events.subscribe(ErrorOccurred, heard.append)
+
+    played = app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes"))
+
+    assert (played.ok, played.message) == (False, why)
+    assert [e.message for e in heard] == [why]
+    assert app.settings.for_device(_KEY).visual is None
+    assert app.dispatch(VisualTile(visual="trcc-pipes", size=32)).ok
+
+
+def test_without_ffmpeg_there_is_nothing_to_hear(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    from trcc.adapters.visual import sound
+
+    monkeypatch.setattr(sound.toolchain, "present", lambda name: False)
+    assert sound.MonitorSoundInput.problem() == (
+        "ffmpeg is not installed -- it is what hears the music for an audio "
+        "visual")
+
+
+def test_the_gallery_carries_why_a_visual_cannot_play() -> None:
+    from trcc.core.models import VisualInfo
+    from trcc.core.results import VisualsResult
+    from trcc.ui.presentation.visual_gallery import gallery_items
+
+    listed = VisualsResult(ok=True, visuals=(
+        VisualInfo("trcc-pipes", "TRCC Pipes", "TRCC", problem="no sound"),))
+    assert [i.problem for i in gallery_items(listed)] == ["no sound"]

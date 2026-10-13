@@ -43,11 +43,19 @@ class MonitorSoundInput(SoundInput):
                 "-f", "f32le", "-ac", str(SOUND_CHANNELS),
                 "-ar", str(SOUND_RATE), "pipe:1"]
 
+    @classmethod
+    def problem(cls) -> str:
+        """ffmpeg is what listens: without it there is nothing to hear."""
+        problem = ("" if toolchain.present("ffmpeg")
+                   else "ffmpeg is not installed -- it is what hears the "
+                        "music for an audio visual")
+        log.debug("MonitorSoundInput.problem: %r", problem)
+        return problem
+
     def open(self) -> None:
         log.info("MonitorSoundInput.open: %s", self.SOURCE)
-        if not toolchain.present("ffmpeg"):
-            raise OSError("ffmpeg is not installed -- it is what hears the "
-                          "music for an audio visual")
+        if problem := self.problem():
+            raise OSError(problem)
         self._proc = subprocess.Popen(
             self.command(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, shell=False)
