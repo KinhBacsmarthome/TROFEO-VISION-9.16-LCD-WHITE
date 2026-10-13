@@ -194,7 +194,7 @@ class UCVisuals(BaseThemeBrowser):
         return SetVisualSettings(key=self._key, settings=values)
 
     def _center_command(self, path: str) -> SetVisualCenter:
-        """The Command for a new centre picture ("" for TRCC's icon)."""
+        """The Command for a new centre picture ("" for none)."""
         log.debug("UCVisuals._center_command: %r", path)
         return SetVisualCenter(path=path)
 

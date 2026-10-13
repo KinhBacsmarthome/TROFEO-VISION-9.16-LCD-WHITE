@@ -50,7 +50,9 @@ _SPEC = {"vid": "0402", "pid": "3922", "fbl": 100}
 # ── The registry ─────────────────────────────────────────────────────
 
 def test_every_visual_registers_by_the_key_in_its_class_line() -> None:
-    assert list(VISUALS) == ["trcc-pipes", "milkdrop"]     # Pipes first
+    """The registry keeps the order modules load; the gallery's order is
+    the rank (test_cavalier checks Pipes first)."""
+    assert {"trcc-pipes", "milkdrop"} <= set(VISUALS)
     assert all(VISUALS[k].INFO.kind == k for k in VISUALS)
 
 
@@ -99,16 +101,18 @@ def test_milkdrop_is_offered_only_where_projectm_can_draw(
                         lambda name: "libprojectM-4.so.4" if installed else None)
     monkeypatch.setattr(projectm_module, "load_projectm", load)
     monkeypatch.setattr(projectm_module, "_EglSurface", _FakeSurface)
-    kinds = [info.kind for info in catalog()]
+    kinds = [info.kind for info in catalog()
+             if not info.kind.startswith("cavalier-")]
     assert kinds == (["trcc-pipes", "milkdrop"] if offered else ["trcc-pipes"])
     assert lib.destroyed == (1 if offered else 0)
 
 
 # ── TRCC Pipes ───────────────────────────────────────────────────────
 
-def _pipes(**settings: float) -> TrccPipes:
+def _pipes(center: Path | None = None, **settings: float) -> TrccPipes:
     engine = TrccPipes()
-    engine.open(VisualSpec("trcc-pipes", 160, 160, settings=settings))
+    engine.open(VisualSpec("trcc-pipes", 160, 160, center=center,
+                           settings=settings))
     return engine
 
 
@@ -155,12 +159,17 @@ def test_pipes_reach_out_with_the_music_and_draw_back_in_silence() -> None:
     assert all(pipe.reach < 0.05 for pipe in engine._pipes)  # pyright: ignore[reportPrivateUsage]
 
 
-def test_the_centre_picture_sits_in_the_middle_and_can_burn() -> None:
-    plain = _pipes(center_size=0.4)
+def test_the_centre_picture_sits_in_the_middle_and_can_burn(
+        tmp_path: Path) -> None:
+    picture = tmp_path / "white.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB888)
+    image.fill(0xFFFFFF)
+    image.save(str(picture))
+    plain = _pipes(picture, center_size=0.4)
     frame = plain.render()
     middle = (80 * 160 + 80) * 3
     assert sum(frame.data[middle:middle + 3]) > 60
-    burning = _pipes(center_size=0.4, fire=1.0)
+    burning = _pipes(picture, center_size=0.4, fire=1.0)
     for _ in range(20):
         frame = burning.render()
     above = np.frombuffer(frame.data, dtype=np.uint8).reshape(160, 160, 3)[20:50, 60:100]
@@ -224,7 +233,8 @@ def _preset(app: App, name: str = "Fractal/one.milk") -> str:
 def test_the_gallery_lists_every_visual_and_the_preset_files(app: App) -> None:
     _preset(app)
     listed = app.dispatch(ListVisuals())
-    assert [v.kind for v in listed.visuals] == ["trcc-pipes", "milkdrop"]
+    kinds = [v.kind for v in listed.visuals]
+    assert (kinds[0], kinds[-1], len(kinds)) == ("trcc-pipes", "milkdrop", 13)
     assert [a.name for a in listed.visuals[0].adjustments] == [
         "growth", "thickness", "center_size", "fire"]
     assert listed.presets == ("Fractal/one.milk",)
@@ -822,3 +832,11 @@ def test_the_mac_is_a_platform_that_hears() -> None:
     from trcc.adapters.visual.coreaudio import TapSoundInput
 
     assert MacOSPlatform.SOUND_INPUT is TapSoundInput
+
+
+def test_pipes_show_no_picture_until_the_user_picks_one() -> None:
+    """The user's call: no TRCC logo in the middle -- empty until a picture
+    is chosen."""
+    engine = TrccPipes()
+    engine.open(VisualSpec("trcc-pipes", 64, 64))
+    assert engine._shown is None                    # type: ignore[attr-defined]

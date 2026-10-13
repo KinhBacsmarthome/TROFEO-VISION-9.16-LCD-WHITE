@@ -9,8 +9,9 @@ from __future__ import annotations
 import builtins
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
+from operator import attrgetter
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
@@ -2466,6 +2467,16 @@ class SoundInput(ABC):
         return ""
 
 
+def ranked_visuals(classes: Iterable[type[VisualEngine]]) -> tuple[VisualInfo, ...]:
+    """The gallery: each visual this machine can draw, by ``RANK`` -- never
+    by the order its module happened to load (an import sorter reorders
+    those, and TRCC Pipes is to come first)."""
+    infos = tuple(cls.INFO for cls in sorted(classes, key=attrgetter("RANK"))
+                  if cls.available())
+    log.debug("ranked_visuals: %s", [i.kind for i in infos])
+    return infos
+
+
 class VisualEngine(ABC):
     """Turns sound into pictures: one audio visual.
 
@@ -2482,6 +2493,10 @@ class VisualEngine(ABC):
 
     #: What the visual is, for the gallery; every concrete visual sets it.
     INFO: ClassVar[VisualInfo]
+    #: Where it sits in the gallery, lowest first -- TRCC Pipes is 0, the
+    #: first thing the user sees (their call).  Equal ranks keep the order
+    #: their classes registered in.  See :func:`ranked_visuals`.
+    RANK: ClassVar[int] = 50
 
     @classmethod
     def available(cls) -> bool:
@@ -3149,8 +3164,7 @@ class Platform(ABC):
 
     def visual_catalog(self) -> tuple[VisualInfo, ...]:
         """Every audio visual this machine can draw -- the gallery."""
-        infos = tuple(cls.INFO for cls in type(self).VISUALS.values()
-                      if cls.available())
+        infos = ranked_visuals(type(self).VISUALS.values())
         log.debug("visual_catalog: %s", [i.kind for i in infos])
         return infos
 

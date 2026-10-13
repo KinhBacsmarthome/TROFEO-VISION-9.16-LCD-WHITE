@@ -1317,7 +1317,7 @@ def visuals(
         typer.echo(f"  {info.kind:<12} {info.title}  ({sliders})")
     for name in result.presets:
         typer.echo(f"    preset: {name}")
-    typer.echo(f"  centre picture: {result.center or 'TRCC icon'}")
+    typer.echo(f"  centre picture: {result.center or 'none'}")
     if key:
         sliders = ", ".join(f"{n} {v:g}" for n, v in result.sliders.items())
         typer.echo(f"  {key} plays: {result.playing or 'no audio visual'}"
@@ -1393,7 +1393,7 @@ def visual_tile(
 @app.command("visual-center")
 def visual_center(
     path: str = typer.Argument(
-        "", help="Any picture for the middle of a visual; '' for TRCC's icon."),
+        "", help="Any picture for the middle of a visual; '' for none."),
 ) -> None:
     """The picture in the middle of the audio visuals that show one."""
     log.info("cli display visual-center: %r", path)

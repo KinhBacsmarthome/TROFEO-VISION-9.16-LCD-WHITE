@@ -1139,7 +1139,7 @@ trcc display visual-center [PATH]
 
 | Argument | Description |
 |---|---|
-| `PATH` | Any picture for the middle of a visual; '' for TRCC's icon. *(optional)* |
+| `PATH` | Any picture for the middle of a visual; '' for none. *(optional)* |
 
 ### `trcc display visual-set`
 

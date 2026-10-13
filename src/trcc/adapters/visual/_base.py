@@ -16,7 +16,7 @@ from typing import Any, ClassVar
 
 from ...core.factory import Registry, Reject
 from ...core.models import VisualInfo
-from ...core.ports import VisualEngine
+from ...core.ports import VisualEngine, ranked_visuals
 
 log = logging.getLogger(__name__)
 
@@ -42,8 +42,8 @@ class BaseVisual(VisualEngine):
 
 
 def catalog() -> tuple[VisualInfo, ...]:
-    """Every visual this machine can draw, in the order they registered --
-    TRCC Pipes first."""
-    infos = tuple(cls.INFO for cls in VISUALS.values() if cls.available())
+    """Every visual this machine can draw, in gallery order -- the same
+    ranking the platform's gallery uses."""
+    infos = ranked_visuals(VISUALS.values())
     log.info("catalog: %s", [info.kind for info in infos])
     return infos

@@ -1307,7 +1307,7 @@ def visual_tile(request: Request, visual: str, preset: str = "",
 @meta_router.post("/visual-center")
 def visual_center(body: VisualCenterRequest, request: Request) -> VisualsResult:
     """The picture in the middle of the visuals that show one -- a file in
-    TRCC's own folders; '' for TRCC's icon."""
+    TRCC's own folders; '' for none."""
     log.info("api POST /display/visual-center: %s", bool(body.path))
     path = str(owned_path(request, body.path)) if body.path else ""
     result = request.app.state.trcc.dispatch(SetVisualCenter(path=path))

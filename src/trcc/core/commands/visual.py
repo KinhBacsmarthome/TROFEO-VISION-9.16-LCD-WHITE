@@ -277,7 +277,7 @@ class CaptureVisualFrame(Command[ScreencastResult]):
 @dataclass(frozen=True, slots=True)
 class SetVisualCenter(Command[VisualsResult]):
     """The centre picture for audio visuals that show one -- any image the
-    user picks; an empty *path* goes back to TRCC's icon.  Every panel
+    user picks; an empty *path* takes it away.  Every panel
     playing such a visual starts it again, so the picture shows at once."""
     path: str = ""
 
@@ -304,7 +304,7 @@ class SetVisualCenter(Command[VisualsResult]):
         return VisualsResult(ok=True, visuals=listed.visuals,
                              presets=listed.presets, center=listed.center,
                              message=("centre picture set" if self.path
-                                      else "centre picture: TRCC's icon"))
+                                      else "no centre picture"))
 
 
 @dataclass(frozen=True, slots=True)

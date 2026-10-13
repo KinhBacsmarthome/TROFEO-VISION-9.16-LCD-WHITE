@@ -88,7 +88,7 @@ Interactive docs are served at `/docs` while the API is running.
 | `POST /devices/{key}/display/visual/settings` | `VisualResult` | Move *key*'s playing audio visual's sliders -- live. |
 | `GET /display/masks` | `MasksListResult` | List masks for a device resolution. |
 | `GET /display/video-duration` | `VideoDurationResult` | How long a video file is, in milliseconds (server-side path). |
-| `POST /display/visual-center` | `VisualsResult` | The picture in the middle of the visuals that show one -- a file in TRCC's own folders; '' for TRCC's icon. |
+| `POST /display/visual-center` | `VisualsResult` | The picture in the middle of the visuals that show one -- a file in TRCC's own folders; '' for none. |
 | `GET /display/visual-tile` | — | A visual's gallery tile as PNG -- what it draws for noise, the same whatever is playing.  The preset is checked by the visual, which refuses one outside the visuals' folder. |
 | `GET /display/visuals` | `VisualsResult` | The audio visuals this computer can draw, their sliders and presets, and the centre picture -- with ``?key=``, also what that panel plays and its slider values. |
 

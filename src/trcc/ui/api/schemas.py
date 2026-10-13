@@ -656,7 +656,7 @@ class VisualSettingsRequest(BaseModel):
 
 class VisualCenterRequest(BaseModel):
     """Body for ``POST /display/visual-center``: a picture in TRCC's own
-    folders; '' for TRCC's icon."""
+    folders; '' for none."""
     path: str = Field("", max_length=1024)
 
 

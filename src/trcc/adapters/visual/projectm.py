@@ -160,6 +160,8 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
     """A MilkDrop preset drawn by libprojectM on an EGL pbuffer; pictures
     read back as RGB24."""
 
+    RANK = 90                     # its thousands of presets come last
+
     INFO = VisualInfo(
         kind="milkdrop", title="MilkDrop", category="MilkDrop",
         uses_presets=True,

@@ -129,7 +129,7 @@ class AppSettings:
     # runs one way.  ``aura_argb_leds`` validates.
     aura_argb_leds: dict[str, int] = field(default_factory=dict)
     # The user's centre picture for audio visuals -- any image; ``None``
-    # shows TRCC's icon.
+    # shows none.
     visual_center: str | None = None
 
 
@@ -596,7 +596,7 @@ class Settings:
         return found
 
     def set_visual_center(self, path: str | None) -> None:
-        """Remember the user's centre picture (``None``: TRCC's icon)."""
+        """Remember the user's centre picture (``None``: none)."""
         log.info("set_visual_center: %s", path)
         with self._lock:
             self._app.visual_center = path

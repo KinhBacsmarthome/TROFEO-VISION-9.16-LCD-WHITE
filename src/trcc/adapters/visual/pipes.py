@@ -26,7 +26,7 @@ The numbers are taken; no code is.  The wheel, the bands, the peaks, the beat
 and the centre picture are TRCC's.  Drawn into a depth buffer as strings of
 lit spheres, CPU only (numpy) -- every OS.
 
-The centre picture is the user's -- anything; TRCC's icon until they pick
+The centre picture is the user's -- anything; none until they pick
 one.  It rocks toward the viewer and away, swells with the bass, and with
 Fire up it burns.
 """
@@ -56,10 +56,6 @@ from ._base import BaseVisual
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
-
-#: TRCC's own icon: the centre picture until the user picks one.
-DEFAULT_CENTER = (Path(__file__).resolve().parents[2] / "assets" / "icons"
-                  / "trcc_256x256.png")
 
 _GRID = 13                    # cells per side
 _BANDS = 8                    # one pipe per frequency band: few, so each is big
@@ -219,6 +215,7 @@ class _Pipe:
 class TrccPipes(BaseVisual, key="trcc-pipes"):
     """TRCC Pipes -- the first visual in the gallery."""
 
+    RANK = 0
     INFO = VisualInfo(
         kind="trcc-pipes", title="TRCC Pipes", category="TRCC",
         uses_center=True,
@@ -264,8 +261,8 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                  spec.height, spec.center, dict(spec.settings))
         self._w, self._h = spec.width, spec.height
         self.adjust(spec.settings)
-        picture = spec.center if spec.center is not None else DEFAULT_CENTER
-        if picture.is_file():
+        picture = spec.center
+        if picture is not None and picture.is_file():
             from PySide6.QtGui import QImage
             image = QImage(str(picture))
             if image.isNull():

@@ -45,7 +45,7 @@ from trcc.adapters.device.ly_lcd import _PID_LY
 from trcc.adapters.rgb.asus_aura import AURA_VID, MAINBOARD_PIDS, REPORT_ID
 from trcc.adapters.rgb.corsair_dram import crc8
 from trcc.adapters.system._base import disambiguate
-from trcc.adapters.visual.pipes import TrccPipes
+from trcc.adapters.visual import VISUALS
 from trcc.adapters.visual.projectm import MilkdropVisual
 from trcc.core.models import (
     SOUND_CHANNELS,
@@ -901,10 +901,11 @@ class ScriptedMilkdrop(MilkdropVisual):
         log.info("ScriptedMilkdrop.close")
 
 
-#: The visuals a stand-in platform draws: TRCC Pipes as itself (it is CPU
-#: only), MilkDrop scripted.
-SCRIPTED_VISUALS: Mapping[str, type[VisualEngine]] = MappingProxyType({
-    "trcc-pipes": TrccPipes, "milkdrop": ScriptedMilkdrop})
+#: The visuals a stand-in platform draws: every real one as itself (they
+#: are CPU only) but MilkDrop, scripted -- derived from the registry, so a
+#: new visual reaches the mocks without anyone remembering to add it here.
+SCRIPTED_VISUALS: Mapping[str, type[VisualEngine]] = MappingProxyType(
+    {**VISUALS, "milkdrop": ScriptedMilkdrop})
 MockPlatform.VISUALS = SCRIPTED_VISUALS
 #: A scripted beat, never the host's sound -- the same table a real
 #: platform fills, so the App reads it the same way.

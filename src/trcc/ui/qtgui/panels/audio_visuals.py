@@ -156,7 +156,7 @@ class AudioVisualsPanel(AssetBrowserPanel):
         return SetVisualSettings(key=key, settings=values)
 
     def _center_command(self, path: str) -> SetVisualCenter:
-        """The Command for a new centre picture ("" for TRCC's icon)."""
+        """The Command for a new centre picture ("" for none)."""
         log.debug("AudioVisualsPanel._center_command: %r", path)
         return SetVisualCenter(path=path)
 

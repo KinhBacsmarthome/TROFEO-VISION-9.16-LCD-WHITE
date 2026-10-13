@@ -3,7 +3,7 @@
 Under the gallery: one slider per adjustment the visual declares (its
 ``VisualInfo.adjustments`` -- TRCC Pipes has Growth, Thickness, Centre
 picture and Fire), and for a visual that shows a centre picture, a button to
-pick any image and one to go back to TRCC's icon.  A slider changes the
+pick any image and one to take it away.  A slider changes the
 visual LIVE when it is let go (``SetVisualSettings``): the visual keeps
 playing.  What the controls show comes from ``ListVisuals(key=...)``, so
 they show the same truth as every other UI, and follow a change another UI
@@ -63,11 +63,11 @@ class VisualControls(QWidget):
         self._hint.setWordWrap(True)
         self._pick = QPushButton("Centre picture…", self)
         self._pick.clicked.connect(self._on_pick_picture)
-        self._icon = QPushButton("TRCC icon", self)
-        self._icon.clicked.connect(self._on_trcc_icon)
+        self._none = QPushButton("No picture", self)
+        self._none.clicked.connect(self._on_no_picture)
         pictures = QHBoxLayout()
         pictures.addWidget(self._pick)
-        pictures.addWidget(self._icon)
+        pictures.addWidget(self._none)
         pictures.addStretch(1)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -92,7 +92,7 @@ class VisualControls(QWidget):
                 adjustment.name, adjustment.default))
         centred = info is not None and info.uses_center
         self._pick.setVisible(centred)
-        self._icon.setVisible(centred)
+        self._none.setVisible(centred)
         self._hint.setText(
             "Pick an audio visual above -- its sliders show here."
             if info is None else
@@ -150,8 +150,8 @@ class VisualControls(QWidget):
             dispatch_in_background(self._bus, self._center(path),
                                    self._on_answer)
 
-    def _on_trcc_icon(self) -> None:
-        log.info("VisualControls._on_trcc_icon")
+    def _on_no_picture(self) -> None:
+        log.info("VisualControls._on_no_picture")
         dispatch_in_background(self._bus, self._center(""), self._on_answer)
 
     def _on_answer(self, result: Result) -> None:

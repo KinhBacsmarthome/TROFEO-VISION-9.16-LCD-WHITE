@@ -603,7 +603,7 @@ class VisualResult(Result):
 class VisualsResult(Result):
     """``ListVisuals``: every audio visual this machine can draw, the preset
     files (relative to the visuals' folder) for those that draw presets, and
-    the user's centre picture ("" for TRCC's icon)."""
+    the user's centre picture ("" for none)."""
     visuals: tuple[VisualInfo, ...] = ()
     presets: tuple[str, ...] = ()
     center: str = ""

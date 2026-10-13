@@ -1685,7 +1685,7 @@ Draw the panel's background with the audio visual *visual* (a ``VISUALS`` key), 
 
 ### `SetVisualCenter`
 
-The centre picture for audio visuals that show one -- any image the user picks; an empty *path* goes back to TRCC's icon.  Every panel playing such a visual starts it again, so the picture shows at once.
+The centre picture for audio visuals that show one -- any image the user picks; an empty *path* takes it away.  Every panel playing such a visual starts it again, so the picture shows at once.
 
 *Command* → `VisualsResult`
 
