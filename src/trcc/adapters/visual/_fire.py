@@ -30,6 +30,12 @@ TUNED_FPS = 30
 STEP = TUNED_FPS / VISUAL_FPS
 #: Embers: what a burning colour turns toward.
 _HOT = np.array([1.0, 0.22, 0.05], dtype=np.float32)
+#: The flames' colours by heat, 0-255: black, red, orange, yellow, white --
+#: one table, so a frame looks colours up instead of working them out.
+_LEVELS = np.linspace(0.0, 1.0, 256, dtype=np.float32)[:, None]
+_PALETTE = (np.clip(np.concatenate([_LEVELS * 3, _LEVELS * 3 - 1,
+                                    _LEVELS * 3 - 2], axis=1), 0, 1)
+            * 255).astype(np.uint8)
 
 
 def keep(kept: float) -> float:
@@ -79,7 +85,7 @@ class Fire:
         return (self._h + 1) // 2, (self._w + 1) // 2
 
     def flames(self, seed: np.ndarray, strength: float, bass: float) -> np.ndarray:
-        """This frame's flames, full size, floats 0-1: heat added where
+        """This frame's flames, full size, RGB bytes: heat added where
         *seed* (half size, 0-1) burns -- harder with the *bass* -- risen,
         spread and cooled, as bright as *strength*."""
         frame_log.debug("Fire.flames: strength %.2f bass %.2f", strength, bass)
@@ -95,9 +101,8 @@ class Fire:
         spread = (rise + np.roll(rise, 1, axis=1) + np.roll(rise, -1, axis=1)
                   + np.roll(rise, -1, axis=0)) / 4.0
         self._heat = heat = spread * (0.955 - 0.03 * flicker) ** STEP
-        t = np.clip(heat * 1.4, 0.0, 1.0)[..., None] * strength
-        colour = np.concatenate([np.clip(t * 3.0, 0, 1), np.clip(t * 3.0 - 1, 0, 1),
-                                 np.clip(t * 3.0 - 2, 0, 1)], axis=2)
+        level = (np.clip(heat * (1.4 * strength), 0.0, 1.0) * 255).astype(np.uint8)
+        colour = _PALETTE[level]
         return colour.repeat(2, axis=0).repeat(2, axis=1)[:self._h, :self._w]
 
     def seed_from(self, paths: list[Any]) -> np.ndarray:

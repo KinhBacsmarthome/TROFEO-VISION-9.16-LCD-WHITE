@@ -309,22 +309,24 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._frame += 1
         self._follow_the_music()
         self._redraw()
-        gain = 1.0 + 0.35 * min(self._beat, 1.0)
-        out = self._color * gain
+        # The beat's glow and the scale to bytes in one pass, in place.
+        gain = (1.0 + 0.35 * min(self._beat, 1.0)) * 255.0
+        out = np.multiply(self._color, gain, out=self._scaled)
+        frame = np.clip(out, 0, 255, out=out).astype(np.uint8)
         placed = (self._center_placement()
                   if self._shown is not None and self._center_size > 0 else None)
         if self._fire > 0:
             # The pipes burn as the picture does: red-hot, flames rising off
-            # every pipe and off the picture's outline.
+            # every pipe and off the picture's outline -- merged in bytes.
             pipes = np.isfinite(self._depth)
             seed = pipes[::2, ::2].astype(np.float32) * _PIPE_HEAT
             if placed is not None:
                 seed = np.maximum(seed, self._picture_outline(placed))
-            burning = burn(out[pipes], self._fire * _PIPE_GLOW)
-            out = np.maximum(out, self._flames_of.flames(seed, self._fire,
-                                                            self._bass))
-            out[pipes] = burning            # the pipe itself, in front
-        frame = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+            burning = burn(self._color[pipes] * (gain / 255.0),
+                           self._fire * _PIPE_GLOW)
+            np.maximum(frame, self._flames_of.flames(seed, self._fire, self._bass),
+                       out=frame)
+            frame[pipes] = np.clip(burning * 255.0, 0, 255).astype(np.uint8)
         data = (self._with_center(frame, placed) if placed is not None
                 else frame.tobytes())
         return RawFrame(data=data, width=self._w, height=self._h)
@@ -343,6 +345,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         w, h = self._w, self._h
         self._color = np.zeros((h, w, 3), dtype=np.float32)
         self._depth = np.full((h, w), np.inf, dtype=np.float32)
+        self._scaled = np.empty_like(self._color)      # render's working copy
         self._turn += _TURN
         axis = np.array([math.cos(self._turn), math.sin(self._turn), 0.0])
         cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]],
