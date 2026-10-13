@@ -169,3 +169,35 @@ def test_a_burning_picture_sends_flames_up_from_a_circle(tmp_path: Path) -> None
 
     cold, hot = above(0.0), above(1.0)
     assert (hot[..., 0] - hot[..., 2]).mean() > (cold[..., 0] - cold[..., 2]).mean() + 20
+
+
+
+
+@pytest.mark.parametrize("kind", ["cavalier-wave", "cavalier-bars-circle"])
+def test_flames_are_fire_coloured(kind: str, tmp_path: Path) -> None:
+    """Wherever the fire changed a pixel, red leads green -- fire never
+    burns green or blue.  Fire.flames hands back finished bytes; scaling them
+    again wrapped past 255 and painted the user's flames green and blue
+    (2026-10-13, on his panel).  MUTATION CHECK: multiply the flames by 255
+    in CavalierVisual.render and this fails."""
+    picture = tmp_path / "white.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB888)
+    image.fill(0xFFFFFF)
+    image.save(str(picture))
+
+    def frame(fire: float) -> np.ndarray:
+        visual = VISUALS[kind]()
+        visual.open(VisualSpec(kind, 160, 160, center=picture, center_fire=fire))
+        _music(visual)
+        drawn = None
+        for _ in range(12):
+            drawn = visual.render()
+        return _pixels(drawn).astype(int)
+
+    cold, hot = frame(0.0), frame(1.0)
+    # Only bare background: a shape's anti-aliased edge over a flame is a
+    # fair blend of the two, and may lean blue.
+    bare = np.all(cold == 0x24, axis=2)                   # Cavalier's grey
+    burnt = bare & np.any(hot != cold, axis=2)
+    assert burnt.sum() > 100, kind
+    assert (hot[burnt][:, 0] >= hot[burnt][:, 1]).all(), kind

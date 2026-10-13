@@ -476,8 +476,8 @@ class CavalierVisual(BaseVisual):
         frame[:] = _BACKGROUND
         if self._fire > 0:
             # Behind the shapes: flames rising from where the picture was.
-            flames = self._flames.flames(self._seed, self._fire, self._bass())
-            frame = np.maximum(frame, (flames * 255).astype(np.uint8))
+            np.maximum(frame, self._flames.flames(self._seed, self._fire,
+                                                  self._bass()), out=frame)
         image = QImage(frame.data, self._w, self._h, 3 * self._w,
                        QImage.Format.Format_RGB888)
         painter = QPainter(image)
