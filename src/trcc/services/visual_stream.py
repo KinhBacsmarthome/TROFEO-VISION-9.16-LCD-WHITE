@@ -141,9 +141,17 @@ class VisualReader:
                     log.info("VisualReader: %s drew its first picture",
                              self.name)
         except OSError as e:
-            self._error = str(e)
-            log.warning("VisualReader: %s could not run -- %s",
-                        self.name, e)
+            if self._stop.is_set():
+                # Closing the sound under a waiting read fails that read --
+                # on Windows, soundcard's capture client is already gone.
+                # That is the stop, not a fault (logged as one on every exit
+                # of the Windows App, 2026-10-13).
+                log.info("VisualReader: %s stopped while listening (%s)",
+                         self.name, e)
+            else:
+                self._error = str(e)
+                log.warning("VisualReader: %s could not run -- %s",
+                            self.name, e)
         finally:
             if engine is not None:
                 engine.close()

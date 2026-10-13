@@ -654,6 +654,32 @@ def test_the_reader_knows_silence_from_sound(
         reader.close()
 
 
+class _FailsWhenClosed(ScriptedSound):
+    """A sound whose waiting read fails once it is closed under it -- what
+    Windows' loopback does when the App exits mid-read."""
+
+    def read(self, frames: int) -> bytes:
+        while not self.closed:
+            time.sleep(0.01)
+        raise OSError("Windows stopped sharing its sound: null pointer")
+
+
+def test_closing_the_reader_mid_read_is_a_stop_not_a_failure(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """A read that fails because the reader is closing is the stop itself:
+    no error, no WARNING in the user's report.  MUTATION CHECK: drop the
+    ``_stop`` test in ``_listen_and_draw``'s ``except OSError``."""
+    from trcc.services.visual_stream import VisualReader
+
+    reader = VisualReader(VisualSpec("trcc-pipes", 32, 32), _FailsWhenClosed,
+                          TrccPipes)
+    time.sleep(0.2)
+    with caplog.at_level("WARNING", logger="trcc.services.visual_stream"):
+        reader.close()
+    assert reader._error == ""                       # type: ignore[attr-defined]
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 # ── Windows: WASAPI loopback through soundcard ───────────────────────
 
 class _FakeRecorder:
