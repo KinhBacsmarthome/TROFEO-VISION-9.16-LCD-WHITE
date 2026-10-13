@@ -436,14 +436,47 @@ def test_a_computer_that_cannot_hear_says_so_up_front(
     assert app.dispatch(VisualTile(visual="trcc-pipes", size=32)).ok
 
 
-def test_without_ffmpeg_there_is_nothing_to_hear(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("pulse", "programs", "tool"), [
+    (True, {"ffmpeg", "pw-record"}, "ffmpeg"),       # nearly every desktop
+    (False, {"ffmpeg", "pw-record"}, "pw-record"),   # PipeWire, no Pulse layer
+    (True, {"pw-record"}, "pw-record"),              # no ffmpeg
+    (False, {"ffmpeg"}, ""),                         # ALSA only
+])
+def test_linux_listens_with_what_the_system_has(
+        monkeypatch: pytest.MonkeyPatch, pulse: bool, programs: set[str],
+        tool: str) -> None:
     from trcc.adapters.visual import sound
 
-    monkeypatch.setattr(sound.toolchain, "present", lambda name: False)
-    assert sound.MonitorSoundInput.problem() == (
-        "ffmpeg is not installed -- it is what hears the music for an audio "
-        "visual")
+    monkeypatch.setattr(sound, "pulse_listens", lambda: pulse)
+    monkeypatch.setattr(sound.toolchain, "present",
+                        lambda name: name in programs)
+    monkeypatch.setattr(sound.toolchain, "executable", lambda name: name)
+    assert sound.MonitorSoundInput.tool() == tool
+    if tool:
+        command = sound.MonitorSoundInput().command()
+        assert command[0] == tool
+        assert ("{ stream.capture.sink=true }" in command) is (tool == "pw-record")
+        assert sound.MonitorSoundInput.problem() == ""
+    else:
+        assert sound.MonitorSoundInput.problem() == (
+            "TRCC hears the music through ffmpeg with PulseAudio (or "
+            "PipeWire's PulseAudio layer), or through PipeWire's pw-record "
+            "-- neither is here")
+
+
+def test_a_pulse_server_is_found_the_way_libpulse_finds_it(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from trcc.adapters.visual import sound
+
+    monkeypatch.delenv("PULSE_SERVER", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    assert not sound.pulse_listens()
+    (tmp_path / "pulse").mkdir()
+    (tmp_path / "pulse" / "native").touch()
+    assert sound.pulse_listens()
+    (tmp_path / "pulse" / "native").unlink()
+    monkeypatch.setenv("PULSE_SERVER", "tcp:localhost")
+    assert sound.pulse_listens()
 
 
 def test_the_gallery_carries_why_a_visual_cannot_play() -> None:

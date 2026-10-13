@@ -1,4 +1,4 @@
-"""What an audio visual hears on Linux: what is playing, through ffmpeg.
+"""What an audio visual hears on Linux: what is playing.
 
 PulseAudio -- and PipeWire through its PulseAudio server, the default on
 current distributions -- gives every output a *monitor*: an input that
@@ -6,11 +6,19 @@ carries exactly what is being played.  ``@DEFAULT_MONITOR@`` names the
 default output's, so this follows the speakers the user picked.  ffmpeg
 already ships with TRCC (videos, web streams) and reads it with its ``pulse``
 input: no new dependency, nothing recorded to disk.
+
+ffmpeg has no PipeWire input, so a system running PipeWire WITHOUT its Pulse
+server is read with PipeWire's own ``pw-record``, capturing the default
+output (``stream.capture.sink``) -- the same raw float32 on stdout.  Both
+were run on PipeWire 1.6.9 (2026-10-12).  A system with only ALSA has no
+monitor at all without hand-made loopback routing, so it is told so.
 """
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+from pathlib import Path
 
 from ...core import toolchain
 from ...core.logs import per_frame
@@ -24,8 +32,20 @@ frame_log = per_frame(__name__)
 FRAME_BYTES = 4 * SOUND_CHANNELS
 
 
+def pulse_listens() -> bool:
+    """Whether a PulseAudio server answers here -- PulseAudio itself or
+    PipeWire's Pulse layer -- found the way libpulse finds it:
+    ``PULSE_SERVER``, else the socket in the user's runtime directory."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    listens = bool(os.environ.get("PULSE_SERVER")) or (
+        Path(runtime) / "pulse" / "native").exists()
+    log.debug("pulse_listens: %s", listens)
+    return listens
+
+
 class MonitorSoundInput(SoundInput):
-    """The default output's monitor, as raw float32 from ffmpeg."""
+    """The default output's monitor, as raw float32 -- from ffmpeg where a
+    PulseAudio server listens, else from PipeWire's ``pw-record``."""
 
     #: The PulseAudio source: the monitor of whatever output is the default.
     SOURCE = "@DEFAULT_MONITOR@"
@@ -34,9 +54,23 @@ class MonitorSoundInput(SoundInput):
         log.debug("MonitorSoundInput.__init__")
         self._proc: subprocess.Popen[bytes] | None = None
 
+    @staticmethod
+    def tool() -> str:
+        """``ffmpeg``, ``pw-record``, or "" when neither can listen here."""
+        tool = ("ffmpeg" if pulse_listens() and toolchain.present("ffmpeg")
+                else "pw-record" if toolchain.present("pw-record") else "")
+        log.debug("MonitorSoundInput.tool: %r", tool)
+        return tool
+
     def command(self) -> list[str]:
-        """ffmpeg reading the monitor live, writing samples to its stdout."""
-        log.debug("MonitorSoundInput.command: %s", self.SOURCE)
+        """The tool reading the monitor live, writing samples to stdout."""
+        tool = self.tool()
+        log.debug("MonitorSoundInput.command: %s", tool)
+        if tool == "pw-record":
+            return [toolchain.executable("pw-record"),
+                    "-P", "{ stream.capture.sink=true }", "--raw",
+                    "--format=f32", f"--rate={SOUND_RATE}",
+                    f"--channels={SOUND_CHANNELS}", "-"]
         return [toolchain.executable("ffmpeg"),
                 "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-f", "pulse", "-i", self.SOURCE,
@@ -45,10 +79,12 @@ class MonitorSoundInput(SoundInput):
 
     @classmethod
     def problem(cls) -> str:
-        """ffmpeg is what listens: without it there is nothing to hear."""
-        problem = ("" if toolchain.present("ffmpeg")
-                   else "ffmpeg is not installed -- it is what hears the "
-                        "music for an audio visual")
+        """Nothing to listen with: ffmpeg with a PulseAudio server (or
+        PipeWire's Pulse layer), or PipeWire's pw-record."""
+        problem = ("" if cls.tool() else
+                   "TRCC hears the music through ffmpeg with PulseAudio (or "
+                   "PipeWire's PulseAudio layer), or through PipeWire's "
+                   "pw-record -- neither is here")
         log.debug("MonitorSoundInput.problem: %r", problem)
         return problem
 
