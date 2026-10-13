@@ -32,6 +32,7 @@ from ...core.ports import (
     SensorEnumerator,
 )
 from ..sensors.windows import build_windows_sensors
+from ..visual import WglSurface, drawn_on
 from ..visual.loopback import LoopbackSoundInput
 from ._base import BaseOS, BasePaths
 from ._windows_wmi import wmi_handle
@@ -373,8 +374,10 @@ class WindowsPlatform(BaseOS, key="win32"):
     _INSTALL_HINTS = _WIN_INSTALL_HINTS
 
     #: Audio visuals: what is playing, by WASAPI loopback of the default
-    #: output (``adapters/visual/loopback.py``).
+    #: output (``adapters/visual/loopback.py``), drawn on WGL behind a
+    #: hidden window -- headless too.
     SOUND_INPUT = LoopbackSoundInput
+    VISUALS = drawn_on(WglSurface)
 
     # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
 

@@ -48,7 +48,8 @@ def _resolve(app: App, visual: str,
         if info is not None and info.uses_presets else None)
     problem = (f"no audio visual {visual!r} on this computer" if info is None
                else f"no preset {preset!r} in the visuals' folder"
-               if info.uses_presets and path is None else "")
+               if info.uses_presets and path is None
+               else app.platform.visual_class(visual).problem())
     log.debug("_resolve: %s %r -> %s %r", visual, preset, path, problem)
     return info, path, problem
 
@@ -105,8 +106,8 @@ class ListVisuals(Query[VisualsResult]):
 
     def execute(self, app: App) -> VisualsResult:
         problem = _sound_problem(app)
-        visuals = tuple(replace(v, problem=problem)
-                        for v in app.platform.visual_catalog())
+        visuals = tuple(replace(v, problem=problem or app.platform.visual_class(
+            v.kind).problem()) for v in app.platform.visual_catalog())
         base = app.platform.paths().visuals_dir()
         presets = tuple(name for v in visuals if v.uses_presets
                         for name in app.platform.visual_class(v.kind).presets(base))

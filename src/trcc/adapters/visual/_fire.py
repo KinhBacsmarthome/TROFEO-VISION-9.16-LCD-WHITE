@@ -7,7 +7,8 @@ picture burns it the same way through :class:`Fire`.
 The flames are the old demoscene fire: heat seeded where things burn rises
 two rows a frame, spreads to its neighbours and cools, coloured black, red,
 orange, yellow, white.  Worked at half resolution -- flames are blurry -- and
-shown at full, a quarter of the work.
+shown at full, a quarter of the work.  TRCC Pipes burns by the same rule
+on the graphics card (``_pipes_gl``): a change here is a change there.
 
 Its motion was tuned by eye at 30 frames a second; visuals draw at
 ``VISUAL_FPS`` (16), so a per-frame keep becomes ``keep ** STEP`` and a
@@ -28,6 +29,8 @@ frame_log = per_frame(__name__)
 
 TUNED_FPS = 30
 STEP = TUNED_FPS / VISUAL_FPS
+#: Rows the heat rises a frame, at the fire's half size: two at 30 fps.
+RISE = max(1, round(2 * STEP))
 #: Embers: what a burning colour turns toward.
 _HOT = np.array([1.0, 0.22, 0.05], dtype=np.float32)
 #: The flames' colours by heat, 0-255: black, red, orange, yellow, white --
@@ -95,9 +98,8 @@ class Fire:
         flicker = np.random.random(seed.shape).astype(np.float32)
         heat = np.maximum(heat, seed * (0.6 + 0.4 * flicker)
                           * (0.7 + 0.5 * min(bass, 1.3)))
-        lift = max(1, round(2 * STEP))
-        rise = np.roll(heat, -lift, axis=0)
-        rise[-lift:] = 0
+        rise = np.roll(heat, -RISE, axis=0)
+        rise[-RISE:] = 0
         spread = (rise + np.roll(rise, 1, axis=1) + np.roll(rise, -1, axis=1)
                   + np.roll(rise, -1, axis=0)) / 4.0
         self._heat = heat = spread * (0.955 - 0.03 * flicker) ** STEP

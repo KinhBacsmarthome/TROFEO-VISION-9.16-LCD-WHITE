@@ -6,7 +6,7 @@ Every abstract contract in the tree: what a new implementation must write, what 
 
 Ordered **cheapest to extend first** — the ports at the top are where this codebase welcomes a contributor, the ones at the bottom are where it does not yet.
 
-52 ports.
+54 ports.
 
 | port | implement | inherit | implementations |
 |---|---|---|---|
@@ -21,6 +21,7 @@ Ordered **cheapest to extend first** — the ports at the top are where this cod
 | [`UserInterface`](#userinterface) | 1 | 11 | 5 |
 | [`_QtUI`](#_qtui) | 1 | 3 | 2 |
 | [`DataInstallRunner`](#datainstallrunner) | 2 | 0 | 2 |
+| [`GlSurface`](#glsurface) | 2 | 1 | 3 |
 | [`IdentifiedSource`](#identifiedsource) | 2 | 0 | 19 |
 | [`RgbHardware`](#rgbhardware) | 2 | 0 | 2 |
 | [`SingleFileTheme`](#singlefiletheme) | 2 | 0 | 1 |
@@ -52,6 +53,7 @@ Ordered **cheapest to extend first** — the ports at the top are where this cod
 | [`SmBus`](#smbus) | 4 | 0 | 1 |
 | [`BaseVisual`](#basevisual) | 5 | 0 | 14 |
 | [`BulkTransport`](#bulktransport) | 5 | 0 | 2 |
+| [`GlVisual`](#glvisual) | 5 | 0 | 1 |
 | [`RamLights`](#ramlights) | 5 | 0 | 1 |
 | [`ScsiTransport`](#scsitransport) | 5 | 0 | 3 |
 | [`VisualEngine`](#visualengine) | 5 | 0 | 14 |
@@ -231,6 +233,23 @@ submit(resolution: 'tuple[int, int]', variant: 'str' = '', mask_variant: 'str' =
 ```
 
 **Implementations (2):** `SyncDataInstallRunner` · `ThreadDataInstallRunner`
+
+## GlSurface
+
+`adapters/visual/_gl.py`
+
+An OpenGL context with nowhere on screen to draw: current on the thread that made it, until :meth:`close`.  Draw into a :class:`Framebuffer`; read back with :func:`read_rgb`.
+
+**You implement (2):**
+
+```python
+address(name: 'str') -> int
+close() -> None
+```
+
+**You inherit (1):** `describe`
+
+**Implementations (3):** `CglSurface` · `EglSurface` · `WglSurface`
 
 ## IdentifiedSource
 
@@ -756,6 +775,24 @@ write(endpoint: 'int', data: 'WriteBuffer', timeout_ms: 'int' = 100) -> int
 ```
 
 **Implementations (2):** `HidApiTransport` · `PyUsbBulkTransport`
+
+## GlVisual
+
+`adapters/visual/_base.py`
+
+A visual drawn with OpenGL, on the context its platform names (:func:`drawn_on`).  Listed wherever it is registered; where no context opens -- or none is named -- the gallery shows it with the reason.
+
+**You implement (5):**
+
+```python
+adjust(settings: 'Mapping[str, float]') -> None
+close() -> None
+feed(pcm: 'bytes') -> None
+open(spec: 'VisualSpec') -> None
+render() -> RawFrame
+```
+
+**Implementations (1):** `TrccPipes`
 
 ## RamLights
 

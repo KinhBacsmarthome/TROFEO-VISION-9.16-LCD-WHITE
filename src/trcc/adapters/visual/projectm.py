@@ -36,6 +36,7 @@ from ...core.models import (
     VisualSpec,
 )
 from ._base import BaseVisual
+from ._gl import EglSurface, read_rgb
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -44,20 +45,6 @@ frame_log = per_frame(__name__)
 PRESET_SUFFIX = ".milk"
 #: libprojectM 4's names: what ``find_library`` resolves, then the soname.
 _LIBRARY = ("projectM-4", "libprojectM-4.so.4")
-
-_EGL_PBUFFER_BIT, _EGL_OPENGL_BIT, _EGL_OPENGL_API = 0x1, 0x8, 0x30A2
-_EGL_SURFACE_TYPE, _EGL_RENDERABLE_TYPE = 0x3033, 0x3040
-_EGL_RED, _EGL_GREEN, _EGL_BLUE, _EGL_ALPHA = 0x3024, 0x3023, 0x3022, 0x3021
-_EGL_DEPTH, _EGL_WIDTH, _EGL_HEIGHT, _EGL_NONE = 0x3025, 0x3057, 0x3056, 0x3038
-_EGL_MAJOR, _EGL_MINOR, _EGL_PROFILE, _EGL_CORE = 0x3098, 0x30FB, 0x30FD, 0x1
-_GL_RGB, _GL_UNSIGNED_BYTE, _GL_PACK_ALIGNMENT = 0x1907, 0x1401, 0x0D05
-_GL_READ_FRAMEBUFFER = 0x8CA8
-
-
-def _ints(*values: int) -> ctypes.Array[ctypes.c_int]:
-    log.debug("_ints: %d value(s)", len(values))
-    return (ctypes.c_int * len(values))(*values)
-
 
 def load_projectm() -> ctypes.CDLL:
     """libprojectM 4, or ``OSError`` saying it is not installed."""
@@ -84,76 +71,6 @@ def load_projectm() -> ctypes.CDLL:
             ("projectm_opengl_render_frame", [ctypes.c_void_p])):
         getattr(lib, name).argtypes = args
     return lib
-
-
-class _EglSurface:
-    """An invisible OpenGL 3.3 core surface: a pbuffer, current on the
-    thread that made it."""
-
-    def __init__(self, width: int, height: int) -> None:
-        log.info("_EglSurface: %dx%d", width, height)
-        try:
-            egl = ctypes.CDLL("libEGL.so.1")
-            self.gl = ctypes.CDLL("libOpenGL.so.0")
-        except OSError as e:
-            raise OSError(f"OpenGL (EGL) is not available: {e}") from e
-        for name in ("eglGetDisplay", "eglCreatePbufferSurface",
-                     "eglCreateContext"):
-            getattr(egl, name).restype = ctypes.c_void_p
-        egl.eglGetDisplay.argtypes = [ctypes.c_void_p]
-        egl.eglInitialize.argtypes = [ctypes.c_void_p] + [ctypes.c_void_p] * 2
-        egl.eglChooseConfig.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_void_p), ctypes.c_int,
-            ctypes.POINTER(ctypes.c_int)]
-        egl.eglCreatePbufferSurface.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-        egl.eglCreateContext.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int)]
-        egl.eglMakeCurrent.argtypes = [ctypes.c_void_p] * 4
-        egl.eglDestroySurface.argtypes = [ctypes.c_void_p] * 2
-        egl.eglDestroyContext.argtypes = [ctypes.c_void_p] * 2
-        egl.eglTerminate.argtypes = [ctypes.c_void_p]
-        self._egl = egl
-        self._display = egl.eglGetDisplay(None)
-        config, count = ctypes.c_void_p(), ctypes.c_int()
-        if not (self._display and egl.eglInitialize(self._display, None, None)
-                and egl.eglChooseConfig(
-                    self._display,
-                    _ints(_EGL_SURFACE_TYPE, _EGL_PBUFFER_BIT,
-                          _EGL_RENDERABLE_TYPE, _EGL_OPENGL_BIT, _EGL_RED, 8,
-                          _EGL_GREEN, 8, _EGL_BLUE, 8, _EGL_ALPHA, 8,
-                          _EGL_DEPTH, 24, _EGL_NONE),
-                    ctypes.byref(config), 1, ctypes.byref(count))
-                and count.value and egl.eglBindAPI(_EGL_OPENGL_API)):
-            raise OSError("OpenGL (EGL) found no off-screen surface to draw on")
-        self._surface = egl.eglCreatePbufferSurface(
-            self._display, config,
-            _ints(_EGL_WIDTH, width, _EGL_HEIGHT, height, _EGL_NONE))
-        self._context = egl.eglCreateContext(
-            self._display, config, None,
-            _ints(_EGL_MAJOR, 3, _EGL_MINOR, 3, _EGL_PROFILE, _EGL_CORE,
-                  _EGL_NONE))
-        if not (self._surface and self._context and egl.eglMakeCurrent(
-                self._display, self._surface, self._surface, self._context)):
-            self.close()
-            raise OSError("OpenGL 3.3 is not available to draw audio visuals")
-        self.gl.glGetString.restype = ctypes.c_char_p
-        log.info("_EglSurface: %s, %s",
-                 (self.gl.glGetString(0x1F01) or b"?").decode(errors="replace"),
-                 (self.gl.glGetString(0x1F02) or b"?").decode(errors="replace"))
-
-    def close(self) -> None:
-        log.debug("_EglSurface.close")
-        egl, display = self._egl, self._display
-        egl.eglMakeCurrent(display, None, None, None)
-        if self._context:
-            egl.eglDestroyContext(display, self._context)
-        if self._surface:
-            egl.eglDestroySurface(display, self._surface)
-        egl.eglTerminate(display)
-        self._context = self._surface = None
 
 
 class MilkdropVisual(BaseVisual, key="milkdrop"):
@@ -189,7 +106,7 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
             log.info("MilkdropVisual: libprojectM 4 is not installed")
             return False
         try:
-            lib, surface = load_projectm(), _EglSurface(16, 16)
+            lib, surface = load_projectm(), EglSurface(16, 16, core=True)
         except OSError as e:
             log.warning("MilkdropVisual: cannot draw here -- %s", e)
             return False
@@ -225,7 +142,7 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
     def __init__(self) -> None:
         log.debug("MilkdropVisual.__init__")
         self._lib: ctypes.CDLL | None = None
-        self._surface: _EglSurface | None = None
+        self._surface: EglSurface | None = None
         self._handle: int | None = None
         self._size = (0, 0)
 
@@ -235,7 +152,7 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
         if preset is None:
             raise OSError("a MilkDrop visual needs a preset file")
         self._lib = lib = load_projectm()
-        self._surface = _EglSurface(width, height)
+        self._surface = EglSurface(width, height, core=True)
         self._handle = lib.projectm_create()
         if not self._handle:
             self.close()
@@ -271,20 +188,12 @@ class MilkdropVisual(BaseVisual, key="milkdrop"):
             raise OSError("projectM is not open")
         width, height = self._size
         self._lib.projectm_opengl_render_frame(self._handle)
-        gl = self._surface.gl
         # projectM binds only the DRAW framebuffer to 0 for its finished
         # picture, and leaves READ on its own buffer -- the image before the
         # preset's final shader.  Reading that showed every preset without
-        # its composite pass (a red test shader came back black).
-        gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, 0)
-        gl.glPixelStorei(_GL_PACK_ALIGNMENT, 1)
-        rows = ctypes.create_string_buffer(width * height * 3)
-        gl.glReadPixels(0, 0, width, height, _GL_RGB, _GL_UNSIGNED_BYTE, rows)
-        stride = width * 3
-        raw = rows.raw
-        # OpenGL's first row is the bottom one; a panel's is the top.
-        data = b"".join(raw[y * stride:(y + 1) * stride]
-                        for y in range(height - 1, -1, -1))
+        # its composite pass (a red test shader came back black); read_rgb
+        # binds READ to 0 itself.
+        data = read_rgb(self._surface.gl, 0, width, height)
         frame_log.debug("MilkdropVisual.render: %dx%d", width, height)
         return RawFrame(data=data, width=width, height=height)
 

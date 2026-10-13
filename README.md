@@ -359,6 +359,7 @@ TRCC Linux stands on other people's open-source work. Credit where it is due —
 - **[projectM](https://github.com/projectM-visualizer/projectm)** (LGPL-2.1) — the MilkDrop audio visual drives libprojectM, the open-source reimplementation of **MilkDrop** by Ryan Geiss.
 - **[SoundCard](https://github.com/bastibe/SoundCard)** (BSD-3-Clause) by Bastian Bechtold — on Windows, the audio visuals hear what is playing through its WASAPI loopback recording.
 - **[catap](https://github.com/sbetko/catap)** (MIT) by Stephen Betko — on macOS 14.2+, the audio visuals hear what is playing through its Core Audio process-tap recording.
+- **[glcontext](https://github.com/moderngl/glcontext)** (MIT) by the ModernGL contributors — TRCC Pipes draws on an off-screen OpenGL context made the way glcontext makes one on each OS: EGL on Linux and the BSDs, WGL behind a hidden window on Windows, CGL on macOS. Reimplemented with `ctypes`; no code is copied.
 - **[Cavalier](https://github.com/NickvisionApps/Cavalier)** (MIT) by Fyodor Sobolev — the eleven Cavalier audio visuals (Wave, Levels, Particles, Bars, Spine, Splitter, and five circles) are ported from its renderer, with its defaults.
 - **[CAVA](https://github.com/karlstav/cava)** (MIT) by Karl Stavestrand — the audio engine under those visuals is a port of its `cavacore` (band layout, EQ, gravity and integral smoothing, automatic sensitivity) and its monstercat smoothing, checked number for number against the real engine.
 

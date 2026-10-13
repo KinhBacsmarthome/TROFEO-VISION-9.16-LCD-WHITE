@@ -2505,6 +2505,14 @@ class VisualEngine(ABC):
         return True
 
     @classmethod
+    def problem(cls) -> str:
+        """Why this machine cannot draw it -- "" when it can.  Unlike
+        ``available``, the gallery still shows it, with this reason: a
+        visual every user expects (TRCC Pipes) says why it is missing."""
+        log.debug("%s.problem: none", cls.__name__)
+        return ""
+
+    @classmethod
     def presets(cls, folder: Path) -> tuple[str, ...]:
         """The preset files under *folder* this visual draws, relative to it;
         none for a visual without presets."""

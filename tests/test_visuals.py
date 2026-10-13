@@ -4,14 +4,15 @@ A visual is a key in ``VISUALS``; ``PlayVisual`` runs it on the screencast's
 chain (reader -> ``VisualDriver`` -> ``CaptureVisualFrame`` ->
 ``SendScreencastFrame``), exactly as a web stream runs.  The stand-in
 platform hears a scripted beat and scripts MilkDrop, so no test reaches the
-host's sound card or GPU.
+host's sound card; TRCC Pipes draws on the host's own OpenGL, as the App
+would -- Mesa's software one in CI.
 """
 from __future__ import annotations
 
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -20,9 +21,10 @@ from PySide6.QtGui import QImage
 from tests.conftest import show_a_theme
 from tests.mock_platform import MockPlatform, ScriptedSound
 from trcc.adapters.render.qt import QtRenderer
+from trcc.adapters.system import host_platform_class
 from trcc.adapters.visual import VISUALS, catalog
+from trcc.adapters.visual import pipes as pipes_module
 from trcc.adapters.visual import projectm as projectm_module
-from trcc.adapters.visual.pipes import TrccPipes
 from trcc.app import App
 from trcc.core.commands import (
     CaptureVisualFrame,
@@ -50,6 +52,12 @@ _SPEC = {"vid": "0402", "pid": "3922", "fbl": 100}
 
 # ── The registry ─────────────────────────────────────────────────────
 
+#: TRCC Pipes as this host draws it: bound to the host's OpenGL context,
+#: as the App's platform binds it.
+TrccPipes = cast("type[pipes_module.TrccPipes]",
+                 host_platform_class().VISUALS["trcc-pipes"])
+
+
 def test_every_visual_registers_by_the_key_in_its_class_line() -> None:
     """The registry keeps the order modules load; the gallery's order is
     the rank (test_cavalier checks Pipes first)."""
@@ -73,7 +81,7 @@ class _FakeProjectM:
 class _FakeSurface:
     closed = 0
 
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(self, width: int, height: int, core: bool = False) -> None:
         pass
 
     def close(self) -> None:
@@ -101,7 +109,7 @@ def test_milkdrop_is_offered_only_where_projectm_can_draw(
     monkeypatch.setattr(projectm_module.ctypes.util, "find_library",
                         lambda name: "libprojectM-4.so.4" if installed else None)
     monkeypatch.setattr(projectm_module, "load_projectm", load)
-    monkeypatch.setattr(projectm_module, "_EglSurface", _FakeSurface)
+    monkeypatch.setattr(projectm_module, "EglSurface", _FakeSurface)
     kinds = [info.kind for info in catalog()
              if not info.kind.startswith("cavalier-")]
     assert kinds == (["trcc-pipes", "milkdrop"] if offered else ["trcc-pipes"])

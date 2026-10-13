@@ -24,6 +24,7 @@ from ...core.ports import (
 )
 from ..device.transport import PyUsbBulkTransport
 from ..device.usb_bot_scsi import UsbBotScsiTransport
+from ..visual import EglSurface, drawn_on
 from ._base import BaseOS, BasePaths
 
 log = logging.getLogger(__name__)
@@ -100,6 +101,9 @@ class BsdOS(BaseOS, key="bsd"):
     hotplugd(8).  One class branching on ``sys.platform`` four times is what
     that used to cost.
     """
+
+    #: Audio visuals draw on EGL, as on Linux (no sound input yet).
+    VISUALS = drawn_on(EglSurface)
 
     # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
 

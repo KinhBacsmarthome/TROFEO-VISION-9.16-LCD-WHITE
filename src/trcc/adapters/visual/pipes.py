@@ -23,8 +23,10 @@ sample Microsoft published in the Windows NT 4.0 SDK
   direction the wheel leans.
 
 The numbers are taken; no code is.  The wheel, the bands, the peaks, the beat
-and the centre picture are TRCC's.  Drawn into a depth buffer as strings of
-lit spheres, CPU only (numpy) -- every OS.
+and the centre picture are TRCC's.  What to draw is worked out here, on the
+CPU; the drawing -- every tube, ball, flame and the picture -- is OpenGL's
+(``_pipes_gl``), on the context the platform names: every OS with OpenGL 3,
+the graphics card's or a software one.
 
 The centre picture is the user's -- anything; none until they pick
 one.  It rocks toward the viewer and away, swells with the bass, and with
@@ -52,8 +54,10 @@ from ...core.models import (
     VisualInfo,
     VisualSpec,
 )
-from ._base import BaseVisual
-from ._fire import STEP, Fire, burn, burned_picture, keep
+from ._base import GlVisual
+from ._fire import RISE, STEP, burned_picture, keep
+from ._gl import GlSurface
+from ._pipes_gl import SHAPE_FIELDS, PipesPainter
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -148,8 +152,9 @@ _MATERIALS = tuple(_material(*row) for row in (
     ("white rubber", (0.05, 0.05, 0.05), (0.5, 0.5, 0.5),
      (0.7, 0.7, 0.7), 0.078125),
 ))
-#: The peak markers: the table's white plastic, whatever the pipe is made of.
-_PEAK = _MATERIALS[11]
+#: The peak markers: the table's white plastic, whatever the pipe is made of
+#: -- by its place in the table, as the painter knows the materials.
+_PEAK = 11
 
 
 
@@ -159,48 +164,23 @@ def band_edges() -> np.ndarray:
     return np.geomspace(40.0, 14000.0, _BANDS + 1)
 
 
-class _Sprites:
-    """A sphere at each pixel radius, lit in each material: coverage, the
-    lit colour, and how far its surface stands toward the camera."""
-
-    def __init__(self) -> None:
-        log.debug("_Sprites.__init__")
-        self._cache: dict[tuple[int, str], tuple[np.ndarray, ...]] = {}
-
-    def get(self, radius: int, material: _Material) -> tuple[np.ndarray, ...]:
-        frame_log.debug("_Sprites.get: %d %s", radius, material.name)
-        key = (radius, material.name)
-        if key not in self._cache:
-            span = np.arange(-radius, radius + 1, dtype=np.float32) / (radius + 0.5)
-            xx, yy = np.meshgrid(span, span)
-            d2 = xx * xx + yy * yy
-            nz = np.sqrt(np.clip(1.0 - d2, 0.0, 1.0))
-            n_l = np.clip(xx * _LIGHT[0] + yy * _LIGHT[1] + nz * _LIGHT[2],
-                          0.0, 1.0)
-            n_h = np.clip(xx * _HALF[0] + yy * _HALF[1] + nz * _HALF[2],
-                          0.0, 1.0)
-            lit = (material.ambient + n_l[..., None] * material.diffuse
-                   + (n_h ** material.shininess)[..., None] * material.specular)
-            self._cache[key] = (d2 <= 1.0, lit, nz)
-        return self._cache[key]
-
-
 class _Pipe:
-    """One pipe: its band, its material, its path from the centre out as
+    """One pipe: its band, its material (its place in ``_MATERIALS``), its
+    path from the centre out as
     screen points, and the index of its elbow.  ``reach`` is how much of the
     path the music shows now."""
 
-    def __init__(self, band: int, material: _Material,
+    def __init__(self, band: int, material: int,
                  points: np.ndarray, elbow: int) -> None:
         log.debug("_Pipe: band %d, %s, %d point(s), elbow at %d", band,
-                  material.name, len(points), elbow)
+                  _MATERIALS[material].name, len(points), elbow)
         self.band, self.material = band, material
         self.points, self.elbow = points, elbow
         self.reach = 0.0
         self.peak = 0.0          # the old graphic EQ's peak marker
 
 
-class TrccPipes(BaseVisual, key="trcc-pipes"):
+class TrccPipes(GlVisual, key="trcc-pipes"):
     """TRCC Pipes -- the first visual in the gallery."""
 
     RANK = 0
@@ -224,7 +204,8 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
 
     def __init__(self) -> None:
         log.debug("TrccPipes.__init__")
-        self._sprites = _Sprites()
+        self._surface: GlSurface | None = None
+        self._painter: PipesPainter | None = None
         self._edges = band_edges()
         self._band_peak = np.full(_BANDS, 1e-3)
         self._bands = np.zeros(_BANDS)
@@ -258,7 +239,17 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 self._center = image
         # The fire is the picture's: no picture, no fire (the user's call).
         self._fire = spec.center_fire if self._center is not None else 0.0
-        self._flames_of = Fire(self._w, self._h)
+        self._surface = surface = self._open_surface()
+        try:
+            self._painter = PipesPainter(
+                surface, self._w, self._h,
+                [(m.ambient, m.diffuse, m.specular, m.shininess)
+                 for m in _MATERIALS],
+                _LIGHT, _HALF, _GRID / 2 * _DISTANCE + _GRID,
+                (RISE, STEP, _PIPE_HEAT))
+        except OSError:
+            self.close()
+            raise
         self._prepare_center()
         self._new_round()
 
@@ -306,33 +297,27 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
 
     def render(self) -> RawFrame:
         frame_log.debug("TrccPipes.render: frame %d", self._frame)
+        if self._painter is None:
+            raise OSError("TRCC Pipes is not open")
         self._frame += 1
         self._follow_the_music()
-        self._redraw()
-        # The beat's glow and the scale to bytes in one pass, in place.
-        gain = (1.0 + 0.35 * min(self._beat, 1.0)) * 255.0
-        out = np.multiply(self._color, gain, out=self._scaled)
-        frame = np.clip(out, 0, 255, out=out).astype(np.uint8)
+        beat = min(self._beat, 1.0)
         placed = (self._center_placement()
                   if self._shown is not None and self._center_size > 0 else None)
-        if self._fire > 0:
-            # The pipes burn as the picture does: red-hot, flames rising off
-            # every pipe and off the picture's outline -- merged in bytes.
-            pipes = np.isfinite(self._depth)
-            seed = pipes[::2, ::2].astype(np.float32) * _PIPE_HEAT
-            if placed is not None:
-                seed = np.maximum(seed, self._picture_outline(placed))
-            burning = burn(self._color[pipes] * (gain / 255.0),
-                           self._fire * _PIPE_GLOW)
-            np.maximum(frame, self._flames_of.flames(seed, self._fire, self._bass),
-                       out=frame)
-            frame[pipes] = np.clip(burning * 255.0, 0, 255).astype(np.uint8)
-        data = (self._with_center(frame, placed) if placed is not None
-                else frame.tobytes())
+        data = self._painter.paint(
+            self._shapes(_RADIUS * self._thickness * (1.0 + 0.45 * beat)),
+            gain=1.0 + 0.35 * beat, glow=self._fire * _PIPE_GLOW,
+            fire=self._fire, bass=self._bass, placed=placed)
         return RawFrame(data=data, width=self._w, height=self._h)
 
     def close(self) -> None:
-        log.info("TrccPipes.close")
+        log.info("TrccPipes.close: open=%s", self._surface is not None)
+        if self._painter is not None:
+            self._painter.close()
+            self._painter = None
+        if self._surface is not None:
+            self._surface.close()
+            self._surface = None
         self._center = self._shown = None
 
     # ── the screen saver ─────────────────────────────────────────────
@@ -343,9 +328,6 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         way, turned on as the screen saver turned its scene each reset."""
         self._frame = self._rolled = getattr(self, "_frame", 0)
         w, h = self._w, self._h
-        self._color = np.zeros((h, w, 3), dtype=np.float32)
-        self._depth = np.full((h, w), np.inf, dtype=np.float32)
-        self._scaled = np.empty_like(self._color)      # render's working copy
         self._turn += _TURN
         axis = np.array([math.cos(self._turn), math.sin(self._turn), 0.0])
         cross = np.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]],
@@ -355,13 +337,14 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                      ).astype(np.float32)
         self._dist = _GRID / 2 * _DISTANCE
         self._focal = min(w, h) / 2 / math.tan(_VIEW / 2)
-        materials = random.sample(_MATERIALS, _BANDS)
+        materials = random.sample(range(len(_MATERIALS)), _BANDS)
         self._pipes = [self._spoke(band, materials[band])
                        for band in range(_BANDS)]
         log.info("TrccPipes: new round, leaning toward %.0f deg, %s",
-                 math.degrees(self._turn) % 360, [m.name for m in materials])
+                 math.degrees(self._turn) % 360,
+                 [_MATERIALS[m].name for m in materials])
 
-    def _spoke(self, band: int, material: _Material) -> _Pipe:
+    def _spoke(self, band: int, material: int) -> _Pipe:
         """A pipe from the centre out at its band's angle -- 360 / 8 =
         every 45 degrees, the bass at twelve o'clock -- straight, then one
         elbow of 45 degrees left or right at half its length or less, then
@@ -411,148 +394,88 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         return (self._w / 2 + self._focal * float(q[0]) / z,
                 self._h / 2 - self._focal * float(q[1]) / z, z)
 
-    def _redraw(self) -> None:
-        """Every pipe as far as it reaches, into a fresh depth buffer --
-        swollen by the beat: a cylinder to the elbow and one past it, the
-        screen saver's balls on the root, the elbow and the tip, and a ball
-        for the peak marker."""
-        frame_log.debug("_redraw: %d pipe(s)", len(self._pipes))
-        self._color.fill(0.0)
-        self._depth.fill(np.inf)
-        radius = (_RADIUS * self._thickness
-                  * (1.0 + 0.45 * min(self._beat, 1.0)))
+    def _shapes(self, radius: float) -> np.ndarray:
+        """This frame's shapes for the painter, ``SHAPE_FIELDS`` floats a
+        row: every pipe as far as it reaches, *radius* thick -- a tube to
+        the elbow and one past it, the screen saver's balls on the root, the
+        elbow and the tip, and a ball for the peak marker.  Nearer shapes
+        hide farther ones; at a tie the one listed first wins."""
+        frame_log.debug("_shapes: %d pipe(s), radius %.3f", len(self._pipes),
+                        radius)
+        rows: list[tuple[float, ...]] = []
         for pipe in self._pipes:
-            tip = round(pipe.reach * (len(pipe.points) - 1))
+            last = len(pipe.points) - 1
+            tip = round(pipe.reach * last)
             bend = min(pipe.elbow, tip)
-            self._cylinder(pipe.points[0], pipe.points[bend], radius,
-                           pipe.material)
+            self._tube(rows, pipe.points[0], pipe.points[bend], radius,
+                       pipe.material)
             if tip > pipe.elbow:
-                self._cylinder(pipe.points[pipe.elbow], pipe.points[tip],
-                               radius, pipe.material)
+                self._tube(rows, pipe.points[pipe.elbow], pipe.points[tip],
+                           radius, pipe.material)
             for j in {0, bend, tip}:
-                sx, sy, z = pipe.points[j]
-                self._stamp(float(sx), float(sy), float(z), radius * _BALL,
-                            pipe.material)
-            top = round(pipe.peak * (len(pipe.points) - 1))
+                self._ball(rows, pipe.points[j], radius * _BALL, pipe.material)
+            top = round(pipe.peak * last)
             if top > tip:
-                sx, sy, z = pipe.points[top]
-                self._stamp(float(sx), float(sy), float(z), radius * _BALL,
-                            _PEAK)
+                self._ball(rows, pipe.points[top], radius * _BALL, _PEAK)
+        return np.array(rows, dtype=np.float32).reshape(-1, SHAPE_FIELDS)
 
-    def _cylinder(self, start: np.ndarray, end: np.ndarray, radius: float,
-                  material: _Material) -> None:
-        """A straight pipe from *start* to *end* (screen x, y and depth) into
-        the depth buffer -- one cylinder, as the screen saver's
-        ``PIPE_OBJECT``, its near end wider than its far end, lit across its
-        width the way a tube is."""
+    def _tube(self, rows: list[tuple[float, ...]], start: np.ndarray,
+              end: np.ndarray, radius: float, material: int) -> None:
+        """A straight pipe from *start* to *end* (screen x, y and depth) --
+        one cylinder, as the screen saver's ``PIPE_OBJECT``, its near end
+        wider than its far end."""
         x0, y0, z0 = (float(v) for v in start)
         x1, y1, z1 = (float(v) for v in end)
-        dx, dy = x1 - x0, y1 - y0
-        length = math.hypot(dx, dy)
-        frame_log.debug("_cylinder: %.0f,%.0f -> %.0f,%.0f", x0, y0, x1, y1)
-        if length < 0.5:
+        frame_log.debug("_tube: %.0f,%.0f -> %.0f,%.0f", x0, y0, x1, y1)
+        if math.hypot(x1 - x0, y1 - y0) < 0.5:
             return
         r0, r1 = self._focal * radius / z0, self._focal * radius / z1
         pad = max(r0, r1) + 1.0
-        bx0, by0 = max(int(min(x0, x1) - pad), 0), max(int(min(y0, y1) - pad), 0)
-        bx1 = min(int(max(x0, x1) + pad) + 1, self._w)
-        by1 = min(int(max(y0, y1) + pad) + 1, self._h)
-        if bx0 >= bx1 or by0 >= by1:
-            return
-        ys, xs = np.ogrid[by0:by1, bx0:bx1]
-        px, py = xs.astype(np.float32) - x0, ys.astype(np.float32) - y0
-        t = (px * dx + py * dy) / (length * length)
-        across = (py * dx - px * dy) / length / (r0 + (r1 - r0) * t)
-        depth = z0 + (z1 - z0) * t
-        zbuf = self._depth[by0:by1, bx0:bx1]
-        inside = (t >= 0.0) & (t <= 1.0) & (np.abs(across) < 1.0)
-        nz = np.sqrt(np.clip(1.0 - across * across, 0.0, 1.0))
-        depth = depth - nz * radius
-        hit = inside & (depth < zbuf)
-        if not hit.any():
-            return
-        o, n_z = across[hit], nz[hit]
-        nx, ny = -dy / length * o, dx / length * o
-        n_l = np.clip(nx * _LIGHT[0] + ny * _LIGHT[1] + n_z * _LIGHT[2], 0.0, 1.0)
-        n_h = np.clip(nx * _HALF[0] + ny * _HALF[1] + n_z * _HALF[2], 0.0, 1.0)
-        self._color[by0:by1, bx0:bx1][hit] = (
-            material.ambient + n_l[:, None] * material.diffuse
-            + (n_h ** material.shininess)[:, None] * material.specular)
-        zbuf[hit] = depth[hit]
+        rows.append((x0, y0, z0, x1, y1, z1, r0, r1, radius, 0.0, material,
+                     min(x0, x1) - pad, min(y0, y1) - pad,
+                     max(x0, x1) + pad, max(y0, y1) + pad))
 
-    def _stamp(self, sx: float, sy: float, z: float, radius: float,
-               material: _Material) -> None:
-        """One lit sphere into the depth buffer -- behind what is nearer."""
+    def _ball(self, rows: list[tuple[float, ...]], point: np.ndarray,
+              radius: float, material: int) -> None:
+        """One lit sphere, centred on a whole pixel, at least one across."""
+        sx, sy, z = (float(v) for v in point)
         px = max(1, round(self._focal * radius / z))
-        frame_log.debug("_stamp: %.0f,%.0f r%d", sx, sy, px)
-        mask, lit, nz = self._sprites.get(px, material)
-        x0, y0 = round(sx) - px, round(sy) - px
-        cx0, cy0 = max(x0, 0), max(y0, 0)
-        cx1, cy1 = min(x0 + 2 * px + 1, self._w), min(y0 + 2 * px + 1, self._h)
-        if cx0 >= cx1 or cy0 >= cy1:
-            return
-        sl = (slice(cy0 - y0, cy1 - y0), slice(cx0 - x0, cx1 - x0))
-        depth = z - nz[sl] * radius
-        zbuf = self._depth[cy0:cy1, cx0:cx1]
-        hit = mask[sl] & (depth < zbuf)
-        if not hit.any():
-            return
-        self._color[cy0:cy1, cx0:cx1][hit] = lit[sl][hit]
-        zbuf[hit] = depth[hit]
+        cx, cy = float(round(sx)), float(round(sy))
+        frame_log.debug("_ball: %.0f,%.0f r%d", cx, cy, px)
+        rows.append((cx, cy, z, cx, cy, z, px, px, radius, 1.0, material,
+                     cx - px - 1, cy - px - 1, cx + px + 1, cy + px + 1))
 
-    def _with_center(self, frame: np.ndarray, placed: Any) -> bytes:
-        """The centre picture drawn onto the finished *frame* by Qt --
-        already red-hot with Fire up (``_shown``)."""
-        from PySide6.QtCore import QRectF
-        from PySide6.QtGui import QImage, QPainter
-        frame_log.debug("_with_center: fire=%.2f", self._fire)
-        transform, size = placed
-        image = QImage(frame.data, self._w, self._h, 3 * self._w,
-                       QImage.Format.Format_RGB888)
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        painter.setTransform(transform)
-        painter.drawImage(QRectF(-size / 2, -size / 2, size, size), self._shown)
-        painter.end()
-        return frame.tobytes()
-
-    def _center_placement(self) -> tuple[Any, float]:
-        """This frame's place for the picture: rocking toward the viewer and
-        away, swelling with the bass -- a transform, and the picture's size."""
-        from PySide6.QtGui import QTransform
+    def _center_placement(self) -> tuple[float, float]:
+        """This frame's place for the picture, in the middle: rocking toward
+        the viewer and away -- how far it is squeezed across -- and swelling
+        with the bass, its size in pixels."""
         self._tick += 1.6 / VISUAL_FPS
         tilt = 0.35 + 0.65 * abs(math.cos(self._tick))
         size = (min(self._w, self._h) * self._center_size
                 * (1.0 + 0.22 * min(self._bass, 1.5)))
         frame_log.debug("_center_placement: tilt %.2f size %.0f", tilt, size)
-        return (QTransform().translate(self._w / 2, self._h / 2).scale(tilt, 1.0),
-                size)
-
-    def _picture_outline(self, placed: tuple[Any, float]) -> np.ndarray:
-        """Where the picture covers, at the fire's half resolution -- what
-        the flames rise from."""
-        from PySide6.QtCore import QRectF, Qt
-        from PySide6.QtGui import QImage, QPainter, QTransform
-        transform, size = placed
-        height, width = (self._h + 1) // 2, (self._w + 1) // 2
-        mask = QImage(width, height, QImage.Format.Format_Alpha8)
-        mask.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(mask)
-        painter.setTransform(transform * QTransform().scale(0.5, 0.5))
-        painter.drawImage(QRectF(-size / 2, -size / 2, size, size), self._shown)
-        painter.end()
-        alpha = np.frombuffer(mask.constBits(), dtype=np.uint8)
-        frame_log.debug("_picture_outline: %dx%d", width, height)
-        return alpha.reshape(height, mask.bytesPerLine())[:, :width] / np.float32(255)
+        return tilt, size
 
     def _prepare_center(self) -> None:
         """The picture as it is drawn: red-hot as far as Fire is up --
         worked out when the picture or the Fire slider changes, never per
         frame."""
-        if self._center is None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QImage
+        if self._center is None or self._painter is None:
             log.debug("_prepare_center: no picture")
             self._shown = None
             return
         self._shown = burned_picture(self._center, self._fire)
-        log.debug("_prepare_center: fire %.2f", self._fire)
+        # Drawn square, at most the panel's short side: scaled once, smoothly,
+        # so the card never shrinks a big photo by sampling it.
+        side = min(self._w, self._h)
+        square = self._shown.scaled(
+            side, side, Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation).convertToFormat(
+            QImage.Format.Format_RGBA8888)
+        rows = np.frombuffer(square.constBits(), dtype=np.uint8).reshape(
+            side, square.bytesPerLine())[:, :side * 4]
+        self._painter.show_picture(rows.tobytes(), side, side)
+        log.debug("_prepare_center: fire %.2f, %dpx", self._fire, side)
 
