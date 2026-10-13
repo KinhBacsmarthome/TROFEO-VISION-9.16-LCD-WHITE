@@ -358,6 +358,7 @@ TRCC Linux stands on other people's open-source work. Credit where it is due —
 - **3D Pipes**, the OpenGL screen saver Microsoft shipped with Windows NT and Windows 95 — the TRCC Pipes audio visual is lit and framed the way it was, from the source Microsoft published as an OpenGL sample in the Windows NT 4.0 SDK (`SCRSAVE/PIPES`, `COMMON/MATERIAL.C`): its sixteen pipe materials (the table it took from SGI's GLAUX teapots demo), its light, its pipe and ball-joint proportions, its perspective and its turn of the scene at every reset. The numbers are taken; no code is.
 - **[projectM](https://github.com/projectM-visualizer/projectm)** (LGPL-2.1) — the MilkDrop audio visual drives libprojectM, the open-source reimplementation of **MilkDrop** by Ryan Geiss.
 - **[SoundCard](https://github.com/bastibe/SoundCard)** (BSD-3-Clause) by Bastian Bechtold — on Windows, the audio visuals hear what is playing through its WASAPI loopback recording.
+- **[catap](https://github.com/sbetko/catap)** (MIT) by Stephen Betko — on macOS 14.2+, the audio visuals hear what is playing through its Core Audio process-tap recording.
 
 ## Code Contributors
 

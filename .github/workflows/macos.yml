@@ -82,10 +82,22 @@ jobs:
             --add-data "src/trcc/ui/gui/assets:trcc/ui/gui/assets" \
             --hidden-import PySide6.QtSvg \
             --hidden-import pynvml \
+            --collect-all catap \
             --collect-submodules trcc \
             --osx-bundle-identifier com.thermalright.trcc \
             --noconfirm \
             src/trcc/__main__.py
+
+      - name: Say why TRCC asks to hear the Mac
+        run: |
+          # The audio visuals record what the Mac plays (a Core Audio tap).
+          # macOS shows this text in the "System Audio Recording" prompt;
+          # without it the tap records silence.
+          plutil -insert NSAudioCaptureUsageDescription -string \
+            "TRCC draws what your Mac is playing on your cooler's screen." \
+            dist/TRCC.app/Contents/Info.plist
+          plutil -extract NSAudioCaptureUsageDescription raw \
+            dist/TRCC.app/Contents/Info.plist
 
       - name: Log PyInstaller output
         run: |

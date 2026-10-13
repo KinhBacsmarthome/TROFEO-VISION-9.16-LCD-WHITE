@@ -70,6 +70,9 @@ dependencies = [
     # Windows audio visuals: what is playing, by WASAPI loopback (ffmpeg has no
     # WASAPI input).  BSD-3, pure Python over cffi (~44 KB), numpy already here.
     "soundcard>=0.4.6; sys_platform == 'win32'",
+    # macOS audio visuals: what is playing, by a Core Audio tap (14.2+; no
+    # driver to install).  MIT; needs Python 3.11+, below that the gallery says so.
+    "catap>=0.6.0; sys_platform == 'darwin' and python_version >= '3.11'",
     "certifi>=2023.7.22",
     # Linux hotplug: live device attach/detach + boot-time coldplug.  Without
     # it the udev monitor can't start, so a device plugged in after launch (or

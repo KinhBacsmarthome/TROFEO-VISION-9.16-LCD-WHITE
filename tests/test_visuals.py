@@ -722,3 +722,103 @@ def test_windows_is_a_platform_that_hears() -> None:
     from trcc.adapters.visual.loopback import LoopbackSoundInput
 
     assert WindowsPlatform.SOUND_INPUT is LoopbackSoundInput
+
+
+# ── macOS: a Core Audio tap through catap ────────────────────────────
+
+def test_a_mac_buffer_becomes_our_format() -> None:
+    from trcc.adapters.visual.coreaudio import to_ours
+
+    stereo48 = np.ones((480, 2), dtype="<f4") * 0.5
+    ours = to_ours(stereo48.tobytes(), 48000.0, 2, 32, True)
+    assert ours.shape == (441, 2) and ours.dtype == np.float32
+    assert np.allclose(ours, 0.5)
+
+    mono16 = np.array([16384, -16384], dtype="<i2")
+    assert to_ours(mono16.tobytes(), 44100.0, 1, 16, False).tolist() == [
+        [0.5, 0.5], [-0.5, -0.5]]
+
+    with pytest.raises(OSError, match="24-bit integer"):
+        to_ours(b"\x00" * 6, 44100.0, 2, 24, False)
+
+
+def _fake_catap(monkeypatch: pytest.MonkeyPatch,
+                buffers: list[Any]) -> Any:
+    import sys
+    import types
+
+    from trcc.adapters.visual import coreaudio
+
+    class Session:
+        def __init__(self, on_buffer: Any) -> None:
+            self.on_buffer, self.stopped = on_buffer, False
+
+        def start(self) -> None:
+            for buffer in buffers:
+                self.on_buffer(buffer)
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    made: list[Session] = []
+
+    def record_system_audio(on_buffer: Any) -> Session:
+        made.append(Session(on_buffer))
+        return made[-1]
+
+    module = types.ModuleType("catap")
+    module.record_system_audio = record_system_audio    # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "catap", module)
+    monkeypatch.setattr(coreaudio.platform, "mac_ver", lambda: ("15.1", "", ""))
+    monkeypatch.setattr(coreaudio.importlib.util, "find_spec",
+                        lambda name: object())
+    return made
+
+
+def test_a_mac_hears_the_tap_and_stays_paced_when_it_stops(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    import types
+
+    from trcc.adapters.visual.coreaudio import TapSoundInput
+
+    fmt = types.SimpleNamespace(sample_rate=44100.0, num_channels=2,
+                                bits_per_sample=32, is_float=True)
+    left = np.arange(4, dtype="<f4")
+    data = np.stack([left, -left], axis=1).tobytes()
+    made = _fake_catap(monkeypatch, [types.SimpleNamespace(
+        data=data, frame_count=4, format=fmt)])
+    sound = TapSoundInput()
+    sound.open()
+
+    assert np.frombuffer(sound.read(4), "<f4").tolist() == [
+        0, -0, 1, -1, 2, -2, 3, -3]
+    assert sound.read(4) == bytes(32)             # nothing more: silence, paced
+    sound.close()
+    assert made[0].stopped
+
+
+@pytest.mark.parametrize(("release", "found", "problem"), [
+    ("13.6", True, "hearing what a Mac plays needs macOS 14.2 or later "
+                   "(this is 13.6)"),
+    ("14.1", True, "hearing what a Mac plays needs macOS 14.2 or later "
+                   "(this is 14.1)"),
+    ("14.2", False, "catap is not installed -- it is what hears the music for "
+                    "an audio visual (pip install catap; Python 3.11 or later)"),
+    ("26.0", True, ""),
+])
+def test_a_mac_says_what_it_needs(monkeypatch: pytest.MonkeyPatch,
+                                  release: str, found: bool,
+                                  problem: str) -> None:
+    from trcc.adapters.visual import coreaudio
+
+    monkeypatch.setattr(coreaudio.platform, "mac_ver", lambda: (release, "", ""))
+    monkeypatch.setattr(coreaudio.importlib.util, "find_spec",
+                        lambda name: object() if found else None)
+    assert coreaudio.TapSoundInput.problem() == problem
+
+
+def test_the_mac_is_a_platform_that_hears() -> None:
+    from trcc.adapters.system.macos import MacOSPlatform
+    from trcc.adapters.visual.coreaudio import TapSoundInput
+
+    assert MacOSPlatform.SOUND_INPUT is TapSoundInput

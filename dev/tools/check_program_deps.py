@@ -183,13 +183,19 @@ FEDORA_VENDORED = {"nvidia-ml-py"}
 DEB_VENDORED: set[str] = set()      # sounddevice: a Recommends since 2026-10-09
 
 
-def pyproject_runtime_deps(include_win32: bool = False) -> list[str]:
+#: A dependency marker that gates it to an OS other than Linux.
+_OTHER_OS = re.compile(r"sys_platform\s*==\s*['\"](win32|darwin)['\"]")
+
+
+def pyproject_runtime_deps(include_other_os: bool = False) -> list[str]:
     """Hard runtime deps from pyproject.
 
-    ``include_win32=False`` (the default) drops the win32-gated ones, because
-    the Linux package managers must not declare them.  The universal report
-    passes True so wmi / tzdata / libusb-package stop being invisible: they are
-    real dependencies of a real target, and nothing checked them before.
+    ``include_other_os=False`` (the default) drops the ones gated to another
+    OS -- Windows (wmi, soundcard ...) and macOS (catap) -- because the Linux
+    package managers must not declare them.  The universal report passes True
+    so they stop being invisible: they are real dependencies of a real
+    target, and nothing checked them before.  This dropped only win32 until
+    2026-10-12, when the first darwin-gated dependency read as a Linux one.
     """
     # Here, not at the top: tomllib is 3.11+, and importing this module (its
     # offline tests do) must work on the 3.10 the package still supports.
@@ -198,7 +204,7 @@ def pyproject_runtime_deps(include_win32: bool = False) -> list[str]:
     data = tomllib.loads(_PYPROJECT.read_text())
     out: list[str] = []
     for spec in data["project"]["dependencies"]:
-        if not include_win32 and "sys_platform == 'win32'" in spec:
+        if not include_other_os and _OTHER_OS.search(spec):
             continue
         out.append(re.split(r"[><=;\[]", spec)[0].strip())
     return out
@@ -1677,7 +1683,7 @@ def matrix_rows() -> list[tuple[str, str, str, str]]:
         return "optional" if dep in DELIBERATELY_OPTIONAL else "NO"
 
     rows = []
-    for dep in pyproject_runtime_deps(include_win32=True):
+    for dep in pyproject_runtime_deps(include_other_os=True):
         if (names := _PKG_NAMES.get(dep)) is None:
             continue
         a, f, d = names
@@ -1692,9 +1698,9 @@ def report_matrix() -> None:
     rows = {row[0]: row[1:] for row in matrix_rows()}
     print(f"{'dependency':18} {'arch':10} {'deb':10} {'rpm':10}  (hand-declared targets)")
     print("-" * 62)
-    for dep in pyproject_runtime_deps(include_win32=True):
+    for dep in pyproject_runtime_deps(include_other_os=True):
         if dep not in rows:
-            print(f"  {dep:16} {'(win32/unmapped — pip-resolved targets only)'}")
+            print(f"  {dep:16} {'(other OS/unmapped — pip-resolved targets only)'}")
             continue
         print(f"  {dep:16} " + " ".join(f"{c:10}" for c in rows[dep]))
     print()

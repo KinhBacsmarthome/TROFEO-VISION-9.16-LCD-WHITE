@@ -32,6 +32,7 @@ from ..device._pyusb_find import find as usb_find
 from ..device._pyusb_find import usb_path
 from ..device.transport import PyUsbBulkTransport
 from ..device.usb_bot_scsi import UsbBotScsiTransport
+from ..visual.coreaudio import TapSoundInput
 from ._base import BaseOS, BasePaths, disambiguate
 
 log = logging.getLogger(__name__)
@@ -96,6 +97,10 @@ class MacOSPlatform(BaseOS, key="darwin"):
     """
 
     _INSTALL_HINTS = _MAC_INSTALL_HINTS
+
+    #: Audio visuals: what is playing, by a Core Audio tap (macOS 14.2+;
+    #: ``adapters/visual/coreaudio.py``).
+    SOUND_INPUT = TapSoundInput
 
     # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
 
