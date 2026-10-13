@@ -39,6 +39,7 @@ import math
 import random
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +208,7 @@ class TrccPipes(GlVisual, key="trcc-pipes"):
         self._surface: GlSurface | None = None
         self._painter: PipesPainter | None = None
         self._edges = band_edges()
+        self._bins: dict[int, list[tuple[int, int]]] = {}
         self._band_peak = np.full(_BANDS, 1e-3)
         self._bands = np.zeros(_BANDS)
         self._band_avg = np.zeros(_BANDS)
@@ -271,12 +273,10 @@ class TrccPipes(GlVisual, key="trcc-pipes"):
         mono = mono.reshape(-1, SOUND_CHANNELS).mean(axis=1)
         size = max(_FFT, mono.size)
         spectrum = np.abs(np.fft.rfft(mono, size))
-        hz = np.fft.rfftfreq(size, 1.0 / SOUND_RATE)
         levels = np.zeros(_BANDS)
-        for i in range(_BANDS):
-            inside = (hz >= self._edges[i]) & (hz < self._edges[i + 1])
-            if inside.any():
-                levels[i] = float(spectrum[inside].mean())
+        for i, (low, high) in enumerate(self._band_bins(size)):
+            if high > low:
+                levels[i] = float(spectrum[low:high].mean())
         # Each band against its own recent peak, so the treble is not
         # drowned by the bass and a quiet song still grows pipes.
         self._band_peak = np.maximum(levels, self._band_peak * keep(0.996))
@@ -364,6 +364,19 @@ class TrccPipes(GlVisual, key="trcc-pipes"):
                   for i in range(int(length * STEPS) + 1)]
         projected = np.array([self._project(p) for p in points], dtype=np.float32)
         return _Pipe(band, material, projected, elbow)
+
+    def _band_bins(self, size: int) -> list[tuple[int, int]]:
+        """Each band's FFT bins for an FFT of *size*, as ``[low, high)`` --
+        the bins at or above its lower edge and below its upper.  Worked out
+        once per size: scanning all 4,097 bins per band every frame was 0.77
+        M instructions a frame (measured 2026-10-13)."""
+        if size not in self._bins:
+            hz = np.fft.rfftfreq(size, 1.0 / SOUND_RATE)
+            cuts = np.searchsorted(hz, self._edges, side="left")
+            self._bins[size] = list(pairwise(cuts.tolist()))
+            log.debug("_band_bins: %d -> %s", size, self._bins[size])
+        frame_log.debug("_band_bins: %d", size)
+        return self._bins[size]
 
     def _follow_the_music(self) -> None:
         """Each pipe reaches out as far as its band rises over its own

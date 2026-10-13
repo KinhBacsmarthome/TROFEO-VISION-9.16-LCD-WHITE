@@ -290,6 +290,44 @@ def test_screencast_composites_the_mask_and_the_metrics(
     )
 
 
+def test_a_screencast_decodes_its_mask_once_not_every_frame(
+    tmp_path: Path,
+) -> None:
+    """A cast or an audio visual composites a new frame under the mask every
+    tick; the mask itself is decoded once, and again only for another file
+    or after the Commands that change a mask invalidate.  Decoding it every
+    frame cost 1.7 M instructions a frame for a 1.3 KB mask (measured
+    2026-10-13).  Every frame still carries it.
+    MUTATION CHECK: call ``open_image`` in ``_composite_mask`` again."""
+    fbl = sorted(FBL_PROFILES)[0]
+    profile = get_profile(fbl, 0)
+    info = _info(fbl, profile.resolution)
+    renderer = RecordingRenderer()
+    display = _display(renderer, tmp_path)
+    mask = tmp_path / "01.png"
+    mask.write_bytes(b"one")
+    display._settings.set_mask_path(info.key, str(mask))
+
+    def frame() -> tuple[int, int]:
+        _screencast_bytes(display, info, profile, _theme(), renderer)
+        decoded = sum(1 for n, a in renderer.calls
+                      if n == "open_image" and a[0] == mask)
+        composited = sum(1 for n, _ in renderer.calls if n == "composite")
+        return decoded, composited
+
+    frames = [frame() for _ in range(5)]
+    assert [d for d, _ in frames] == [1, 0, 0, 0, 0]
+    assert all(c == frames[0][1] > 0 for _, c in frames)
+    other = tmp_path / "other.png"
+    other.write_bytes(b"two")
+    display._settings.set_mask_path(info.key, str(other))
+    assert frame()[0] == 0 and renderer.calls.count(("open_image", (other,))) == 1
+    display.invalidate(info.key)                       # what ApplyMask does
+    assert renderer.calls.count(("open_image", (other,))) == 1
+    frame()
+    assert renderer.calls.count(("open_image", (other,))) == 1
+
+
 @pytest.mark.parametrize("fbl", sorted(FBL_PROFILES))
 @pytest.mark.parametrize("angle", ANGLES)
 def test_screencast_composites_before_it_rotates(

@@ -311,17 +311,20 @@ def test_mask_state_change_rebuilds_bg_layer(
     info = _info()
 
     display.build_frame(info=info, theme=theme, sensors={})
-    first_count = sum(1 for n, _ in renderer.calls if n == "open_image")
+    assert [c for c in renderer.calls
+            if c[0] == "composite" and c[1][2] == (10, 20)] == []
 
     # Mutate settings WITHOUT going through Commands (no explicit invalidate).
-    # The mask layer must still rebuild because mask state is in the cache key.
+    # The mask layer must still rebuild because mask state is in the cache key
+    # -- composited again at the new place.  (Not "the mask is re-opened": the
+    # decoded mask is kept, and only the layer is rebuilt.)
     settings.for_device(_KEY).mask_position = (10, 20)
 
     display.build_frame(info=info, theme=theme, sensors={})
-    second_count = sum(1 for n, _ in renderer.calls if n == "open_image")
-
-    assert second_count > first_count, (
-        "mask state change must invalidate bg+mask cache and re-open the mask"
+    assert [c for c in renderer.calls
+            if c[0] == "composite" and c[1][2] == (10, 20)], (
+        "mask state change must invalidate the bg+mask cache and composite "
+        "the mask again at its new place"
     )
 
 

@@ -178,6 +178,15 @@ class DisplayService:
         # one.  Filled lazily (one composite per asking tick), so nothing
         # is paid up front the way the unbounded pre-composed cache did.
         self._bg_caches: dict[str, BgMaskCache] = {}
+        # Per-device decoded mask, with the path it was read from.  The theme
+        # path composes its mask once into ``_bg_caches``; a screen cast or
+        # audio visual composites a NEW frame under it every tick, and
+        # decoded the mask PNG again each time -- 1.7 M instructions a frame
+        # for a 1.3 KB mask (measured 2026-10-13).  Like ``_bg_caches`` it
+        # trusts the Commands that change a mask (ApplyMask, SaveTheme,
+        # DeleteTheme, SetMaskPosition/Visible) to ``invalidate``: a stat a
+        # frame would be filesystem I/O inside the hexagon.
+        self._masks: dict[str, tuple[Path, Any]] = {}
         # Cache of loaded split-overlay surfaces keyed by
         # (style, rotation, mirrored).  Loaded lazily on first
         # widescreen render so non-Levita devices pay nothing.
@@ -968,6 +977,7 @@ class DisplayService:
         # ages out, and a device that just changed theme should not be
         # spending its allowance on the previous one.
         self._bg_caches.pop(key, None)
+        self._masks.pop(key, None)
         # Reset the transition tracker too, so the next build_frame for
         # this key logs INFO when the cache state first appears
         # post-invalidation (instead of comparing against stale state).
@@ -979,6 +989,7 @@ class DisplayService:
                  len(self._scenes), len(self._bg_caches))
         self._scenes.clear()
         self._bg_caches.clear()
+        self._masks.clear()
         self._cache_state.clear()
         self._overlay_layout.clear()
 
@@ -1190,7 +1201,7 @@ class DisplayService:
         """
         mask_source = self._resolve_mask_source(s, theme)
         if mask_source is not None:
-            mask = self._r.open_image(mask_source)
+            mask = self._mask_surface(info.key, mask_source)
             mw, mh = self._r.surface_size(mask)
             position = s.mask_position or (0, 0)
             frame_log.debug(
@@ -1212,6 +1223,18 @@ class DisplayService:
             info.key, s.mask_visible, s.mask_path,
         )
         return canvas
+
+    def _mask_surface(self, key: str, source: Path) -> Any:
+        """*source* decoded, kept for *key* until it names another file or
+        the device's caches are invalidated."""
+        kept = self._masks.get(key)
+        if kept is not None and kept[0] == source:
+            frame_log.debug("_mask_surface %s: %s kept", key, source.name)
+            return kept[1]
+        log.debug("_mask_surface %s: decoding %s", key, source)
+        surface = self._r.open_image(source)
+        self._masks[key] = (source, surface)
+        return surface
 
     def _resolve_mask_source(
         self,

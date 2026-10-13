@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, cast
 
@@ -124,6 +125,22 @@ def _pipes(center: Path | None = None, center_fire: float = 0.0,
     engine.open(VisualSpec("trcc-pipes", 160, 160, center=center,
                            center_fire=center_fire, settings=settings))
     return engine
+
+
+@pytest.mark.parametrize("size", [8192, 9000, 16384])
+def test_pipes_bands_take_exactly_their_fft_bins(size: int) -> None:
+    """Each band is the bins at or above its lower edge and below its upper
+    -- worked out once per FFT size, the same bins the per-frame scan took.
+    MUTATION CHECK: take one bin past each band's upper edge.  (Not
+    ``side="right"``: no edge lands on a bin's frequency, so that changes
+    nothing.)"""
+    engine = TrccPipes()
+    hz = np.fft.rfftfreq(size, 1.0 / SOUND_RATE)
+    edges = pipes_module.band_edges()
+    expected = [np.flatnonzero((hz >= low) & (hz < high)).tolist()
+                for low, high in pairwise(edges)]
+    assert [list(range(low, high)) for low, high
+            in engine._band_bins(size)] == expected  # type: ignore[attr-defined]
 
 
 def _lit(frame: RawFrame) -> int:
