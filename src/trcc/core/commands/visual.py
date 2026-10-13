@@ -142,7 +142,8 @@ class PlayVisual(Command[VisualResult]):
         app.settings.set_visual(self.key, self.visual, self.preset,
                                 self.settings)
         app.media.open_visual(self.key, spec, app.platform.sound_input,
-                              app.platform.visual_class(self.visual))
+                              app.platform.visual_class(self.visual),
+                              app.platform.worker_thread_context)
         app.add_task(VisualDriver(app, self.key))
         _publish_background(app, self.key)
         log.info("PlayVisual: %s playing %s", self.key,

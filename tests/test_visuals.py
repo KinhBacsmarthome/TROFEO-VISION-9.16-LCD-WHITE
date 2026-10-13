@@ -182,7 +182,8 @@ def test_the_centre_picture_sits_in_the_middle_and_can_burn(
 class _FakeReader:
     """What ``VisualReader`` promises, scripted -- no thread, no sound."""
 
-    def __init__(self, spec: VisualSpec, sound: Any, engine: Any) -> None:
+    def __init__(self, spec: VisualSpec, sound: Any, engine: Any,
+                 thread: Any = None) -> None:
         self.spec, self.name, self.closed = spec, spec.kind, False
         self.fail, self.ready = "", True
         self.hearing = self.announced = True
@@ -840,3 +841,29 @@ def test_pipes_show_no_picture_until_the_user_picks_one() -> None:
     engine = TrccPipes()
     engine.open(VisualSpec("trcc-pipes", 64, 64))
     assert engine._shown is None                    # type: ignore[attr-defined]
+
+
+def test_the_reader_thread_enters_the_platform_s_worker_context() -> None:
+    """Platform.worker_thread_context: every worker touching OS APIs enters
+    it -- on Windows the COM apartment its sound input needs.  MUTATION
+    CHECK: call _listen_and_draw without the context."""
+    import threading
+    from contextlib import contextmanager
+
+    from trcc.services.visual_stream import VisualReader
+
+    entered: list[str] = []
+    done = threading.Event()
+
+    @contextmanager
+    def apartment():
+        entered.append(threading.current_thread().name)
+        yield
+        done.set()
+
+    reader = VisualReader(VisualSpec("trcc-pipes", 32, 32), ScriptedSound,
+                          TrccPipes, apartment)
+    time.sleep(0.2)
+    reader.close()
+    assert done.wait(5)
+    assert entered == ["trcc-visual"]

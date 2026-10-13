@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 
 import numpy as np
@@ -46,12 +47,15 @@ class VisualReader:
 
     def __init__(self, spec: VisualSpec,
                  sound: Callable[[], SoundInput],
-                 engine: Callable[[], VisualEngine]) -> None:
+                 engine: Callable[[], VisualEngine],
+                 thread: Callable[[], AbstractContextManager[None]] = nullcontext
+                 ) -> None:
         self.spec = spec
         self.name = spec.preset.name if spec.preset else spec.kind
         log.info("VisualReader: %s at %dx%d", self.name, spec.width,
                  spec.height)
         self._make_sound, self._make_engine = sound, engine
+        self._thread_context = thread
         self._sound: SoundInput | None = None
         self._lock = threading.Lock()
         self._adjusted: Mapping[str, float] | None = None
@@ -99,8 +103,15 @@ class VisualReader:
         self._thread.join(timeout=3)
 
     def _run(self) -> None:
-        """Hear, feed, draw -- until closed or the sound ends."""
+        """The thread: inside the platform's per-thread setup (Windows' COM
+        apartment, which its sound input needs), hear, feed, draw."""
         log.debug("_run: %s", self.name)
+        with self._thread_context():
+            self._listen_and_draw()
+
+    def _listen_and_draw(self) -> None:
+        """Hear, feed, draw -- until closed or the sound ends."""
+        log.debug("_listen_and_draw: %s", self.name)
         engine: VisualEngine | None = None
         try:
             self._sound = sound = self._make_sound()

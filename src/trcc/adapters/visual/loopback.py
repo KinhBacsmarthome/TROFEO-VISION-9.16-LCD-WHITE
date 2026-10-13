@@ -13,8 +13,9 @@ Two Windows facts shape it, both read in soundcard 0.4.6's source:
 
 * **COM belongs to a thread.**  soundcard sets COM up when it is imported,
   on the importing thread -- and the GUI's thread already has Qt's apartment,
-  where that quietly fails.  So the reader's own thread enters an apartment
-  (``_ComApartment``, the one WMI uses) and imports soundcard there.
+  where that quietly fails.  So soundcard is imported in ``open``, on the
+  reader's own thread, which runs inside the platform's
+  ``worker_thread_context()`` -- the COM apartment every worker gets.
 * **Silence is no packets.**  A sound card with nothing playing delivers
   nothing; soundcard waits a few blocks and returns zeros, so a read stays
   paced and never hangs -- and the reader reports "hearing nothing".
@@ -51,25 +52,22 @@ class LoopbackSoundInput(SoundInput):
         return problem
 
     def open(self) -> None:
-        """Called on the reader's thread: COM there, then the default
-        output's loopback."""
-        from ..system.windows import _ComApartment
-
+        """Called on the reader's thread, inside its COM apartment: the
+        default output's loopback."""
         log.info("LoopbackSoundInput.open")
         if problem := self.problem():
             raise OSError(problem)
-        with _ComApartment():
-            try:
-                import soundcard  # pyright: ignore[reportMissingImports]
+        try:
+            import soundcard  # pyright: ignore[reportMissingImports]
 
-                speaker = soundcard.default_speaker()
-                loopback = soundcard.get_microphone(id=str(speaker.id),
-                                                    include_loopback=True)
-                recorder = loopback.recorder(samplerate=SOUND_RATE,
-                                             channels=SOUND_CHANNELS)
-                recorder.__enter__()
-            except (RuntimeError, OSError, IndexError) as e:
-                raise OSError(f"Windows would not share its sound: {e}") from e
+            speaker = soundcard.default_speaker()
+            loopback = soundcard.get_microphone(id=str(speaker.id),
+                                                include_loopback=True)
+            recorder = loopback.recorder(samplerate=SOUND_RATE,
+                                         channels=SOUND_CHANNELS)
+            recorder.__enter__()
+        except (RuntimeError, OSError, IndexError) as e:
+            raise OSError(f"Windows would not share its sound: {e}") from e
         log.info("LoopbackSoundInput.open: listening to %s", speaker.name)
         self._recorder = recorder
 

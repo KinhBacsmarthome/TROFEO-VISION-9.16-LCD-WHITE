@@ -16,6 +16,7 @@ import logging
 import struct
 import subprocess
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -582,14 +583,17 @@ class MediaService:
 
     def open_visual(self, device_key: str, spec: VisualSpec,
                     sound: Callable[[], SoundInput],
-                    engine: Callable[[], VisualEngine]) -> VisualReader:
+                    engine: Callable[[], VisualEngine],
+                    thread: Callable[[], AbstractContextManager[None]]
+                    ) -> VisualReader:
         """Start the visual *spec* names drawing *device_key*'s background
-        from what is playing, replacing any visual it had."""
+        from what is playing, replacing any visual it had.  *thread* is the
+        platform's per-thread setup, which the reader's thread enters."""
         log.info("open_visual: %s <- %s (%dx%d)", device_key, spec.kind,
                  spec.width, spec.height)
         self.close_visual(device_key)
         reader = self._visuals[device_key] = self.visual_reader(
-            spec, sound, engine)
+            spec, sound, engine, thread)
         return reader
 
     def visual(self, device_key: str) -> VisualReader | None:
