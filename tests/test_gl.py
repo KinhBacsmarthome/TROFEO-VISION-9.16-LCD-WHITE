@@ -116,10 +116,20 @@ _TOP_RED = ("in vec2 corner;\nin vec2 uv;\nout vec2 v_uv;\n"
             "                             : vec4(0.0, 0.0, 1.0, 1.0);\n}\n")
 
 
-def test_a_picture_reads_back_top_row_first() -> None:
+@pytest.mark.parametrize("libraries", [
+    pytest.param(gl_module._GL_LIBRARIES, id="libOpenGL"),
+    # Ubuntu without libopengl0 -- CI's runner: glvnd's libGL dispatches to
+    # the EGL context the same way.  MUTATION CHECK: drop "libGL.so.1".
+    pytest.param(("libOpenGL-absent.so.0", "libGL.so.1"), id="libGL-only"),
+])
+def test_a_picture_reads_back_top_row_first(
+        monkeypatch: pytest.MonkeyPatch, libraries: tuple[str, ...]) -> None:
     """OpenGL counts rows from the bottom, a panel from the top: what is
     drawn at the top of OpenGL's picture is the first row read back.
     MUTATION CHECK: drop the row flip in read_rgb."""
+    if _HOST_PIPES.SURFACE is not gl_module.EglSurface:  # type: ignore[attr-defined]
+        libraries = gl_module._GL_LIBRARIES      # the choice is EGL's alone
+    monkeypatch.setattr(gl_module, "_GL_LIBRARIES", libraries)
     surface = _surface()
     gl = surface.gl
     try:

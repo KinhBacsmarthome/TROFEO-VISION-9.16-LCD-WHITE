@@ -232,6 +232,28 @@ _EGL_MAJOR, _EGL_MINOR, _EGL_PROFILE, _EGL_CORE = 0x3098, 0x30FB, 0x30FD, 0x1
 _EGL_PLATFORM_SURFACELESS_MESA = 0x31DD
 
 
+#: Where OpenGL's own calls are, without GLX: glvnd's ``libOpenGL``; else its
+#: ``libGL``, which dispatches to the current EGL context the same way and is
+#: on every TRCC install -- Qt links it.  Ubuntu ships ``libOpenGL.so.0`` in
+#: ``libopengl0``, which neither ``libgl1`` nor ``libegl1`` pulls in: CI's
+#: runner had none, and every OpenGL test failed (2026-10-13).
+_GL_LIBRARIES = ("libOpenGL.so.0", "libGL.so.1")
+
+
+def _opengl_library() -> Any:
+    """The first of ``_GL_LIBRARIES`` that loads; ``OSError`` naming both."""
+    failures = []
+    for name in _GL_LIBRARIES:
+        try:
+            library = ctypes.CDLL(name)
+        except OSError as e:
+            failures.append(str(e))
+            continue
+        log.info("_opengl_library: %s", name)
+        return library
+    raise OSError(f"OpenGL (EGL) is not available: {'; '.join(failures)}")
+
+
 class EglSurface(GlSurface):
     """An EGL *pbuffer*: a surface with a framebuffer of its own and no
     window.  On the default display first; with none (no X, no Wayland --
@@ -244,9 +266,9 @@ class EglSurface(GlSurface):
         super().__init__()
         try:
             egl = ctypes.CDLL("libEGL.so.1")
-            self._libgl = ctypes.CDLL("libOpenGL.so.0")
         except OSError as e:
             raise OSError(f"OpenGL (EGL) is not available: {e}") from e
+        self._libgl = _opengl_library()
         for name in ("eglGetDisplay", "eglCreatePbufferSurface",
                      "eglCreateContext", "eglGetProcAddress"):
             getattr(egl, name).restype = c_void_p
