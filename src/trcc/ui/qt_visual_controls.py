@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt
@@ -56,6 +57,7 @@ class VisualControls(QWidget):
         log.debug("VisualControls.__init__")
         self._bus, self._sliders, self._center = bus, sliders, center
         self._adjustments: dict[str, VisualAdjustment] = {}
+        self._picture = ""
         self._values: dict[str, QLabel] = {}
         self._rows = QGridLayout()
         self._rows.setColumnStretch(1, 1)
@@ -87,6 +89,7 @@ class VisualControls(QWidget):
             if item is not None and (widget := item.widget()) is not None:
                 widget.deleteLater()
         self._adjustments, self._values = {}, {}
+        self._picture = listed.center
         for row, adjustment in enumerate(info.adjustments if info else ()):
             self._add_slider(row, adjustment, listed.sliders.get(
                 adjustment.name, adjustment.default))
@@ -143,12 +146,23 @@ class VisualControls(QWidget):
                                self._on_answer)
 
     def _on_pick_picture(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Centre picture", "",
-                                              _PICTURES)
+        path, _ = QFileDialog.getOpenFileName(self, "Centre picture",
+                                              self._picture_folder(), _PICTURES)
         log.info("VisualControls._on_pick_picture: %r", path)
         if path:
             dispatch_in_background(self._bus, self._center(path),
                                    self._on_answer)
+
+    def _picture_folder(self) -> str:
+        """Where the picker opens: the current picture's folder, else the
+        user's Pictures -- never wherever TRCC happened to be started."""
+        from PySide6.QtCore import QStandardPaths
+        where = QStandardPaths.StandardLocation
+        folder = (str(Path(self._picture).parent) if self._picture else
+                  QStandardPaths.writableLocation(where.PicturesLocation)
+                  or QStandardPaths.writableLocation(where.HomeLocation))
+        log.debug("VisualControls._picture_folder: %s", folder)
+        return folder
 
     def _on_no_picture(self) -> None:
         log.info("VisualControls._on_no_picture")

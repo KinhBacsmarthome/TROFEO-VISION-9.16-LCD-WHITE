@@ -76,10 +76,11 @@ class VisualThumbnail(BaseThumbnail):
             Qt.TransformationMode.SmoothTransformation)))
 
 
-#: The gallery above, the playing visual's controls below (within the
-#: 732x652 panel).
-_GALLERY = (0, 50, 732, 430)
-_CONTROLS = (24, 492, 684, 150)
+#: The user's split: the previews scroll in the top half, the selected
+#: visual's settings get the bottom half (within the 732x652 panel) -- a
+#: Cavalier circle has six sliders and the picture buttons.
+_GALLERY = (0, 50, 732, 300)
+_CONTROLS = (24, 362, 684, 280)
 #: The controls in the classic skin's colours; the groove shows on the dark
 #: panel, which the shared slider style leaves transparent.
 _CONTROLS_STYLE = (
