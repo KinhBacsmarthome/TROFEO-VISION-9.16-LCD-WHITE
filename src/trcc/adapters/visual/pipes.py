@@ -1,7 +1,7 @@
 """TRCC Pipes: the Windows 3D Pipes screen saver, as a stereo's equaliser.
 
-Sixteen straight pipes run out from the centre picture like the spokes of a
-wheel, one per frequency band, every 360 / 16 = 22.5 degrees -- the bass at
+Eight pipes run out from the centre picture like the spokes of a
+wheel, one per frequency band, every 360 / 8 = 45 degrees -- the bass at
 twelve o'clock, round through the mids to the treble.  Each reaches from the
 centre toward the edge as far as its band is loud, a peak marker hangs at its
 highest reach and sinks back as an old graphic equaliser's did, and the beat
@@ -62,7 +62,8 @@ DEFAULT_CENTER = (Path(__file__).resolve().parents[2] / "assets" / "icons"
                   / "trcc_256x256.png")
 
 _GRID = 13                    # cells per side
-_BANDS = 16                   # one pipe per frequency band
+_BANDS = 8                    # one pipe per frequency band: few, so each is big
+_BASS_HZ = 180.0              # the bands below this are the bass, for the beat
 _RING = 1.5                   # where the pipes start: right at the centre
 _ZENITH_CELLS = 6.2           # how far out a pipe reaches at full volume, in cells
 _STEPS = 14                   # spheres per cell of pipe
@@ -244,6 +245,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._band_peak = np.full(_BANDS, 1e-3)
         self._bands = np.zeros(_BANDS)
         self._band_avg = np.zeros(_BANDS)
+        self._bass_bands = max(1, int(np.count_nonzero(self._edges[1:] <= _BASS_HZ)))
         self._bass = self._beat = 0.0
         self._peak_bass = 1e-3
         self._tick = 0.0
@@ -310,7 +312,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         # its band rises over that -- a hit -- not merely because it is loud.
         usual = _keep(0.96)
         self._band_avg = usual * self._band_avg + (1 - usual) * self._bands
-        bass = float(levels[:3].mean())
+        bass = float(levels[:self._bass_bands].mean())
         self._peak_bass = max(bass, self._peak_bass * _keep(0.995))
         bass_now = bass / self._peak_bass
         self._beat = (max(bass_now - self._bass, 0.0) * 2.5
@@ -349,7 +351,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
     # ── the screen saver ─────────────────────────────────────────────
 
     def _new_round(self) -> None:
-        """New materials -- the sixteen, dealt one to a pipe, as the screen
+        """New materials -- eight of the sixteen, dealt one to a pipe, as the screen
         saver picked one at random per pipe -- and the wheel leaning a new
         way, turned on as the screen saver turned its scene each reset."""
         self._frame = self._rolled = getattr(self, "_frame", 0)
@@ -372,8 +374,8 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                  math.degrees(self._turn) % 360, [m.name for m in materials])
 
     def _spoke(self, band: int, material: _Material) -> _Pipe:
-        """A pipe from the centre out at its band's angle -- 360 / 16 =
-        every 22.5 degrees, the bass at twelve o'clock -- straight, then one
+        """A pipe from the centre out at its band's angle -- 360 / 8 =
+        every 45 degrees, the bass at twelve o'clock -- straight, then one
         elbow of 45 degrees left or right at half its length or less, then
         straight to the zenith; as screen points, with the elbow's index."""
         frame_log.debug("_spoke: band %d", band)
