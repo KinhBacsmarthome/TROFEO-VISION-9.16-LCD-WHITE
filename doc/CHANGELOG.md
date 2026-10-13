@@ -1,9 +1,42 @@
 # Changelog
 
-## Unreleased
+## v9.10.9
 
 ### Added
 
+- **Audio visuals: the panel's background can follow the music.** A new
+  gallery tab (the audio-bars button, after Cloud backgrounds) in both
+  windows shows a live tile for each visual; pick one and the panel plays
+  it to whatever the computer is playing. Each visual's sliders sit under the
+  gallery and change it live.
+  - **TRCC Pipes** comes first: eight pipes reach out from the centre, one per
+    frequency band, lit and framed like the Windows NT 3D Pipes screen
+    saver. They grow with each hit, swell with the beat, and leave a peak
+    marker like an old graphic equaliser.
+  - **Cavalier's eleven visuals**: Wave, Levels, Particles, Bars, Spine,
+    Splitter and five circles, on CAVA's audio engine.
+  - **MilkDrop presets**, where libprojectM 4 is installed (Linux).
+  - **A centre picture of your own**, with a button to switch it on and off.
+    With it on, a Fire slider sets it burning, flames and all.
+  - TRCC Pipes draws with OpenGL 3 on the graphics card. On a machine
+    without one (a VM, Remote Desktop) it uses a software OpenGL. Where no
+    OpenGL 3 opens at all, its tile's name is dimmed and its tooltip says
+    why.
+  - It hears what is playing through PulseAudio or PipeWire on Linux
+    (`ffmpeg` or `pw-record`), the default output on Windows, and a Core
+    Audio tap on macOS 14.2 and later. When it hears nothing it says so.
+  - From the CLI: `trcc display visuals [KEY]`, `trcc display visual KEY
+    [NAME]`, `visual-set`, `visual-center`, `visual-picture` and
+    `visual-tile`; in the API, `/display/visuals`,
+    `/devices/{key}/display/visual` and its `/settings`,
+    `/display/visual-center`, `/display/visual-picture` and
+    `/display/visual-tile`.
+- **RGB memory lighting is opt-in, with TRCC's own short password prompt.**
+  `trcc system ram-lighting enable` asks once for your password and lets the
+  person at this computer reach the memory's lighting chips; `disable`
+  removes it, with no password. A pip or source install now gets the same
+  prompt as the packages (`trcc system setup`), not polkit's generic one
+  printing the whole command.
 - **An RGB Lighting page, in both windows.** The classic window has an RGB
   button above Control Center; the new window has an "RGB Lighting" entry.
   It lists your RGB memory and OpenRGB's devices, each with a tick for
@@ -97,6 +130,17 @@
   prints the exact command for how you installed TRCC (pipx, pip, the release
   package for your distro, or the download page), and runs nothing; the
   window's update button shows the same command.
+- **A command run right after `trcc kill` reaches the panel.** `trcc kill &&
+  trcc display ...` waited 10 seconds for the app that was shutting down,
+  then ran in a throwaway app of its own, so the panel showed nothing. It now
+  starts a new app at once (about 1.7 seconds).
+- **`trcc system list-endpoints` prints the routes without starting TRCC's
+  background app.**
+- **Less CPU while a screen cast or an audio visual plays over a masked
+  theme:** the theme's mask was decoded from disk on every frame; it is now
+  decoded once. A TRCC window also sends no preview frames while it is in
+  the tray, and one on the same computer reads the frame's pixels directly
+  instead of a JPEG.
 - **The README and guides no longer name commands that do not exist (#247)**,
   and `-v` / `-vv` are shown where the CLI accepts them (`trcc -vv gui`).
 
