@@ -119,9 +119,13 @@ class VisualControls(QWidget):
         shown = QLabel(f"{value:.2f}", self)
         self._adjustments[adjustment.name] = adjustment
         self._values[adjustment.name] = shown
-        self._rows.addWidget(QLabel(adjustment.label, self), row, 0)
-        self._rows.addWidget(slider, row, 1)
-        self._rows.addWidget(shown, row, 2)
+        name = QLabel(adjustment.label, self)
+        for column, widget in enumerate((name, slider, shown)):
+            self._rows.addWidget(widget, row, column)
+            # Shown now: Qt would show a new child on the next event-loop
+            # pass, and a layout leaves hidden widgets out of its height --
+            # the window sized the settings at 70 px for 214 px of sliders.
+            widget.show()
 
     def _value(self, name: str, step: int) -> float:
         adjustment = self._adjustments[name]

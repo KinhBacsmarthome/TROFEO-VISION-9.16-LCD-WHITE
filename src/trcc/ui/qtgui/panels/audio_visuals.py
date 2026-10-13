@@ -82,10 +82,10 @@ class AudioVisualsPanel(AssetBrowserPanel):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(8)
         root.addLayout(form)
-        root.addWidget(self._list, stretch=1)       # previews on top, settings
+        root.addWidget(self._list, stretch=1)       # previews on top take the rest;
 
         root.addLayout(buttons)
-        root.addWidget(self._controls, stretch=1)   # ... below: an even split
+        root.addWidget(self._controls)              # ... below, as tall as they need
         root.addWidget(self._status)
 
     def showEvent(self, event: QShowEvent) -> None:

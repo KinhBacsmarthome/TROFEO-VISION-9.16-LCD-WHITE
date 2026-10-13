@@ -76,11 +76,10 @@ class VisualThumbnail(BaseThumbnail):
             Qt.TransformationMode.SmoothTransformation)))
 
 
-#: The user's split: the previews scroll in the top half, the selected
-#: visual's settings get the bottom half (within the 732x652 panel) -- a
-#: Cavalier circle has six sliders and the picture buttons.
-_GALLERY = (0, 50, 732, 300)
-_CONTROLS = (24, 362, 684, 280)
+#: The user's split, within the 732x652 panel: the previews scroll on top,
+#: the selected visual's settings sit below at the height THEY need (a hint
+#: alone, four sliders, six) -- the previews get everything else.
+_TOP, _BOTTOM, _MARGIN = 50, 640, 24
 #: The controls in the classic skin's colours; the groove shows on the dark
 #: panel, which the shared slider style leaves transparent.
 _CONTROLS_STYLE = (
@@ -109,15 +108,15 @@ class UCVisuals(BaseThemeBrowser):
         super().__init__(parent)
 
     def _setup_ui(self) -> None:
-        """The cloud gallery's grid, shorter, with the controls below it."""
+        """The cloud gallery's grid, with the settings below it."""
         log.debug("UCVisuals._setup_ui")
         super()._setup_ui()
-        self.scroll_area.setGeometry(*_GALLERY)
+        self.scroll_area.setGeometry(0, _TOP, 732, _BOTTOM - _TOP)
         if self._app is not None:
             self._controls = VisualControls(self._app, self._sliders_command,
                                             self._center_command, self)
-            self._controls.setGeometry(*_CONTROLS)
             self._controls.setStyleSheet(_CONTROLS_STYLE)
+            self._fit_controls()
 
     def set_device_key(self, key: str) -> None:
         """The panel the window works on -- its visual's controls show."""
@@ -188,6 +187,27 @@ class UCVisuals(BaseThemeBrowser):
         self._select_item(playing)
         if self._controls is not None:
             self._controls.show_for(listed)
+            self._fit_controls()
+
+    def _fit_controls(self) -> None:
+        """The settings at the height they need, at the bottom; the
+        previews above take the rest."""
+        controls = self._controls
+        if controls is None:
+            log.debug("UCVisuals._fit_controls: no controls")
+            return
+        # Styled first (the classic skin's padding makes rows taller), then
+        # laid out afresh, THEN measured -- else the height is too short.
+        controls.ensurePolished()
+        if (layout := controls.layout()) is not None:
+            layout.invalidate()
+            layout.activate()
+        height = controls.sizeHint().height()
+        top = _BOTTOM - height
+        controls.setGeometry(_MARGIN, top, 732 - 2 * _MARGIN, height)
+        self.scroll_area.setGeometry(0, _TOP, 732, top - 12 - _TOP)
+        log.debug("UCVisuals._fit_controls: settings %d px, previews %d px",
+                  height, top - 12 - _TOP)
 
     def _sliders_command(self, values: dict[str, float]) -> SetVisualSettings:
         """The Command for new slider values, for the active panel."""
