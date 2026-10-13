@@ -1353,13 +1353,15 @@ class VisualInfo:
 @dataclass(frozen=True, slots=True)
 class VisualSpec:
     """Everything an audio visual needs to start: which one, its preset
-    file (if it draws presets), the panel's size, the user's centre picture,
-    and the slider values by name."""
+    file (if it draws presets), the panel's size, the user's centre picture
+    (``None`` when off) and how hot it burns, and the slider values by
+    name."""
     kind: str
     width: int
     height: int
     preset: Path | None = None
     center: Path | None = None
+    center_fire: float = 0.0
     settings: Mapping[str, float] = field(default_factory=dict)
 
 #: The URL schemes the media player will open.  An allow-list, not a deny-list:

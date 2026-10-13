@@ -4,7 +4,7 @@
 
 Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
 
-**158 total: 113 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+**159 total: 114 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
 
 ## Dispatching one
 
@@ -1692,6 +1692,17 @@ The centre picture for audio visuals that show one -- any image the user picks; 
 | Field | Type | Required |
 |---|---|---|
 | `path` | `str` | no |
+
+### `SetVisualPicture`
+
+Switch the centre picture on or off -- it is kept while off, so on brings it back -- and set how hot it burns, 0 to 1 (the user's call: the fire belongs to the picture; no picture, no fire).  Each only when given.  Every panel playing a visual that shows it starts again.
+
+*Command* → `VisualsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `shown` | `bool | None` | no |
+| `fire` | `float | None` | no |
 
 ### `SetVisualSettings`
 

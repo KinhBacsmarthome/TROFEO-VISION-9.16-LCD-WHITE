@@ -614,6 +614,9 @@ class VisualsResult(Result):
     sliders: dict[str, float] = field(default_factory=dict)
     #: Whether that panel's visual hears any sound right now.
     hearing: bool = False
+    #: The centre picture switched on, and its fire (0 to 1).
+    center_shown: bool = True
+    center_fire: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

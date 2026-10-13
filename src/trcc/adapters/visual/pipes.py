@@ -53,6 +53,7 @@ from ...core.models import (
     VisualSpec,
 )
 from ._base import BaseVisual
+from ._fire import STEP, Fire, burn, burned_picture, keep
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -62,25 +63,12 @@ _BANDS = 8                    # one pipe per frequency band: few, so each is big
 _BASS_HZ = 180.0              # the bands below this are the bass, for the beat
 _RING = 1.5                   # where the pipes start: right at the centre
 _ZENITH_CELLS = 6.2           # how far out a pipe reaches at full volume, in cells
-_STEPS = 14                   # spheres per cell of pipe
+STEPS = 14                   # spheres per cell of pipe
 _ROLL = 20 * VISUAL_FPS       # frames, at least, between new rounds
-#: The motion below was tuned by eye at 30 frames a second.  At another rate
-#: a per-frame KEEP becomes keep ** _STEP and a per-frame STEP step * _STEP,
-#: so the pipes build, fall and glow at the same speed in real time.
-_TUNED_FPS = 30
-_STEP = _TUNED_FPS / VISUAL_FPS
-
-
-def _keep(kept: float) -> float:
-    """What is kept of a value per frame now, given *kept* at 30 fps."""
-    frame_log.debug("_keep: %.4f at %d fps", kept, VISUAL_FPS)
-    return kept ** _STEP
-
-
 _FFT = 8192                   # FFT size: 5.4 Hz bins, so the 40-57 Hz band has some
 _LIFT = 2.0                   # a hit this far over the band's average is the zenith
-_BUILD = _STEP / 7.0          # most a pipe grows in a frame: built out, not shot
-_FALL = 1 - _keep(0.88)       # how fast a pipe falls back toward the centre
+_BUILD = STEP / 7.0          # most a pipe grows in a frame: built out, not shot
+_FALL = 1 - keep(0.88)       # how fast a pipe falls back toward the centre
 _ELBOW = math.radians(45.0)   # each pipe turns this far at its one elbow ...
 _BEND = (0.3, 0.5)            # ... somewhere in this part of its length
 _LEAN = math.radians(30.0)    # how far the whole wheel leans, a new way each round
@@ -223,7 +211,6 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
             VisualAdjustment("growth", "Growth", 0.3, 3.0, 1.0),
             VisualAdjustment("thickness", "Thickness", 0.5, 4.0, 2.8),
             VisualAdjustment("center_size", "Centre picture", 0.0, 0.5, 0.3),
-            VisualAdjustment("fire", "Fire", 0.0, 1.0, 0.0),
         ))
 
     @classmethod
@@ -269,6 +256,9 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 log.warning("TrccPipes.open: %s is not a picture", picture)
             else:
                 self._center = image
+        # The fire is the picture's: no picture, no fire (the user's call).
+        self._fire = spec.center_fire if self._center is not None else 0.0
+        self._flames_of = Fire(self._w, self._h)
         self._prepare_center()
         self._new_round()
 
@@ -280,9 +270,6 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         self._growth = float(values["growth"])
         self._thickness = float(values["thickness"])
         self._center_size = float(values["center_size"])
-        fire, self._fire = self._fire, float(values["fire"])
-        if self._center is not None and fire != self._fire:
-            self._prepare_center()
 
     def feed(self, pcm: bytes) -> None:
         samples = np.frombuffer(pcm, dtype="<f4")
@@ -301,20 +288,20 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 levels[i] = float(spectrum[inside].mean())
         # Each band against its own recent peak, so the treble is not
         # drowned by the bass and a quiet song still grows pipes.
-        self._band_peak = np.maximum(levels, self._band_peak * _keep(0.996))
-        held = _keep(0.55)
+        self._band_peak = np.maximum(levels, self._band_peak * keep(0.996))
+        held = keep(0.55)
         self._bands = (held * self._bands
                        + (1 - held) * levels / np.maximum(self._band_peak, 1e-6))
         # ... and its recent average, about a second: a pipe goes out when
         # its band rises over that -- a hit -- not merely because it is loud.
-        usual = _keep(0.96)
+        usual = keep(0.96)
         self._band_avg = usual * self._band_avg + (1 - usual) * self._bands
         bass = float(levels[:self._bass_bands].mean())
-        self._peak_bass = max(bass, self._peak_bass * _keep(0.995))
+        self._peak_bass = max(bass, self._peak_bass * keep(0.995))
         bass_now = bass / self._peak_bass
         self._beat = (max(bass_now - self._bass, 0.0) * 2.5
-                      + self._beat * _keep(0.8))
-        kept = _keep(0.6)
+                      + self._beat * keep(0.8))
+        kept = keep(0.6)
         self._bass = kept * self._bass + (1 - kept) * bass_now
 
     def render(self) -> RawFrame:
@@ -333,8 +320,9 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
             seed = pipes[::2, ::2].astype(np.float32) * _PIPE_HEAT
             if placed is not None:
                 seed = np.maximum(seed, self._picture_outline(placed))
-            burning = self._burn(out[pipes], _PIPE_GLOW)
-            out = np.maximum(out, self._flames(seed))
+            burning = burn(out[pipes], self._fire * _PIPE_GLOW)
+            out = np.maximum(out, self._flames_of.flames(seed, self._fire,
+                                                            self._bass))
             out[pipes] = burning            # the pipe itself, in front
         frame = np.clip(out * 255.0, 0, 255).astype(np.uint8)
         data = (self._with_center(frame, placed) if placed is not None
@@ -383,11 +371,11 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         after = np.array([math.cos(turned), -math.sin(turned), 0.0], dtype=np.float32)
         start = np.full(3, mid, dtype=np.float32) + along * _RING
         length = _ZENITH_CELLS - _RING
-        elbow = round(random.uniform(*_BEND) * length * _STEPS)
-        corner = start + along * (elbow / _STEPS)
-        points = [start + along * (i / _STEPS) if i <= elbow
-                  else corner + after * ((i - elbow) / _STEPS)
-                  for i in range(int(length * _STEPS) + 1)]
+        elbow = round(random.uniform(*_BEND) * length * STEPS)
+        corner = start + along * (elbow / STEPS)
+        points = [start + along * (i / STEPS) if i <= elbow
+                  else corner + after * ((i - elbow) / STEPS)
+                  for i in range(int(length * STEPS) + 1)]
         projected = np.array([self._project(p) for p in points], dtype=np.float32)
         return _Pipe(band, material, projected, elbow)
 
@@ -408,7 +396,7 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
                 pipe.reach += (target - pipe.reach) * _FALL
             # The peak marker hangs at the highest reach, then sinks back --
             # as an old stereo's graphic equaliser did.
-            pipe.peak = max(pipe.reach, pipe.peak - 0.012 * _STEP)
+            pipe.peak = max(pipe.reach, pipe.peak - 0.012 * STEP)
         quiet = all(p.reach < 0.12 for p in self._pipes)
         if quiet and self._frame - self._rolled > _ROLL:
             self._new_round()
@@ -525,15 +513,6 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         painter.end()
         return frame.tobytes()
 
-    def _burn(self, rgb: np.ndarray, share: float) -> np.ndarray:
-        """*rgb* glowing red-hot, as far as Fire is up times *share*: its
-        brightness kept, its colour turned to embers."""
-        frame_log.debug("_burn: %d pixel(s) x%.2f", rgb.size // 3, share)
-        heat = self._fire * share
-        hot = np.array([1.0, 0.22, 0.05], dtype=np.float32)
-        glow = rgb.mean(axis=-1, keepdims=True) * 0.7 + 0.3
-        return rgb * (1 - heat) + hot * glow * heat * 1.25
-
     def _center_placement(self) -> tuple[Any, float]:
         """This frame's place for the picture: rocking toward the viewer and
         away, swelling with the bass -- a transform, and the picture's size."""
@@ -567,46 +546,10 @@ class TrccPipes(BaseVisual, key="trcc-pipes"):
         """The picture as it is drawn: red-hot as far as Fire is up --
         worked out when the picture or the Fire slider changes, never per
         frame."""
-        from PySide6.QtGui import QImage
         if self._center is None:
             log.debug("_prepare_center: no picture")
             self._shown = None
             return
-        if self._fire <= 0:
-            log.debug("_prepare_center: as it is")
-            self._shown = self._center
-            return
-        source = self._center.convertToFormat(QImage.Format.Format_RGBA8888)
-        w, h = source.width(), source.height()
-        rgba = np.frombuffer(source.constBits(), dtype=np.uint8).reshape(
-            h, source.bytesPerLine())[:, :w * 4].reshape(h, w, 4)
-        hot = self._burn(rgba[..., :3] / np.float32(255), 1.0)
-        burned = np.concatenate(
-            [np.clip(hot * 255, 0, 255).astype(np.uint8), rgba[..., 3:]], axis=2)
-        self._burned_pixels = np.ascontiguousarray(burned)
-        self._shown = QImage(self._burned_pixels.data, w, h, 4 * w,
-                             QImage.Format.Format_RGBA8888).copy()
-        log.debug("_prepare_center: %dx%d red-hot at fire %.2f", w, h, self._fire)
+        self._shown = burned_picture(self._center, self._fire)
+        log.debug("_prepare_center: fire %.2f", self._fire)
 
-    def _flames(self, seed: np.ndarray) -> np.ndarray:
-        """The demoscene fire: heat from the picture's outline rises, spreads
-        and cools, coloured black, red, orange, yellow, white -- worked at
-        half resolution (*seed* is), a quarter of the work."""
-        frame_log.debug("_flames")
-        heat = getattr(self, "_heat", None)
-        if heat is None or heat.shape != seed.shape:
-            heat = np.zeros_like(seed)
-        flicker = np.random.random(seed.shape).astype(np.float32)
-        heat = np.maximum(heat, seed * (0.6 + 0.4 * flicker)
-                          * (0.7 + 0.5 * min(self._bass, 1.3)))
-        lift = max(1, round(2 * _STEP))
-        rise = np.roll(heat, -lift, axis=0)
-        rise[-lift:] = 0
-        spread = (rise + np.roll(rise, 1, axis=1) + np.roll(rise, -1, axis=1)
-                  + np.roll(rise, -1, axis=0)) / 4.0
-        self._heat = heat = spread * (0.955 - 0.03 * flicker) ** _STEP
-        t = np.clip(heat * 1.4, 0.0, 1.0)[..., None] * self._fire
-        colour = np.concatenate([np.clip(t * 3.0, 0, 1), np.clip(t * 3.0 - 1, 0, 1),
-                                 np.clip(t * 3.0 - 2, 0, 1)], axis=2)
-        # Simulated at half resolution -- flames are blurry -- shown at full.
-        return colour.repeat(2, axis=0).repeat(2, axis=1)[:self._h, :self._w]

@@ -654,6 +654,13 @@ class VisualSettingsRequest(BaseModel):
     sliders: dict[str, float] = Field(default_factory=dict, max_length=16)
 
 
+class VisualPictureRequest(BaseModel):
+    """Body for ``POST /display/visual-picture``: the centre picture on or
+    off, and its fire (0 to 1) -- each only when given."""
+    shown: bool | None = None
+    fire: float | None = Field(None, ge=0.0, le=1.0)
+
+
 class VisualCenterRequest(BaseModel):
     """Body for ``POST /display/visual-center``: a picture in TRCC's own
     folders; '' for none."""

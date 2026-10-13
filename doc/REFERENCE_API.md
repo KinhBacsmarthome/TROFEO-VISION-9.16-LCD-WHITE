@@ -4,7 +4,7 @@
 
 A REST interface to the same command bus every other UI uses. Each endpoint builds a Command, dispatches it, and returns the Result as JSON — so anything here is also reachable from the CLI, the GUI, or your own client. The Commands themselves are documented in [`REFERENCE_COMMANDS.md`](REFERENCE_COMMANDS.md).
 
-**146 endpoints.**
+**147 endpoints.**
 
 ## Running it
 
@@ -89,6 +89,7 @@ Interactive docs are served at `/docs` while the API is running.
 | `GET /display/masks` | `MasksListResult` | List masks for a device resolution. |
 | `GET /display/video-duration` | `VideoDurationResult` | How long a video file is, in milliseconds (server-side path). |
 | `POST /display/visual-center` | `VisualsResult` | The picture in the middle of the visuals that show one -- a file in TRCC's own folders; '' for none. |
+| `POST /display/visual-picture` | `VisualsResult` | Switch the centre picture on or off (kept while off) and set its fire. |
 | `GET /display/visual-tile` | — | A visual's gallery tile as PNG -- what it draws for noise, the same whatever is playing.  The preset is checked by the visual, which refuses one outside the visuals' folder. |
 | `GET /display/visuals` | `VisualsResult` | The audio visuals this computer can draw, their sliders and presets, and the centre picture -- with ``?key=``, also what that panel plays and its slider values. |
 

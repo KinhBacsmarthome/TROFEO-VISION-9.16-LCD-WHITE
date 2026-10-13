@@ -25,6 +25,7 @@ from ....core.commands import (
     ListVisuals,
     PlayVisual,
     SetVisualCenter,
+    SetVisualPicture,
     SetVisualSettings,
     VisualTile,
 )
@@ -62,7 +63,8 @@ class AudioVisualsPanel(AssetBrowserPanel):
 
         self._list = self._build_asset_list()
         self._controls = VisualControls(self.app, self._sliders_command,
-                                        self._center_command, self)
+                                        self._center_command,
+                                            self._picture_command, self)
         self._picker.key_changed.connect(self._on_key_changed)
         self._bus.settings_changed.connect(
             self._on_settings_changed, type=Qt.ConnectionType.QueuedConnection)
@@ -155,6 +157,12 @@ class AudioVisualsPanel(AssetBrowserPanel):
         key = self._picker.current_key() or ""
         log.debug("AudioVisualsPanel._sliders_command: %s %s", key, values)
         return SetVisualSettings(key=key, settings=values)
+
+    def _picture_command(self, shown: bool | None,
+                         fire: float | None) -> SetVisualPicture:
+        """The Command for the centre picture on or off, and its fire."""
+        log.debug("AudioVisualsPanel._picture_command: shown=%s fire=%s", shown, fire)
+        return SetVisualPicture(shown=shown, fire=fire)
 
     def _center_command(self, path: str) -> SetVisualCenter:
         """The Command for a new centre picture ("" for none)."""

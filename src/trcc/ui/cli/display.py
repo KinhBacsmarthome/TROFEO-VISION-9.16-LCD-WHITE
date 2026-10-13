@@ -51,6 +51,7 @@ from ...core.commands import (
     SetSlideshow,
     SetSplitMode,
     SetVisualCenter,
+    SetVisualPicture,
     SetVisualSettings,
     SleepDevice,
     StartScreencast,
@@ -1370,6 +1371,21 @@ def visual_set(
     """Move the playing audio visual's sliders -- live, it keeps playing."""
     log.info("cli display visual-set: key=%s %s", key, setting)
     dispatch_echo(SetVisualSettings(key=key, settings=_visual_settings(setting)))
+
+
+@app.command("visual-picture")
+def visual_picture(
+    shown: str = typer.Argument("", help="on or off -- '' leaves it as it is."),
+    fire: float | None = typer.Option(
+        None, "--fire", help="How hot the picture burns, 0 to 1."),
+) -> None:
+    """Switch the centre picture on or off (it is kept while off) and set
+    its fire."""
+    log.info("cli display visual-picture: %r fire=%s", shown, fire)
+    if shown not in ("", "on", "off"):
+        raise typer.BadParameter(f"on or off -- got {shown!r}")
+    dispatch_echo(SetVisualPicture(shown=None if not shown else shown == "on",
+                                   fire=fire))
 
 
 @app.command("visual-tile")

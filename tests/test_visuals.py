@@ -33,6 +33,7 @@ from trcc.core.commands import (
     RestoreDeviceState,
     SetMediaPlayer,
     SetVisualCenter,
+    SetVisualPicture,
     SetVisualSettings,
     StopVisual,
     VisualTile,
@@ -109,10 +110,11 @@ def test_milkdrop_is_offered_only_where_projectm_can_draw(
 
 # ── TRCC Pipes ───────────────────────────────────────────────────────
 
-def _pipes(center: Path | None = None, **settings: float) -> TrccPipes:
+def _pipes(center: Path | None = None, center_fire: float = 0.0,
+           **settings: float) -> TrccPipes:
     engine = TrccPipes()
     engine.open(VisualSpec("trcc-pipes", 160, 160, center=center,
-                           settings=settings))
+                           center_fire=center_fire, settings=settings))
     return engine
 
 
@@ -169,12 +171,18 @@ def test_the_centre_picture_sits_in_the_middle_and_can_burn(
     frame = plain.render()
     middle = (80 * 160 + 80) * 3
     assert sum(frame.data[middle:middle + 3]) > 60
-    burning = _pipes(picture, center_size=0.4, fire=1.0)
-    for _ in range(20):
-        frame = burning.render()
-    above = np.frombuffer(frame.data, dtype=np.uint8).reshape(160, 160, 3)[20:50, 60:100]
-    hot = above[above.max(axis=2) > 60]
-    assert hot.size and (hot[:, 0] >= hot[:, 2]).all()      # flames: red over blue
+    def above_the_picture(engine: TrccPipes) -> np.ndarray:
+        for _ in range(20):
+            frame = engine.render()
+        return np.frombuffer(frame.data, dtype=np.uint8).reshape(
+            160, 160, 3)[20:50, 60:100].astype(int)
+
+    cold = above_the_picture(_pipes(picture, center_size=0.4, growth=0.3))
+    hot = above_the_picture(_pipes(picture, center_fire=1.0, center_size=0.4,
+                                   growth=0.3))
+    flames = (hot[..., 0] - hot[..., 2]) - (cold[..., 0] - cold[..., 2])
+    assert flames.mean() > 20                               # red rose above it
+    assert not _pipes(center_fire=1.0)._fire                # no picture, no fire
 
 
 # ── The Commands, on the App ─────────────────────────────────────────
@@ -237,7 +245,7 @@ def test_the_gallery_lists_every_visual_and_the_preset_files(app: App) -> None:
     kinds = [v.kind for v in listed.visuals]
     assert (kinds[0], kinds[-1], len(kinds)) == ("trcc-pipes", "milkdrop", 13)
     assert [a.name for a in listed.visuals[0].adjustments] == [
-        "growth", "thickness", "center_size", "fire"]
+        "growth", "thickness", "center_size"]       # Fire is the picture's
     assert listed.presets == ("Fractal/one.milk",)
 
 
@@ -514,10 +522,10 @@ def test_sliders_change_the_playing_visual_live(app: App) -> None:
     heard: list[BackgroundChanged] = []
     app.events.subscribe(BackgroundChanged, heard.append)
 
-    moved = app.dispatch(SetVisualSettings(key=_KEY, settings={"fire": 9.0}))
+    moved = app.dispatch(SetVisualSettings(key=_KEY, settings={"growth": 9.0}))
 
     assert moved.ok and moved.playing
-    assert reader.adjusted == {"growth": 2.0, "fire": 1.0}       # clamped
+    assert reader.adjusted == {"growth": 3.0}                    # clamped
     assert _reader(app) is reader                                # not restarted
     assert app.settings.for_device(_KEY).visual_settings == reader.adjusted
     assert [e.key for e in heard] == [_KEY]
@@ -867,3 +875,55 @@ def test_the_reader_thread_enters_the_platform_s_worker_context() -> None:
     reader.close()
     assert done.wait(5)
     assert entered == ["trcc-visual"]
+
+
+
+# ── the picture: on, off, and its fire ───────────────────────────────
+
+def test_the_picture_switches_off_and_on_and_is_kept(app: App,
+                                                     tmp_path: Path) -> None:
+    """The user's button: off hides it, on brings the SAME picture back --
+    the App keeps it; the playing visual starts again with each change."""
+    picture = tmp_path / "bob.png"
+    QImage(8, 8, QImage.Format.Format_ARGB32).save(str(picture))
+    app.dispatch(SetVisualCenter(path=str(picture)))
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes"))
+    assert _reader(app).spec.center == picture
+
+    off = app.dispatch(SetVisualPicture(shown=False))
+    assert (off.ok, off.center, off.center_shown) == (True, str(picture), False)
+    assert _reader(app).spec.center is None
+
+    app.dispatch(SetVisualPicture(shown=True))
+    assert _reader(app).spec.center == picture
+
+
+def test_the_fire_belongs_to_the_picture(app: App, tmp_path: Path) -> None:
+    """Its fire reaches the visual only while the picture is on, and is
+    kept while it is off.  MUTATION CHECK: drop the shown guard in
+    Settings.visual_picture."""
+    picture = tmp_path / "bob.png"
+    QImage(8, 8, QImage.Format.Format_ARGB32).save(str(picture))
+    app.dispatch(SetVisualCenter(path=str(picture)))
+    app.dispatch(PlayVisual(key=_KEY, visual="trcc-pipes"))
+    app.dispatch(SetVisualPicture(fire=0.7))
+    assert _reader(app).spec.center_fire == pytest.approx(0.7)
+
+    off = app.dispatch(SetVisualPicture(shown=False))
+    assert _reader(app).spec.center_fire == 0.0
+    assert off.center_fire == pytest.approx(0.7)            # kept
+    assert app.dispatch(SetVisualPicture(fire=4.0)).center_fire == 1.0
+
+
+def test_the_api_switches_the_picture(app: App, tmp_path: Path) -> None:
+    from tests.conftest import loopback_client
+    from trcc.ui.api.main import build_app
+
+    client = loopback_client(build_app(app))
+    answer = client.post("/display/visual-picture", json={"shown": False,
+                                                          "fire": 0.5})
+    assert answer.status_code == 200
+    assert (answer.json()["center_shown"], answer.json()["center_fire"]) == (
+        False, 0.5)
+    assert client.post("/display/visual-picture",
+                       json={"fire": 2.0}).status_code == 422

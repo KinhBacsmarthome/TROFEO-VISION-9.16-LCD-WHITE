@@ -76,6 +76,7 @@ from ...core.models import (
 )
 from ._base import BaseVisual
 from ._cava import Cava, monstercat
+from ._fire import Fire, burned_picture
 
 log = logging.getLogger(__name__)
 frame_log = per_frame(__name__)
@@ -412,6 +413,10 @@ class CavalierVisual(BaseVisual):
         self._look = _Look()
         self._color: Any = None
         self._mirror = 0
+        self._fire = 0.0
+        self._flames = Fire(0, 0)
+        self._seed = np.zeros((0, 0), dtype=np.float32)
+        self._burning: list[Any] = []
 
     def open(self, spec: VisualSpec) -> None:
         from PySide6.QtGui import QImage
@@ -422,6 +427,12 @@ class CavalierVisual(BaseVisual):
         if spec.center is not None and spec.center.is_file():
             image = QImage(str(spec.center))
             self._picture = None if image.isNull() else image
+        # The fire is the picture's (the user's call): no picture, no fire.
+        self._fire = spec.center_fire if self._picture is not None else 0.0
+        if self._picture is not None:
+            self._picture = burned_picture(self._picture, self._fire)
+        self._flames = Fire(self._w, self._h)
+        self._seed = np.zeros(self._flames.half, dtype=np.float32)
 
     def adjust(self, settings: Mapping[str, float]) -> None:
         """The sliders: each at *settings*' value, else its default."""
@@ -459,19 +470,31 @@ class CavalierVisual(BaseVisual):
         self._sample = np.concatenate([left, right[::-1]])
 
     def render(self) -> RawFrame:
-        from PySide6.QtGui import QColor, QImage, QPainter
+        from PySide6.QtGui import QImage, QPainter
         frame_log.debug("%s.render", type(self).__name__)
-        image = QImage(self._w, self._h, QImage.Format.Format_RGB888)
-        image.fill(QColor(*_BACKGROUND))
+        frame = np.empty((self._h, self._w, 3), dtype=np.uint8)
+        frame[:] = _BACKGROUND
+        if self._fire > 0:
+            # Behind the shapes: flames rising from where the picture was.
+            flames = self._flames.flames(self._seed, self._fire, self._bass())
+            frame = np.maximum(frame, (flames * 255).astype(np.uint8))
+        image = QImage(frame.data, self._w, self._h, 3 * self._w,
+                       QImage.Format.Format_RGB888)
         painter = QPainter(image)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._burning = []
         for sample, y, height, up in self._halves():
             self._draw(painter, sample, float(y), float(height), up)
         painter.end()
-        rows = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(
-            self._h, image.bytesPerLine())
-        return RawFrame(data=rows[:, :self._w * 3].tobytes(), width=self._w,
-                        height=self._h)
+        if self._fire > 0:
+            self._seed = self._flames.seed_from(self._burning)
+        return RawFrame(data=frame.tobytes(), width=self._w, height=self._h)
+
+    def _bass(self) -> float:
+        """How hard the bass hits now: its bars sit at both outer edges."""
+        bass = float(max(self._sample[0], self._sample[-1]))
+        frame_log.debug("%s._bass: %.2f", type(self).__name__, bass)
+        return bass
 
     def _halves(self) -> list[tuple[np.ndarray, float, float, bool]]:
         """Renderer.Draw's mirror: off -- the whole height; full -- the bars
@@ -502,6 +525,7 @@ class CavalierVisual(BaseVisual):
                                 self._look)
         painter.fillPath(path, self._color)
         if self._picture is not None:
+            self._burning.append(path)
             painter.save()
             painter.setClipPath(path)
             self._draw_picture(painter, 0.0, 0.0, float(self._w), float(self._h))
@@ -518,6 +542,7 @@ class CavalierVisual(BaseVisual):
         middle = QPointF(self._w / 2, y + height / 2)
         circle = QPainterPath()
         circle.addEllipse(middle, inner, inner)
+        self._burning.append(circle)
         painter.save()
         painter.setClipPath(circle)
         self._draw_picture(painter, middle.x() - inner, middle.y() - inner,

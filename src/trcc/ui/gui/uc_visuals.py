@@ -19,6 +19,7 @@ from PySide6.QtGui import QImage, QPixmap
 from ...core.commands import (
     ListVisuals,
     SetVisualCenter,
+    SetVisualPicture,
     SetVisualSettings,
     VisualTile,
 )
@@ -114,7 +115,8 @@ class UCVisuals(BaseThemeBrowser):
         self.scroll_area.setGeometry(0, _TOP, 732, _BOTTOM - _TOP)
         if self._app is not None:
             self._controls = VisualControls(self._app, self._sliders_command,
-                                            self._center_command, self)
+                                            self._center_command,
+                                            self._picture_command, self)
             self._controls.setStyleSheet(_CONTROLS_STYLE)
             self._fit_controls()
 
@@ -213,6 +215,12 @@ class UCVisuals(BaseThemeBrowser):
         """The Command for new slider values, for the active panel."""
         log.debug("UCVisuals._sliders_command: %s %s", self._key, values)
         return SetVisualSettings(key=self._key, settings=values)
+
+    def _picture_command(self, shown: bool | None,
+                         fire: float | None) -> SetVisualPicture:
+        """The Command for the centre picture on or off, and its fire."""
+        log.debug("UCVisuals._picture_command: shown=%s fire=%s", shown, fire)
+        return SetVisualPicture(shown=shown, fire=fire)
 
     def _center_command(self, path: str) -> SetVisualCenter:
         """The Command for a new centre picture ("" for none)."""

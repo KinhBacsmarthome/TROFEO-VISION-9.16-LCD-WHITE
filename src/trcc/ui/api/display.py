@@ -63,6 +63,7 @@ from ...core.commands import (
     SetSlideshow,
     SetSplitMode,
     SetVisualCenter,
+    SetVisualPicture,
     SetVisualSettings,
     SleepDevice,
     StartScreencast,
@@ -160,6 +161,7 @@ from .schemas import (
     ThemeResponse,
     VideoStatusResponse,
     VisualCenterRequest,
+    VisualPictureRequest,
     VisualRequest,
     VisualSettingsRequest,
 )
@@ -1302,6 +1304,18 @@ def visual_tile(request: Request, visual: str, preset: str = "",
     if not result.ok:
         raise HTTPException(404, result.message)
     return Response(content=result.image, media_type=result.media_type)
+
+
+@meta_router.post("/visual-picture")
+def visual_picture(body: VisualPictureRequest, request: Request) -> VisualsResult:
+    """Switch the centre picture on or off (kept while off) and set its
+    fire."""
+    log.info("api POST /display/visual-picture: shown=%s fire=%s",
+             body.shown, body.fire)
+    result = request.app.state.trcc.dispatch(
+        SetVisualPicture(shown=body.shown, fire=body.fire))
+    http_error_if_failed(result)
+    return result
 
 
 @meta_router.post("/visual-center")

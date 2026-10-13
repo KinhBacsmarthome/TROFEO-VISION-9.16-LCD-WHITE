@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..errors import DeviceNotFoundError
 from ..events import ErrorOccurred, VisualHearingChanged
@@ -64,6 +64,28 @@ def _sound_problem(app: App) -> str:
     return problem
 
 
+def _picture(app: App) -> dict[str, Any]:
+    """The centre picture as a visual takes it: the file -- or ``None``
+    while switched off -- and its fire."""
+    center, shown, fire = app.settings.visual_picture()
+    log.debug("_picture: %s shown=%s fire=%.2f", center, shown, fire)
+    return {"center": center if shown else None, "center_fire": fire}
+
+
+def _restart_centred(app: App, command: str) -> None:
+    """Every panel playing a visual that shows the picture starts it again,
+    so a change to the picture shows at once, sliders kept."""
+    centred = {v.kind for v in app.platform.visual_catalog() if v.uses_center}
+    for key in list(app.devices):
+        s = app.settings.for_device(key)
+        if s.visual in centred and app.media.visual(key) is not None:
+            log.info("%s: %s plays %s -- starting it again", command, key,
+                     s.visual)
+            app.dispatch(PlayVisual(key=key, visual=s.visual,
+                                    preset=s.visual_preset,
+                                    settings=dict(s.visual_settings)))
+
+
 def _refused(app: App, command: str, key: str, preset: str,
              problem: str) -> VisualResult:
     """*command* refused before anything changed -- and said where the user
@@ -88,14 +110,15 @@ class ListVisuals(Query[VisualsResult]):
         base = app.platform.paths().visuals_dir()
         presets = tuple(name for v in visuals if v.uses_presets
                         for name in app.platform.visual_class(v.kind).presets(base))
-        center = app.settings.visual_center()
+        center, shown, _fire = app.settings.visual_picture()
         s = app.settings.for_device(self.key) if self.key else None
         reader = app.media.visual(self.key) if self.key else None
         log.info("ListVisuals: %s, %d preset(s), centre %s, %s plays %s",
                  [v.kind for v in visuals], len(presets), center,
                  self.key or "-", s.visual if s else None)
         return VisualsResult(ok=True, visuals=visuals, presets=presets,
-                             center=str(center or ""),
+                             center=str(center or ""), center_shown=shown,
+                             center_fire=app.settings.visual_center_fire(),
                              playing=(s.visual or "") if s else "",
                              preset=s.visual_preset if s else "",
                              sliders=dict(s.visual_settings) if s else {},
@@ -136,8 +159,7 @@ class PlayVisual(Command[VisualResult]):
         assert info is not None and profile is not None
         width, height = profile.resolution
         spec = VisualSpec(self.visual, width, height, preset=preset,
-                          center=app.settings.visual_center(),
-                          settings=dict(self.settings))
+                          settings=dict(self.settings), **_picture(app))
         app.dispatch(StopVideo(key=self.key))
         app.settings.set_visual(self.key, self.visual, self.preset,
                                 self.settings)
@@ -292,20 +314,31 @@ class SetVisualCenter(Command[VisualsResult]):
             log.warning("SetVisualCenter: refused -- %s", problem)
             return VisualsResult(ok=False, message=problem)
         app.settings.set_visual_center(self.path or None)
-        centred = {v.kind for v in app.platform.visual_catalog() if v.uses_center}
-        for key in list(app.devices):
-            s = app.settings.for_device(key)
-            if s.visual in centred and app.media.visual(key) is not None:
-                log.info("SetVisualCenter: %s plays %s -- starting it again",
-                         key, s.visual)
-                app.dispatch(PlayVisual(key=key, visual=s.visual,
-                                        preset=s.visual_preset,
-                                        settings=dict(s.visual_settings)))
+        _restart_centred(app, "SetVisualCenter")
         listed = app.dispatch(ListVisuals())
         return VisualsResult(ok=True, visuals=listed.visuals,
                              presets=listed.presets, center=listed.center,
                              message=("centre picture set" if self.path
                                       else "no centre picture"))
+
+
+@dataclass(frozen=True, slots=True)
+class SetVisualPicture(Command[VisualsResult]):
+    """Switch the centre picture on or off -- it is kept while off, so on
+    brings it back -- and set how hot it burns, 0 to 1 (the user's call:
+    the fire belongs to the picture; no picture, no fire).  Each only when
+    given.  Every panel playing a visual that shows it starts again."""
+    shown: bool | None = None
+    fire: float | None = None
+
+    def execute(self, app: App) -> VisualsResult:
+        log.info("SetVisualPicture: shown=%s fire=%s", self.shown, self.fire)
+        app.settings.set_visual_picture(shown=self.shown, fire=self.fire)
+        _restart_centred(app, "SetVisualPicture")
+        listed = app.dispatch(ListVisuals())
+        return replace(listed, message=(
+            "centre picture off" if not listed.center_shown
+            else f"centre picture on, fire {listed.center_fire:.2f}"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +359,7 @@ class VisualTile(Query[VisualTileResult]):
             problem = f"a tile is 16 to {MAX_TILE} pixels a side"
         if not problem:
             spec = VisualSpec(self.visual, self.size, self.size, preset=preset,
-                              center=app.settings.visual_center())
+                              **_picture(app))
             try:
                 frame = snapshot(spec, app.platform.visual_class(self.visual)())
             except OSError as e:

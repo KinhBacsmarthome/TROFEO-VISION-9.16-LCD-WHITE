@@ -146,3 +146,26 @@ def test_a_slider_rebuilds_the_engine_only_for_a_new_bar_count() -> None:
     assert visual._cava is engine                           # type: ignore[attr-defined]
     visual.adjust({"bars": 12.0})
     assert visual._cava is not engine and visual._sample.size == 24  # type: ignore[attr-defined]
+
+
+
+def test_a_burning_picture_sends_flames_up_from_a_circle(tmp_path: Path) -> None:
+    """The picture's fire reaches Cavalier's modes too: flames rise from
+    the circle it sits in."""
+    picture = tmp_path / "white.png"
+    image = QImage(8, 8, QImage.Format.Format_RGB888)
+    image.fill(0xFFFFFF)
+    image.save(str(picture))
+
+    def above(fire: float) -> np.ndarray:
+        visual = VISUALS["cavalier-bars-circle"]()
+        visual.open(VisualSpec("cavalier-bars-circle", 160, 160,
+                               center=picture, center_fire=fire))
+        _music(visual)
+        frame = None
+        for _ in range(12):
+            frame = visual.render()
+        return _pixels(frame)[30:55, 70:90].astype(int)
+
+    cold, hot = above(0.0), above(1.0)
+    assert (hot[..., 0] - hot[..., 2]).mean() > (cold[..., 0] - cold[..., 2]).mean() + 20

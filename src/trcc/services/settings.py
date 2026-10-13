@@ -129,8 +129,11 @@ class AppSettings:
     # runs one way.  ``aura_argb_leds`` validates.
     aura_argb_leds: dict[str, int] = field(default_factory=dict)
     # The user's centre picture for audio visuals -- any image; ``None``
-    # shows none.
+    # shows none.  Kept while switched off, so switching it on brings it
+    # back; its fire belongs to it (0 to 1).
     visual_center: str | None = None
+    visual_center_shown: bool = True
+    visual_center_fire: float = 0.0
 
 
 # =========================================================================
@@ -596,10 +599,40 @@ class Settings:
         return found
 
     def set_visual_center(self, path: str | None) -> None:
-        """Remember the user's centre picture (``None``: none)."""
+        """Remember the user's centre picture (``None``: none) -- a picture
+        just picked is shown."""
         log.info("set_visual_center: %s", path)
         with self._lock:
             self._app.visual_center = path
+            if path:
+                self._app.visual_center_shown = True
+            self._save()
+
+    def visual_picture(self) -> tuple[Path | None, bool, float]:
+        """The centre picture as visuals draw it: its file, whether it is
+        on, and its fire (no fire while it is off)."""
+        path = self.visual_center()
+        shown = bool(self._app.visual_center_shown)
+        fire = float(self._app.visual_center_fire) if shown else 0.0
+        log.debug("visual_picture: %s shown=%s fire=%.2f", path, shown, fire)
+        return path, shown, fire
+
+    def visual_center_fire(self) -> float:
+        """The picture's fire setting, kept while the picture is off."""
+        fire = float(self._app.visual_center_fire)
+        log.debug("visual_center_fire: %.2f", fire)
+        return fire
+
+    def set_visual_picture(self, shown: bool | None = None,
+                           fire: float | None = None) -> None:
+        """Switch the centre picture on or off, and set how hot it burns
+        (0 to 1) -- each only when given."""
+        log.info("set_visual_picture: shown=%s fire=%s", shown, fire)
+        with self._lock:
+            if shown is not None:
+                self._app.visual_center_shown = shown
+            if fire is not None:
+                self._app.visual_center_fire = min(max(fire, 0.0), 1.0)
             self._save()
 
     def set_fit_mode(self, key: str, mode: FitMode) -> None:

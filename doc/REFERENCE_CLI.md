@@ -1141,6 +1141,22 @@ trcc display visual-center [PATH]
 |---|---|
 | `PATH` | Any picture for the middle of a visual; '' for none. *(optional)* |
 
+### `trcc display visual-picture`
+
+Switch the centre picture on or off (it is kept while off) and set its fire.
+
+```bash
+trcc display visual-picture [OPTIONS] [SHOWN]
+```
+
+| Argument | Description |
+|---|---|
+| `SHOWN` | on or off -- '' leaves it as it is. *(optional)* |
+
+| Option | Description |
+|---|---|
+| `--fire` `FIRE` | How hot the picture burns, 0 to 1. |
+
 ### `trcc display visual-set`
 
 Move the playing audio visual's sliders -- live, it keeps playing.
