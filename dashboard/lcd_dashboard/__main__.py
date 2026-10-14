@@ -1,4 +1,4 @@
-"""Chạy dashboard: ``python3 -m lcd_dashboard [-c config.toml] [--web]``."""
+"""Chạy dashboard: ``trcc-dashboard [-c config.toml] [--web]`` (= ``python3 -m lcd_dashboard``)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .config import DEFAULT_PATH, Config, ConfigError, load_config
 from .demo import demo_snapshot
 from .render import render
@@ -94,8 +95,9 @@ class Loop:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="lcd_dashboard",
+    ap = argparse.ArgumentParser(prog="trcc-dashboard",
                                  description="Dashboard cho Thermalright Trofeo Vision 9.16 LCD")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("-c", "--config", type=Path, default=DEFAULT_PATH,
                     help=f"file cấu hình TOML (mặc định {DEFAULT_PATH})")
     ap.add_argument("--once", action="store_true", help="vẽ và gửi một lần rồi thoát")
@@ -116,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    log.info("trcc-dashboard %s, cấu hình %s", __version__, args.config)
     loop = Loop(args.config, args.demo)
     loop.reload_if_changed()
 

@@ -1,19 +1,20 @@
-# Chạy dashboard nền cho người dùng hiện tại.
-# Cài:  cp trcc-dashboard.service ~/.config/systemd/user/
-#       systemctl --user daemon-reload
-#       systemctl --user enable --now trcc-dashboard
-# Log:  journalctl --user -u trcc-dashboard -f
-# Cấu hình: mở http://127.0.0.1:8765 trong trình duyệt
+# Dịch vụ systemd (người dùng) cho TRCC Dashboard — install.sh tự cài file này vào
+# ~/.config/systemd/user/. Lệnh hay dùng:
+#   systemctl --user status trcc-dashboard      trạng thái
+#   systemctl --user restart trcc-dashboard     khởi động lại
+#   systemctl --user stop trcc-dashboard        tạm dừng (vd. để dùng trcc gui)
+#   journalctl --user -u trcc-dashboard -f      xem log
+# Trang cấu hình: http://127.0.0.1:8765
 [Unit]
-Description=Dashboard cho Thermalright Trofeo Vision 9.16 LCD
+Description=TRCC Dashboard cho Thermalright Trofeo Vision 9.16 LCD
+Documentation=file://%h/.local/share/trcc-dashboard/README.md
 After=network-online.target graphical-session.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/TROFEO-VISION-9.16-LCD-WHITE/dashboard
-# --web: mở trang cấu hình tại http://127.0.0.1:8765 (bỏ đi nếu không cần)
-ExecStart=/usr/bin/python3 -m lcd_dashboard -c %h/.config/trcc-dashboard/config.toml --web -v
+# --web: mở trang cấu hình (bỏ đi nếu không cần)
+ExecStart=%h/.local/bin/trcc-dashboard --web -v
 Restart=on-failure
 RestartSec=10
 

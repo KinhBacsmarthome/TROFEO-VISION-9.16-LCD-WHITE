@@ -175,8 +175,14 @@ Muốn mở cho mạng LAN thì dùng `--host 0.0.0.0` **kèm** `--token MAT_KHA
 ### Dashboard Home Assistant / NAS / thời tiết
 
 Thư mục [`dashboard/`](dashboard/) có chương trình hiển thị đồng hồ, Home Assistant,
-NAS Synology, nhiệt độ, mạng và thời tiết lên màn hình. Xem hướng dẫn ở
-[dashboard/README.md](dashboard/README.md).
+NAS Synology, nhiệt độ, mạng và thời tiết lên màn hình, cấu hình bằng trang web. Cài đặt:
+
+```bash
+cd TROFEO-VISION-9.16-LCD-WHITE/dashboard
+./install.sh                       # rồi mở http://127.0.0.1:8765
+```
+
+Hướng dẫn đầy đủ: [dashboard/README.md](dashboard/README.md).
 
 ---
 

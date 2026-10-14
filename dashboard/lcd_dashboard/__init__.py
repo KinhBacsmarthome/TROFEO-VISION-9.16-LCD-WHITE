@@ -4,4 +4,4 @@ Vẽ một khung hình 1920x462 bằng Pillow rồi đẩy lên màn hình qua t
 (lệnh ``SendImage`` — giữ ảnh trên màn hình cho tới lần nạp theme tiếp theo).
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

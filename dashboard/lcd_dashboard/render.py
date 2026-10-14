@@ -198,6 +198,17 @@ class Painter:
         else:
             paint(self.draw)
 
+    def gradient_bar(self, x0: float, y0: float, x1: float, y1: float, r: float,
+                     c0: RGB, c1: RGB) -> None:
+        """Thanh bo góc tô dải màu ngang từ ``c0`` sang ``c1``."""
+        bx0, by0, bx1, by1 = self.box(x0, y0, x1, y1)
+        w, h = max(bx1 - bx0, 1), max(by1 - by0, 1)
+        line = Image.new("RGB", (w, 1))
+        line.putdata([lerp(c0, c1, i / max(w - 1, 1)) for i in range(w)])
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, w - 1, h - 1), radius=self.s(r), fill=255)
+        self.img.paste(line.resize((w, h)), (bx0, by0), mask)
+
     def circle(self, cx: float, cy: float, r: float, fill: Sequence[int]) -> None:
         self.draw.ellipse(self.box(cx - r, cy - r, cx + r, cy + r), fill=tuple(fill))
 
@@ -551,12 +562,8 @@ def temp_card(p: Painter, x0: float, y0: float, x1: float, y1: float,
         p.rrect(x0 + 20, by, x1 - 18, by + 12, 6, fill=TRACK)
         if row.value is not None:
             fill_w = max((x1 - x0 - 38) * min(frac, 1.0), 12)
-            c0 = temp_color(frac * 0.6)
-            steps = 24
-            for k in range(steps):
-                sx = x0 + 20 + fill_w * k / steps
-                p.rrect(sx, by, min(sx + fill_w / steps + 6, x0 + 20 + fill_w), by + 12, 6,
-                        fill=lerp(c0, col, k / (steps - 1)))
+            p.gradient_bar(x0 + 20, by, x0 + 20 + fill_w, by + 12, 6,
+                           temp_color(frac * 0.6), col)
         if i < len(rows) - 1:
             p.line([(x0 + 16, top + step - 8), (x1 - 16, top + step - 8)], (25, 45, 80), 1)
 
