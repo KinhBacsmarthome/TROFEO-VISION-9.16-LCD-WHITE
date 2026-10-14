@@ -1,0 +1,553 @@
+"""Health checks — quick probes that surface common reporter issues.
+
+Each check returns a ``HealthCheckResult`` so callers (Doctor command,
+GUI about panel, GitHub-issue debug bundle) can render them uniformly.
+Checks are intentionally cheap (no subprocess that takes >1s); deeper
+diagnostics live in legacy's interactive ``device_debug`` flows which
+next/ doesn't port — those are GUI features, not CLI-on-headless ones.
+
+Severity ladder:
+  * ``OK`` — everything in scope works.
+  * ``WARN`` — works on this machine but reporter should know.
+  * ``FAIL`` — feature won't work until this is fixed.
+
+Adding a check: define a function returning ``HealthCheckResult`` and add
+it to the list in ``run_health_checks``.  The doctor + report bundlers both
+go through that function, so registration = inclusion.
+"""
+from __future__ import annotations
+
+import logging
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from ...core import toolchain
+from ...core.diagnostics import HealthCheckResult, HealthReport, Severity
+from ...core.ports import Paths, Platform
+from ..sensors.nvml import NVML_RELOAD_HINT, GpuStateFn, nvml_init_state
+from .install import collect_install_info
+
+log = logging.getLogger(__name__)
+
+# DTOs moved to ``core.diagnostics`` (pure data the Diagnostics port speaks);
+# re-exported here so existing ``from ...health import HealthReport`` keeps working.
+__all__ = [
+    "HealthCheckResult",
+    "HealthReport",
+    "Severity",
+    "detect_package_manager",
+    "nvidia_gpu_present",
+    "package_install_hint",
+    "quick_subprocess",
+    "run_health_checks",
+]
+
+
+# =========================================================================
+# Individual checks
+# =========================================================================
+
+
+def check_install_integrity() -> HealthCheckResult:
+    """Is the running trcc the one the user thinks they installed?
+
+    Two failures both present to the user as "I upgraded and nothing
+    changed", and neither is visible from the outside:
+
+    * stale bytecode — Python serves a cached .pyc whose recorded mtime+size
+      still match a since-edited source (FAIL: every other diagnostic, and
+      the version itself, is then untrustworthy);
+    * duplicate binaries on PATH — the upgrade landed on one, the other keeps
+      running (WARN: legitimate for venv/pipx users, so not fatal).
+    """
+    log.info("check_install_integrity: called")
+    try:
+        info = collect_install_info()
+    except Exception as e:
+        log.exception("check_install_integrity: collection failed: %s", e)
+        return HealthCheckResult(
+            name="install-integrity", severity="WARN",
+            message=f"Could not inspect the install: {e}",
+        )
+    if info.bytecode_stale:
+        return HealthCheckResult(
+            name="install-integrity", severity="FAIL",
+            message=(
+                f"Stale bytecode — running {info.version} but "
+                f"{info.module_path} says {info.source_version}"
+            ),
+            fix_hint=(
+                "Python is serving a cached .pyc that no longer matches the "
+                "source. Delete the __pycache__ directories under "
+                f"{info.module_path}, or reinstall trcc-linux."
+            ),
+        )
+    if info.duplicates:
+        found = ", ".join(str(e.path) for e in info.executables)
+        return HealthCheckResult(
+            name="install-integrity", severity="WARN",
+            message=f"{len(info.executables)} trcc on PATH: {found}",
+            fix_hint=(
+                f"'{info.executables[0].path}' is the one that runs. An "
+                "upgrade applied to the other will appear to do nothing. "
+                "Remove whichever you don't want."
+            ),
+        )
+    return HealthCheckResult(
+        name="install-integrity", severity="OK",
+        message=f"{info.version} via {info.installer} ({info.interpreter})",
+    )
+
+
+#: The oldest Python TRCC supports -- ``requires-python`` in ``pyproject.toml``,
+#: which ``tests/test_diagnostics.py`` holds equal to this.  The doctor said 3.11
+#: while the package promised 3.10, so every Ubuntu 22.04 user was told their
+#: supported Python FAILED and ``trcc quickstart`` stopped at the doctor.
+MIN_PYTHON = (3, 10)
+
+
+def check_python_version(platform: Platform) -> HealthCheckResult:
+    """The running Python meets :data:`MIN_PYTHON`."""
+    log.info("check_python_version: called")
+    major, minor = sys.version_info[:2]
+    if (major, minor) >= MIN_PYTHON:
+        return HealthCheckResult(
+            name="python-version", severity="OK",
+            message=f"Python {major}.{minor}",
+        )
+    return HealthCheckResult(
+        name="python-version", severity="FAIL",
+        message=(f"Python {major}.{minor} is below the "
+                 f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]} minimum"),
+        fix_hint=platform.software_install_hint("python"),
+    )
+
+
+def check_log_writable(paths: Paths) -> HealthCheckResult:
+    """The log file's parent dir must be writable for diagnostics to land."""
+    log.info("check_log_writable: called")
+    log_path = paths.log_file()
+    parent = log_path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        probe = parent / ".trcc_health_probe"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        return HealthCheckResult(
+            name="log-writable", severity="FAIL",
+            message=f"Cannot write to {parent}: {e}",
+            fix_hint=f"chmod the directory or pick a different log path: {parent}",
+        )
+    return HealthCheckResult(
+        name="log-writable", severity="OK",
+        message=f"Log directory writable: {parent}",
+    )
+
+
+def check_config_writable(paths: Paths) -> HealthCheckResult:
+    log.info("check_config_writable: called")
+    config_dir = paths.config_dir()
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        probe = config_dir / ".trcc_health_probe"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        return HealthCheckResult(
+            name="config-writable", severity="FAIL",
+            message=f"Cannot write to {config_dir}: {e}",
+            fix_hint=f"chmod the directory or pick a different config path: {config_dir}",
+        )
+    return HealthCheckResult(
+        name="config-writable", severity="OK",
+        message=f"Config directory writable: {config_dir}",
+    )
+
+
+def check_devices_visible(platform: Platform) -> HealthCheckResult:
+    """A device-less scan is WARN not FAIL — the user might not have plugged in yet."""
+    log.info("check_devices_visible: called")
+    try:
+        devices = platform.scan_devices()
+    except (OSError, RuntimeError) as e:
+        return HealthCheckResult(
+            name="devices-visible", severity="FAIL",
+            message=f"USB scan raised {type(e).__name__}: {e}",
+            fix_hint="Check libusb is installed and the user has USB permissions",
+        )
+    if not devices:
+        return HealthCheckResult(
+            name="devices-visible", severity="WARN",
+            message="No Thermalright devices detected on USB",
+            fix_hint=platform.no_devices_hint(),
+        )
+    return HealthCheckResult(
+        name="devices-visible", severity="OK",
+        message=f"{len(devices)} device(s) detected",
+    )
+
+
+def check_sensors_enumerable(platform: Platform) -> HealthCheckResult:
+    """At least one sensor (CPU temp / RAM) should be readable."""
+    log.info("check_sensors_enumerable: called")
+    try:
+        descriptors = platform.sensors().discover()
+    except (OSError, RuntimeError) as e:
+        return HealthCheckResult(
+            name="sensors-enumerable", severity="FAIL",
+            message=f"Sensor enumeration raised {type(e).__name__}: {e}",
+            fix_hint="Check psutil / hwmon dependencies are installed",
+        )
+    if not descriptors:
+        return HealthCheckResult(
+            name="sensors-enumerable", severity="WARN",
+            message="No sensors discovered (overlay metrics will be empty)",
+            fix_hint="Install psutil; on Linux also enable hwmon/lm-sensors",
+        )
+    return HealthCheckResult(
+        name="sensors-enumerable", severity="OK",
+        message=f"{len(descriptors)} sensor descriptor(s) available",
+    )
+
+
+def nvidia_gpu_present() -> bool:
+    """Cheap probe: is a discrete NVIDIA (PCI vendor ``0x10de``) GPU present?
+
+    Reads ``/sys/bus/pci/devices/*/vendor`` — no subprocess, and works even
+    when the driver / pynvml are absent.  That's the point: detect the card
+    independently of the reader so we can advise *installing* the reader.
+    Non-Linux falls back to the driver proc node.
+    """
+    from ..sensors.gpu_detect import nvidia_gpu_present as pci_probe
+
+    present = pci_probe()
+    log.debug("nvidia_gpu_present: PCI says %s", present)
+    if present is None:
+        return Path("/proc/driver/nvidia/version").exists()
+    return present
+
+
+def check_gpu_sensors(
+    platform: Platform, gpu_state: GpuStateFn = nvml_init_state,
+) -> HealthCheckResult:
+    """NVIDIA GPU present but no metrics → guide the user to the fix.
+
+    The foolproof-install check: a discrete NVIDIA card with empty GPU
+    readings is almost always (a) the pynvml reader not installed, or (b) an
+    NVML version mismatch after a driver update without reboot.  Both are
+    actionable, so this WARNs (not FAILs) with a distro-specific hint.  No
+    NVIDIA card → OK (AMD reads via hwmon, no extra package needed).
+
+    ``gpu_state`` is injected so this check can be asked about a driver state
+    the running machine isn't in.  Reading the module function directly meant
+    every test of this check — and of every report that contains it — probed
+    the real NVIDIA driver, which is how a developer box with a genuine
+    version mismatch made unrelated tests fail.
+    """
+    log.info("check_gpu_sensors: called")
+    reader_available, initialized, last_error = gpu_state()
+    if initialized:
+        return HealthCheckResult(
+            name="gpu-sensors", severity="OK",
+            message="NVIDIA GPU sensors available (NVML initialized)",
+        )
+    if not nvidia_gpu_present():
+        return HealthCheckResult(
+            name="gpu-sensors", severity="OK",
+            message="No discrete NVIDIA GPU detected (NVML check not applicable)",
+        )
+    if not reader_available:
+        # Distinguish absent from present-but-broken.  A reporter who installed
+        # nvidia-ml-py into a different interpreter, or whose install is
+        # missing libnvidia-ml.so.1, gets told to install it again otherwise --
+        # which is #207 and #216 arriving back on the same message.
+        version = toolchain.installed_elsewhere("nvidia-ml-py")
+        if version is not None:
+            return HealthCheckResult(
+                name="gpu-sensors", severity="WARN",
+                message=f"nvidia-ml-py {version} is installed but did not "
+                        f"import — GPU metrics will be empty",
+                fix_hint="It is installed, so installing it again will not "
+                         "help. Check you are running trcc under the same "
+                         "interpreter, and that libnvidia-ml.so.1 (the driver, "
+                         "not the binding) is present.",
+            )
+        return HealthCheckResult(
+            name="gpu-sensors", severity="WARN",
+            message="NVIDIA GPU detected but the pynvml reader is not installed "
+                    "— GPU metrics will be empty",
+            fix_hint=platform.software_install_hint("pynvml")
+                     + " (the trcc-linux package should pull this in)",
+        )
+    return HealthCheckResult(
+        name="gpu-sensors", severity="WARN",
+        message=f"NVIDIA GPU detected but NVML init failed: {last_error}",
+        fix_hint=NVML_RELOAD_HINT,
+    )
+
+
+def _install_advice(platform: Platform, tool: str, binary: str) -> str:
+    """The install line, derived from the system where it can be.
+
+    Asks the package manager what would supply *binary* and builds the command
+    from the answer; falls back to the static per-OS hint when it cannot say.
+    The table stays as the floor -- a manager that is absent, uncached or slow
+    must leave the user no worse off than before.
+
+    Four static entries were verified broken on 2026-08-21 and every one had
+    shipped, which is why the derived answer is preferred when available: it
+    cannot be stale, because it is read at the moment it is printed.
+    """
+    hint = platform.software_install_hint(tool)
+    try:
+        packages = platform.packages()
+        candidate = packages.provides(binary)
+        if candidate is None:
+            log.debug("_install_advice: %s not derivable — static hint", tool)
+            return hint
+        argv = packages.install_argv(candidate)
+        if not argv:
+            return hint
+    except Exception as e:                     # a diagnostic must not raise
+        log.warning("_install_advice: %s query failed (%s) — static hint",
+                    tool, e)
+        return hint
+    derived = " ".join(argv)
+    log.info("_install_advice: %s derived %r (static was %r)",
+             tool, derived, hint)
+    return derived
+
+
+def check_ffmpeg_present(platform: Platform) -> HealthCheckResult:
+    """ffmpeg is required for video themes; absence is WARN (still usable
+    for image-only themes)."""
+    log.info("check_ffmpeg_present: called")
+    found, off_path = toolchain.locate("ffmpeg")
+    if found:
+        return HealthCheckResult(
+            name="ffmpeg", severity="OK",
+            message=f"{found} on PATH (video themes will decode)",
+        )
+    if off_path is not None:
+        # Installed but unreachable.  Telling this user to install it sends
+        # them round the loop again -- they already did.
+        return HealthCheckResult(
+            name="ffmpeg", severity="WARN",
+            message=f"ffmpeg is installed at {off_path} but not on PATH",
+            fix_hint=f"Add {off_path.parent} to PATH — it is installed, so "
+                     f"installing it again will not help",
+        )
+    return HealthCheckResult(
+        name="ffmpeg", severity="WARN",
+        message=f"ffmpeg not found (tried: {toolchain.tried('ffmpeg')})",
+        fix_hint=_install_advice(platform, "ffmpeg", "/usr/bin/ffmpeg")
+                 + " — image themes still work without it",
+    )
+
+
+def check_qt_importable() -> HealthCheckResult:
+    """PySide6 is required for the GUI; absence is WARN if headless."""
+    log.info("check_qt_importable: called")
+    try:
+        import PySide6  # noqa: F401
+    except ImportError:
+        version = toolchain.installed_elsewhere("PySide6")
+        if version is not None:
+            return HealthCheckResult(
+                name="pyside6", severity="WARN",
+                message=f"PySide6 {version} is installed but did not import "
+                        f"(GUI mode unavailable)",
+                fix_hint="It is installed, so reinstalling will not help. "
+                         "Usually a missing system library — check the "
+                         "traceback in the log for which .so failed.",
+            )
+        return HealthCheckResult(
+            name="pyside6", severity="WARN",
+            message="PySide6 not installed (GUI mode unavailable)",
+            fix_hint="pip install PySide6 — only needed for `trcc gui`",
+        )
+    return HealthCheckResult(
+        name="pyside6", severity="OK",
+        message="PySide6 importable",
+    )
+
+
+def check_udev_rules_linux() -> HealthCheckResult:
+    """Linux-only: look for the installed rule in every directory udev reads."""
+    log.info("check_udev_rules_linux: called")
+    if sys.platform != "linux":
+        return HealthCheckResult(
+            name="udev-rules", severity="OK",
+            message="Not applicable on this OS",
+        )
+    # Derived from the writer, never restated.  This list used to name
+    # "99-trcc.rules" — a file nothing has ever installed — so a correctly
+    # set-up machine was told its rules were missing, in the very report we
+    # ask people to send us when their device is not detected (#258).  It
+    # then named three of the directories udev reads, so a /usr/local install
+    # was told the same thing (#273).  The bare "99-trcc.rules" names are
+    # kept only so a box carrying one from an older install still reads as
+    # configured.
+    from ..system._udev import RULES_DIRS, RULES_PATH
+
+    candidate_paths = [
+        *(directory / RULES_PATH.name for directory in RULES_DIRS),
+        Path("/etc/udev/rules.d/99-trcc.rules"),
+        Path("/etc/udev/rules.d/90-trcc.rules"),
+        Path("/lib/udev/rules.d/99-trcc.rules"),
+    ]
+    found = [p for p in candidate_paths if p.is_file()]
+    if not found:
+        return HealthCheckResult(
+            name="udev-rules", severity="WARN",
+            message="No TRCC udev rules found in any directory udev reads",
+            fix_hint=f"Run `trcc system setup` (or install via the distro "
+                     f"package) to lay down {RULES_PATH}",
+        )
+    from ..system._udev import rules_state
+    state = rules_state()
+    if state.path is not None and state.current is False:
+        # udev reads only the highest-priority copy, so a stale one in /etc
+        # hides every rule fix a package ships (#201).
+        current_below = [p for p in state.shadowed if p.read_text(
+            encoding="utf-8", errors="replace") == _current_rules()]
+        return HealthCheckResult(
+            name="udev-rules", severity="WARN",
+            message=f"udev rules in {state.path} are from an older TRCC"
+                    + (f" and hide the current {current_below[0]}"
+                       if current_below else ""),
+            fix_hint=(f"sudo rm {state.path} && sudo udevadm control "
+                      "--reload-rules && sudo udevadm trigger"
+                      if current_below else "Run `trcc system setup`"),
+        )
+    return HealthCheckResult(
+        name="udev-rules", severity="OK",
+        message=f"udev rules installed: {state.path or found[0]}",
+    )
+
+
+def _current_rules() -> str:
+    """The rule file this version generates."""
+    from ..system._udev import build_udev_rules
+    log.debug("_current_rules: called")
+    return build_udev_rules()
+
+
+def check_seven_zip_present(platform: Platform) -> HealthCheckResult:
+    """``7z`` is required for theme-pack extraction.  Absence is WARN —
+    user can still install themes via tarballs or the cloud catalog."""
+    log.info("check_seven_zip_present: called")
+    found, off_path = toolchain.locate("7z")
+    if found:
+        return HealthCheckResult(
+            name="7z", severity="OK",
+            message=f"{found} on PATH (theme-pack extraction available)",
+        )
+    if off_path is not None:
+        return HealthCheckResult(
+            name="7z", severity="WARN",
+            message=f"7z is installed at {off_path} but not on PATH",
+            fix_hint=f"Add {off_path.parent} to PATH — it is installed, so "
+                     f"installing it again will not help",
+        )
+    return HealthCheckResult(
+        name="7z", severity="WARN",
+        message=f"7z not found (tried: {toolchain.tried('7z')})",
+        fix_hint=_install_advice(platform, "7z", "/usr/bin/7z"),
+    )
+
+
+# =========================================================================
+# Aggregator
+# =========================================================================
+
+
+def run_health_checks(
+    platform: Platform, gpu_state: GpuStateFn = nvml_init_state,
+) -> HealthReport:
+    """Run every registered check; collect results into a HealthReport.
+
+    ``gpu_state`` is threaded through to :func:`check_gpu_sensors` — see there
+    for why it is injectable rather than read off the module.
+    """
+    log.info("run_health_checks: starting")
+    paths = platform.paths()
+    checks: list[HealthCheckResult] = [
+        # First: if this isn't the trcc they think it is, nothing below means
+        # anything.
+        check_install_integrity(),
+        check_python_version(platform),
+        check_log_writable(paths),
+        check_config_writable(paths),
+        check_devices_visible(platform),
+        check_sensors_enumerable(platform),
+        check_gpu_sensors(platform, gpu_state),
+        check_ffmpeg_present(platform),
+        check_qt_importable(),
+        check_udev_rules_linux(),
+        check_seven_zip_present(platform),
+    ]
+    for c in checks:
+        log.info("  %s [%s]: %s", c.name, c.severity, c.message)
+    report = HealthReport(checks=checks)
+    log.info(
+        "run_health_checks: done — worst=%s fail=%d warn=%d",
+        report.worst_severity, report.fail_count, report.warn_count,
+    )
+    return report
+
+
+def detect_package_manager() -> str | None:
+    """Return the first available package manager name, or None.
+
+    Lightweight version of legacy ``_detect_pkg_manager``.  Used by
+    install-hint generation when a check FAILs and we want to suggest a
+    distro-specific install command.
+    """
+    log.info("detect_package_manager: called")
+    candidates = ["dnf", "apt", "pacman", "zypper", "xbps-install", "apk"]
+    for binary in candidates:
+        if shutil.which(binary):
+            return binary
+    return None
+
+
+_PM_INSTALL_COMMANDS: dict[str, str] = {
+    "dnf":          "sudo dnf install {pkg}",
+    "apt":          "sudo apt install {pkg}",
+    "pacman":       "sudo pacman -S {pkg}",
+    "zypper":       "sudo zypper install {pkg}",
+    "xbps-install": "sudo xbps-install {pkg}",
+    "apk":          "sudo apk add {pkg}",
+}
+
+
+def package_install_hint(package: str) -> str:
+    """One-line install hint for a missing package, distro-specific."""
+    log.info("package_install_hint: package=%s", package)
+    pm = detect_package_manager()
+    template = _PM_INSTALL_COMMANDS.get(pm or "", "")
+    if template:
+        return template.format(pkg=package)
+    return f"Install {package} via your package manager"
+
+
+def quick_subprocess(cmd: list[str], timeout_s: float = 2.0) -> str:
+    """Best-effort run a probe command and return its stdout.
+
+    Returns empty string on any failure — health checks treat that as
+    "not available" rather than propagating.  Used by checks that want
+    to ask the system "tell me your version" without crashing the doctor.
+    """
+    log.debug("quick_subprocess: cmd=%s timeout=%s", cmd, timeout_s)
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return ""
+    return proc.stdout.strip()

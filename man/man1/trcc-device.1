@@ -1,0 +1,133 @@
+.TH "TRCC\-DEVICE" "1" "" "trcc\-linux 9.10.9" "TRCC Manual"
+.SH NAME
+trcc\-device \- Discover and connect to TRCC devices
+.SH SYNOPSIS
+\fBtrcc device\fR \fISUBCOMMAND\fR [\fIARGS\fR]...
+.SH DESCRIPTION
+Discover and connect to TRCC devices.
+.SH SUBCOMMANDS
+.SS canvas
+.PP
+\fBtrcc device canvas\fR \fIKEY\fR
+.PP
+The panel's NATIVE pixels  \-  the size to AUTHOR an asset for. Not the size to DRAW a preview at: that folds the user orientation and the active theme's composition, while a theme, a mask or a Theme.zt is authored at the panel's own pixels and the firmware mounts it. source says which answer this is  \-  the handshake the panel gave, the scan, or the product registry  \-  because when a panel comes out the wrong shape, WHICH source won is the diagnostic.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS connect
+.PP
+\fBtrcc device connect\fR \fIKEY\fR
+.PP
+Open USB transport and perform the wire\-protocol handshake.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS disconnect
+.PP
+\fBtrcc device disconnect\fR \fIKEY\fR
+.PP
+Close the transport and drop the device.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+(no description)
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS issues
+.PP
+\fBtrcc device issues\fR
+.PP
+Show devices that failed to connect, and why. A connect can fail before anything is watching the bus, so the failure is pulled with a query rather than only published  \-  the same one the GUIs and GET /devices/issues use.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list
+.PP
+\fBtrcc device list\fR
+.PP
+List devices currently attached to the host.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS reset
+.PP
+\fBtrcc device reset\fR \fIKEY\fR
+.PP
+Power\-cycle a device: disconnect, reconnect, restore its display. Use this when the LCD seems stuck. The connection is torn down and rebuilt and the persisted theme is put back, so the panel ends up showing what it showed before  \-  no second connect needed. Not the same as blanking the panel to a known colour; that is trcc display reset, which leaves the device connected.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+(no description)
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS state
+.PP
+\fBtrcc device state\fR \fIKEY\fR
+.PP
+Show what a device IS  \-  identity, connection, handshake geometry. catalog_* is what the product registry claims for the USB id; product and resolution are the cooler the handshake identified. When they differ, the handshake wins and the difference is usually the thing worth reporting.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SH SEE ALSO
+\fBtrcc\fR(1)
+.SH REPORTING BUGS
+Report bugs at \fBhttps://github.com/Lexonight1/thermalright-trcc-linux/issues\fR \(em include the output of \fBtrcc report\fR.
+.SH AUTHOR
+TRCC Linux contributors. Unofficial community project, not affiliated with Thermalright.

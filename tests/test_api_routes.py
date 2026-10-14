@@ -1,0 +1,2147 @@
+"""API route smoke tests — every router exercised through FastAPI's TestClient.
+
+Phase D boilerplate: one fixture that builds the full FastAPI app over
+a FakePlatform + minimal renderer, plus one smoke test per router so
+every route handler at least *imports cleanly + dispatches through the
+Command bus + serializes a response*.
+
+Future tests for specific API behavior land in this file (or sibling
+``test_api_<router>.py`` files) using the same ``api_client`` fixture.
+The fixture is the foundation; the smoke checks are the example.
+
+Routes that need a connected device hit the "not attached" code path
+and surface a structured error — that's a successful smoke (proves
+the route reaches Command dispatch + Result serialization).  Real
+end-to-end happy paths land alongside the parity tests where the
+device fakes get fuller setup.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, cast
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from trcc.__version__ import __version__
+from trcc.app import App
+from trcc.core.commands import GetPaths, LoadTheme
+from trcc.core.models import DEFAULT_AUTOSTART_TARGET
+from trcc.core.ports import Renderer
+from trcc.core.protocol import FBL_PROFILES
+
+from .conftest import FakePlatform, loopback_client
+
+# Unique resolutions from the canonical FBL profile registry.
+API_TEST_RESOLUTIONS: list[tuple[int, int]] = sorted({
+    (p.width, p.height) for p in FBL_PROFILES.values()
+})
+
+# =========================================================================
+# Minimal renderer — FastAPI build_app needs *some* renderer to construct
+# DisplayService; smoke tests don't render anything visible.
+# =========================================================================
+
+
+class _SmokeRenderer(Renderer):
+    """No-op renderer just so DisplayService builds cleanly."""
+
+    class _Surface:
+        def __init__(self, w: int = 100, h: int = 100) -> None:
+            self.w, self.h = w, h
+
+    def create_surface(self, width: int, height: int,
+                       color: tuple[int, ...] | None = None) -> Any:
+        return _SmokeRenderer._Surface(width, height)
+
+    def open_image(self, path: Path) -> Any:
+        return _SmokeRenderer._Surface()
+
+    def surface_size(self, surface: Any) -> tuple[int, int]:
+        return (surface.w, surface.h)
+
+    def surface_nbytes(self, surface: Any) -> int:
+        return surface.w * surface.h * 4
+
+    def composite(self, base: Any, overlay: Any,
+                  position: tuple[int, int],
+                  mask: Any | None = None) -> Any:
+        return base
+
+    def resize(self, surface: Any, width: int, height: int) -> Any:
+        return _SmokeRenderer._Surface(width, height)
+
+    def rotate(self, surface: Any, degrees: int) -> Any:
+        return surface
+
+    def apply_brightness(self, surface: Any, percent: int) -> Any:
+        return surface
+
+    def draw_text(self, surface: Any, x: int, y: int, text: str,
+                  color: str, size: int, bold: bool = False,
+                  italic: bool = False, family: str = "") -> None:
+        pass
+
+    def encode_rgb565(self, surface: Any, byte_order: str = ">") -> bytes:
+        return b"\x00\x00" * (surface.w * surface.h)
+
+    def encode_jpeg(self, surface: Any, quality: int = 95,
+                    max_size: int = 0) -> bytes:
+        return b""
+
+    def from_raw_rgb24(self, frame: Any) -> Any:
+        return _SmokeRenderer._Surface()
+
+    def decode_image(self, data: bytes) -> Any:
+        return _SmokeRenderer._Surface()
+
+
+# =========================================================================
+# Fixture — the API TestClient
+# =========================================================================
+
+
+@pytest.fixture
+def api_client(fake_platform: FakePlatform) -> Iterator[TestClient]:
+    """Builds the full FastAPI app + yields a TestClient.
+
+    The underlying App is wired with the standard FakePlatform fixture
+    so any route handler can be exercised; nothing actually talks to
+    USB.  Future tests can pre-populate ``app.state.trcc.devices``
+    before making requests when they need a connected-device scenario.
+    """
+    from trcc.ui.api.main import build_app
+
+    trcc = App(platform=fake_platform, renderer=_SmokeRenderer())
+    api = build_app(trcc=trcc)
+    with loopback_client(api) as client:
+        yield client
+
+
+# =========================================================================
+# Root endpoint — meta smoke
+# =========================================================================
+
+
+def test_root_returns_endpoint_directory(api_client: TestClient) -> None:
+    """``GET /`` lists every documented endpoint — proves the app
+    constructs + every router included successfully."""
+    resp = api_client.get("/")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "TRCC API"
+    assert body["version"] == __version__
+    # The endpoint catalog mentions at least the canonical routes
+    endpoints = " ".join(body["endpoints"])
+    for canonical in (
+        "GET  /devices",
+        "POST /devices/{key}/connect",
+        "POST /devices/{key}/display/brightness",
+        "POST /devices/{key}/led/colors",
+        "GET  /system/info",
+        "POST /config/temp-unit",
+    ):
+        assert canonical in endpoints, f"endpoint catalog missing {canonical!r}"
+
+
+def test_openapi_schema_loads(api_client: TestClient) -> None:
+    """FastAPI's auto-generated OpenAPI must build — any router whose
+    schemas don't resolve breaks this with a 500."""
+    resp = api_client.get("/openapi.json")
+    assert resp.status_code == 200
+    schema = resp.json()
+    assert schema["info"]["title"] == "TRCC API"
+    # All six routers contributed paths
+    assert "/devices" in schema["paths"]
+    assert any(p.startswith("/devices/{key}/display/") for p in schema["paths"])
+    assert any(p.startswith("/devices/{key}/led/") for p in schema["paths"])
+    assert "/system/info" in schema["paths"]
+    assert "/config/temp-unit" in schema["paths"]
+
+
+# =========================================================================
+# autostart — the three routes now go through the Command bus
+#
+# No API test touched autostart at all before 2026-08-31, which is part of why
+# ``GET /system/autostart`` could read ``trcc.platform.autostart()`` directly
+# for as long as it did — reaching past the bus, dropping the ``path`` the
+# Command returns, and raising under TRCC_DAEMON=1.
+# =========================================================================
+
+
+def test_autostart_status_reports_disabled_by_default(api_client: TestClient) -> None:
+    """GET reports state via ``GetAutostartStatus`` — including ``path``."""
+    r = api_client.get("/system/autostart")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["enabled"] is False
+    assert "path" in body, "the Command carries path; the hand-rolled route did not"
+
+
+def test_autostart_enable_then_status_agrees(api_client: TestClient) -> None:
+    """POST and GET are the same answer — one Command, not two code paths."""
+    assert api_client.post("/system/autostart",
+                           json={"enabled": True}).json()["enabled"] is True
+    assert api_client.get("/system/autostart").json()["enabled"] is True
+
+
+def test_autostart_refresh_does_not_enable(api_client: TestClient) -> None:
+    """The route inherits the Command's contract: refresh never installs.
+
+    Mirrors ``test_autostart_refresh_never_enables`` at the Command level —
+    asserted here too because a route is free to dispatch the wrong Command.
+    """
+    r = api_client.post("/system/autostart/refresh")
+    assert r.status_code == 200
+    assert r.json()["enabled"] is False
+    assert api_client.get("/system/autostart").json()["enabled"] is False
+
+
+def test_autostart_enable_installs_the_requested_target(
+    api_client: TestClient,
+) -> None:
+    """POST carries ``target``, and GET reads back the SAME answer.
+
+    The response is the ``AutostartResult`` itself, so ``target`` reaches the
+    client without the route restating it — the point of returning the Result.
+    """
+    r = api_client.post("/system/autostart",
+                        json={"enabled": True, "target": "daemon"})
+    assert r.status_code == 200
+    assert r.json()["target"] == "daemon"
+    assert api_client.get("/system/autostart").json()["target"] == "daemon"
+
+
+def test_autostart_enable_without_target_keeps_the_default(
+    api_client: TestClient,
+) -> None:
+    """A body written before ``target`` existed stays valid and means gui.
+
+    ``target`` is optional for exactly this reason: an API client that predates
+    it must not start failing, and what it used to get is what it still gets.
+    """
+    r = api_client.post("/system/autostart", json={"enabled": True})
+    assert r.status_code == 200
+    assert r.json()["target"] == DEFAULT_AUTOSTART_TARGET
+
+
+def test_autostart_enable_rejects_an_unknown_target(
+    api_client: TestClient,
+) -> None:
+    """An unknown target is a refusal that NAMES the valid set — not a 422.
+
+    The schema deliberately does not constrain the string: pydantic would
+    answer with its own validation error, and the one place that knows the
+    valid targets is the Command.  So the request succeeds at the transport
+    level and the Result carries the refusal.
+    """
+    r = api_client.post("/system/autostart",
+                        json={"enabled": True, "target": "nonesuch"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "nonesuch" in body["message"]
+    assert "daemon" in body["message"], "the valid set was not named"
+    assert api_client.get("/system/autostart").json()["enabled"] is False, \
+        "a refused target must not install anything"
+
+
+# =========================================================================
+# auth — token + pairing
+# =========================================================================
+
+
+def test_health_endpoint_is_unauthed(api_client: TestClient) -> None:
+    """``/health`` is reachable without any token — it's the liveness
+    probe LB / monitoring hits."""
+    from trcc.ui.api.main import configure_auth
+    configure_auth("secret-token")
+    try:
+        resp = api_client.get("/health")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert "version" in body
+    finally:
+        configure_auth(None)
+
+
+def test_request_without_token_rejected_when_auth_enforced(
+    api_client: TestClient,
+) -> None:
+    """When ``_api_token`` is set, every non-exempt path requires a
+    matching ``X-API-Token`` header.  401 otherwise."""
+    from trcc.ui.api.main import configure_auth
+    configure_auth("secret-token")
+    try:
+        resp = api_client.get("/devices")
+        assert resp.status_code == 401
+        assert resp.json() == {"detail": "Invalid token"}
+    finally:
+        configure_auth(None)
+
+
+def test_request_with_correct_token_accepted(api_client: TestClient) -> None:
+    from trcc.ui.api.main import configure_auth
+    configure_auth("secret-token")
+    try:
+        resp = api_client.get(
+            "/devices", headers={"X-API-Token": "secret-token"},
+        )
+        assert resp.status_code == 200
+    finally:
+        configure_auth(None)
+
+
+def test_request_with_wrong_token_rejected(api_client: TestClient) -> None:
+    from trcc.ui.api.main import configure_auth
+    configure_auth("secret-token")
+    try:
+        resp = api_client.get(
+            "/devices", headers={"X-API-Token": "wrong-token"},
+        )
+        assert resp.status_code == 401
+    finally:
+        configure_auth(None)
+
+
+def test_pair_disabled_without_pairing_code(api_client: TestClient) -> None:
+    """``/pair`` returns 503 when ``set_pairing_code`` wasn't called."""
+    from trcc.ui.api.main import configure_auth, set_pairing_code
+    configure_auth("secret")
+    set_pairing_code(None)
+    try:
+        resp = api_client.post("/pair", params={"code": "ABCDEF"})
+        assert resp.status_code == 503
+    finally:
+        configure_auth(None)
+
+
+def test_pair_exchanges_code_for_token(api_client: TestClient) -> None:
+    """Correct pairing code → 200 + the persistent API token."""
+    from trcc.ui.api.main import configure_auth, set_pairing_code
+    configure_auth("the-real-token")
+    set_pairing_code("ABCDEF")
+    try:
+        resp = api_client.post("/pair", params={"code": "ABCDEF"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["token"] == "the-real-token"
+    finally:
+        configure_auth(None)
+        set_pairing_code(None)
+
+
+def test_pair_rejects_wrong_code(api_client: TestClient) -> None:
+    from trcc.ui.api.main import configure_auth, set_pairing_code
+    configure_auth("the-real-token")
+    set_pairing_code("ABCDEF")
+    try:
+        resp = api_client.post("/pair", params={"code": "WRONG1"})
+        assert resp.status_code == 403
+    finally:
+        configure_auth(None)
+        set_pairing_code(None)
+
+
+# =========================================================================
+# devices router
+# =========================================================================
+
+
+def test_devices_list_returns_discover_response(api_client: TestClient) -> None:
+    """``GET /devices`` always succeeds — empty list when FakePlatform
+    reports no attached devices."""
+    resp = api_client.get("/devices")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["products"] == []
+
+
+def test_devices_connect_unknown_returns_4xx(api_client: TestClient) -> None:
+    """Connecting an unknown vid:pid surfaces a structured error,
+    not a 500.  Proves the dispatch path → result envelope works."""
+    resp = api_client.post("/devices/dead:beef/connect")
+    # http_error_if_failed maps ok=False → 400 by default
+    assert resp.status_code == 400
+
+
+def test_devices_disconnect_unknown_returns_4xx(api_client: TestClient) -> None:
+    resp = api_client.post("/devices/dead:beef/disconnect")
+    assert resp.status_code == 404
+
+
+# =========================================================================
+# display router
+# =========================================================================
+
+
+def test_display_set_orientation_validates_degrees(
+    api_client: TestClient,
+) -> None:
+    """Pydantic enforces 0 <= degrees <= 270; an out-of-range value
+    surfaces as 422, not 500."""
+    resp = api_client.post(
+        "/devices/0402:3922/display/orientation",
+        json={"degrees": 1000},
+    )
+    assert resp.status_code == 422
+
+
+def test_display_set_brightness_on_valid_key(api_client: TestClient) -> None:
+    """SetBrightness mutates Settings unconditionally — succeeds even
+    without a connected device."""
+    resp = api_client.post(
+        "/devices/0402:3922/display/brightness",
+        json={"percent": 50},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["percent"] == 50
+
+
+def test_display_media_player_clear(api_client: TestClient) -> None:
+    """SetMediaPlayer with an empty URI clears the source — succeeds without a
+    connected device.  Proves the media-player toggle is unified into the API."""
+    resp = api_client.post(
+        "/devices/0402:3922/display/media-player",
+        json={"uri": ""},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["uri"] == ""
+    assert body["playing"] is False
+
+
+def test_display_send_color_unknown_device_returns_4xx(
+    api_client: TestClient,
+) -> None:
+    """``display/color`` needs a connected device; an unknown key
+    surfaces a structured error envelope."""
+    resp = api_client.post(
+        "/devices/dead:beef/display/color",
+        json={"r": 255, "g": 0, "b": 0},
+    )
+    assert resp.status_code == 400
+
+
+def test_display_reset_unknown_device_returns_4xx(
+    api_client: TestClient,
+) -> None:
+    """``display/reset`` (stop video + red frame) needs a connected device;
+    an unknown key surfaces a structured error envelope (the StopVideo
+    pre-step is best-effort and doesn't mask the send failure)."""
+    resp = api_client.post("/devices/dead:beef/display/reset")
+    assert resp.status_code == 400
+
+
+def test_display_load_theme_reaches_lookup_not_attribute_error(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """Regression: load_theme called ``platform.user_content_dir()`` — an
+    AttributeError (that method is on Paths, not Platform), so the route
+    500'd on every call.  It must reach the theme lookup via
+    ``platform.paths().user_content_dir()``."""
+    ucd = fake_platform.paths().user_content_dir()
+    ucd.mkdir(parents=True, exist_ok=True)   # resolve(strict=True) needs it
+    resp = api_client.post(
+        "/devices/dead:beef/display/theme", json={"path": "no-such-theme"},
+    )
+    # Pre-fix: 500 (AttributeError).  Post-fix: reaches the "unknown
+    # theme" guard → 400, never a 500.
+    assert resp.status_code == 400
+
+
+def test_display_load_theme_accepts_a_nested_catalog_path(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """A path straight from the theme catalog — nested ``theme{res}/<name>``
+    under the data / user root, NOT flat under user_content_dir — must load,
+    not be wrongly rejected "Unknown theme" (#239).  The old whitelist only
+    enumerated top-level user_content_dir, so every real /theme/list path 400'd.
+    """
+    import json as _json
+
+    tdir = fake_platform.paths().theme_dir(320, 320) / "Nested"
+    tdir.mkdir(parents=True)
+    (tdir / "trcc.json").write_text(
+        _json.dumps({"name": "Nested", "width": 320, "height": 320,
+                     "elements": []}),
+        encoding="utf-8",
+    )
+    (tdir / "00.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = api_client.post(
+        "/devices/0402:3922/display/theme", json={"path": str(tdir)},
+    )
+
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["ok"] is True
+
+
+def test_boot_animation_rejects_path_traversal(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """frames_dir is a basename under user_content_dir — a traversal payload
+    can't escape the root (CodeQL py/path-injection barrier)."""
+    fake_platform.paths().user_content_dir().mkdir(parents=True, exist_ok=True)
+    resp = api_client.post(
+        "/devices/0402:3922/display/boot-animation",
+        json={"frames_dir": "../../../../etc", "delay_ds": 5},
+    )
+    # basename of the payload ("etc") is not a subdir under user_content → 400
+    assert resp.status_code == 400
+
+
+def test_boot_animation_answers_400_on_a_fresh_install(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """No ~/.trcc-user yet: ``resolve(strict=True)`` raised straight through
+    as a 500 — the test above creates the directory first, which hid it."""
+    assert not fake_platform.paths().user_content_dir().exists()
+    resp = api_client.post(
+        "/devices/0402:3922/display/boot-animation",
+        json={"frames_dir": "myanim", "delay_ds": 5},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "frames_dir not found under the user content directory: 'myanim'")
+
+
+def test_boot_animation_valid_subdir_passes_path_barrier(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """A real subdir of frames clears the path barrier (then only fails
+    because no device is connected — proving it isn't a path rejection)."""
+    frames = fake_platform.paths().user_content_dir() / "myanim"
+    frames.mkdir(parents=True, exist_ok=True)
+    (frames / "01.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    resp = api_client.post(
+        "/devices/dead:beef/display/boot-animation",
+        json={"frames_dir": "myanim", "delay_ds": 5},
+    )
+    # Path barrier passed; the device dispatch fails (not connected) → 4xx.
+    assert resp.status_code == 400
+
+
+# =========================================================================
+# led router
+# =========================================================================
+
+
+def test_led_set_color_persists_via_settings(api_client: TestClient) -> None:
+    """SetLedColor writes to per-device LedDeviceSettings without
+    needing a connected device — succeeds with ok=True."""
+    resp = api_client.post(
+        "/devices/0416:8001/led/color",
+        json={"color": [10, 20, 30]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_led_set_mode_round_trip(api_client: TestClient) -> None:
+    """Mode enum validation: every legal value the regex accepts is
+    routed to a valid LEDMode."""
+    resp = api_client.post(
+        "/devices/0416:8001/led/mode",
+        json={"mode": "rainbow"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_led_set_mode_rejects_unknown(api_client: TestClient) -> None:
+    """Unknown mode strings fail Pydantic validation before reaching
+    the Command bus."""
+    resp = api_client.post(
+        "/devices/0416:8001/led/mode",
+        json={"mode": "supernova"},
+    )
+    assert resp.status_code == 422
+
+
+def test_led_set_brightness_validates_range(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/brightness",
+        json={"percent": 200},
+    )
+    assert resp.status_code == 422
+
+
+def test_led_toggle_global(api_client: TestClient) -> None:
+    """ToggleLed flips global_on through the API."""
+    resp = api_client.post(
+        "/devices/0416:8001/led/toggle",
+        json={"on": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert "global" in body["message"].lower()
+
+
+def test_led_toggle_zone_out_of_range_rejected(api_client: TestClient) -> None:
+    """Negative zone numbers fail Pydantic validation."""
+    resp = api_client.post(
+        "/devices/0416:8001/led/toggle",
+        json={"on": True, "zone": -1},
+    )
+    assert resp.status_code == 422
+
+
+def test_led_zone_sync_enable(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/zone-sync",
+        json={"enabled": True},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+
+def test_led_select_zone(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/select-zone",
+        json={"zone": 3},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert "3" in body["message"]
+
+
+def test_led_snapshot(api_client: TestClient) -> None:
+    """LedSnapshot returns the persisted LED state."""
+    resp = api_client.get("/devices/0416:8001/led/snapshot")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["key"] == "0416:8001"
+    assert "mode" in body
+
+
+def test_led_styles_listing(api_client: TestClient) -> None:
+    """``GET /led/styles`` returns the PM registry."""
+    resp = api_client.get("/led/styles")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert len(body["styles"]) > 0
+    assert any(s["style"] == "ax120" for s in body["styles"])
+    # Capability columns present on every entry; PA120 reports 4 zones.
+    assert all(
+        "segment_count" in s and "zone_count" in s for s in body["styles"]
+    )
+    assert any(s["zone_count"] == 4 for s in body["styles"])
+
+
+def test_led_modes_listing(api_client: TestClient) -> None:
+    resp = api_client.get("/led/modes")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "STATIC" in body["modes"]
+    assert "RAINBOW" in body["modes"]
+
+
+def test_display_snapshot(api_client: TestClient) -> None:
+    resp = api_client.get("/devices/0402:3922/display/snapshot")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["key"] == "0402:3922"
+
+
+@pytest.mark.parametrize("body,expected", [
+    ({"enabled": True, "threshold": 60}, (True, 60)),
+    ({"threshold": 40}, (False, 40)),
+])
+def test_display_game_sets_either_half(
+    api_client: TestClient, body: dict, expected: tuple[bool, int],
+) -> None:
+    resp = api_client.post("/devices/0402:3922/display/game", json=body)
+
+    assert resp.status_code == 200
+    assert (resp.json()["enabled"], resp.json()["threshold"]) == expected
+    snap = api_client.get("/devices/0402:3922/display/snapshot").json()
+    assert (snap["game_enabled"], snap["game_threshold"]) == expected
+
+
+@pytest.mark.parametrize("body,status", [
+    ({"threshold": 100}, 422),       # the schema holds the two digits
+    ({}, 400),                       # the Command refuses an empty change
+])
+def test_display_game_refuses_what_it_cannot_send(
+    api_client: TestClient, body: dict, status: int,
+) -> None:
+    resp = api_client.post("/devices/0402:3922/display/game", json=body)
+
+    assert resp.status_code == status
+    snap = api_client.get("/devices/0402:3922/display/snapshot").json()
+    assert (snap["game_enabled"], snap["game_threshold"]) == (False, 75)
+
+
+def test_display_restore_theme_no_persisted(api_client: TestClient) -> None:
+    """RestoreDeviceState with nothing persisted AND no themes installed
+    returns a 400 from ``http_error_if_failed`` (Result.ok=False —
+    "No theme available")."""
+    resp = api_client.post("/devices/0402:3922/display/restore-theme")
+    assert resp.status_code == 400
+
+
+def test_display_restore_theme_autoloads_first_theme(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """With a theme installed but none persisted, the restore-theme route's
+    RestoreDeviceState auto-loads the first available theme → 200 ok."""
+    import json as _json
+
+    theme_root = fake_platform.paths().theme_dir(320, 320)
+    tdir = theme_root / "Auto"
+    tdir.mkdir(parents=True)
+    (tdir / "trcc.json").write_text(
+        _json.dumps({"name": "Auto", "width": 320, "height": 320, "elements": []}),
+        encoding="utf-8",
+    )
+    (tdir / "00.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = api_client.post("/devices/0402:3922/display/restore-theme")
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+
+def test_system_list_gpus(api_client: TestClient) -> None:
+    resp = api_client.get("/system/gpus")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_system_list_fans(api_client: TestClient) -> None:
+    resp = api_client.get("/system/fans")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert isinstance(body["fans"], list)
+
+
+def test_system_snapshot(api_client: TestClient) -> None:
+    resp = api_client.get("/system/snapshot")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert "language" in body
+    assert "refresh_interval_s" in body
+
+
+# --- Tier 2 -----------------------------------------------------------------
+
+
+def test_led_clock_format(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/clock-format",
+        json={"is_24h": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["is_24h"] is False
+
+
+def test_led_week_start(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/week-start",
+        json={"sunday_first": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["sunday_first"] is True
+
+
+def test_led_memory_ratio(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0416:8001/led/memory-ratio",
+        json={"ratio": 4},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["ratio"] == 4
+
+
+def test_led_disk_index_route_is_retired(api_client: TestClient) -> None:
+    """The inert route is gone and the working one still answers."""
+    assert api_client.post(
+        "/devices/0416:8001/led/disk-index", json={"index": 1},
+    ).status_code == 404
+    assert api_client.post(
+        "/system/disk-sensors/active", json={"disk_key": ""},
+    ).status_code == 200
+
+
+def test_system_hdd_enabled(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/system/hdd-enabled", json={"enabled": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["enabled"] is True
+
+
+def test_display_background_mode_color(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/background-mode",
+        json={"mode": "color"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["mode"] == "color"
+
+
+def test_display_background_mode_rejects_bad(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/background-mode",
+        json={"mode": "bogus"},
+    )
+    assert resp.status_code == 422
+
+
+def test_display_overlay_background(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/overlay-background",
+        json={"color": [17, 34, 51]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["color"] == [17, 34, 51]
+
+
+# --- Tier 3 -----------------------------------------------------------------
+
+
+def test_display_pause_video_no_playback(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/pause-video",
+        json={"paused": True},
+    )
+    assert resp.status_code == 400
+
+
+def test_display_seek_negative_rejected(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/seek-video",
+        json={"frame": -1},
+    )
+    assert resp.status_code == 422
+
+
+def test_display_loop_no_playback(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/loop-video",
+        json={"loop": False},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize("resolution", API_TEST_RESOLUTIONS)
+def test_display_masks_listing_empty(
+    api_client: TestClient, resolution: tuple[int, int],
+) -> None:
+    """``GET /display/masks?width=W&height=H`` returns ok=True with an
+    empty list when the user has no masks at that resolution yet.
+    Parametrized over every resolution in FBL_PROFILES to prove the
+    resolution-aware path port resolves for every supported canvas."""
+    w, h = resolution
+    resp = api_client.get(
+        "/display/masks", params={"width": w, "height": h},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["masks"] == []
+
+
+def test_theme_delete_unknown(api_client: TestClient) -> None:
+    """Deleting a non-existent theme returns a structured error.
+
+    It sent ``DELETE /theme/<name>``, a route that does not exist, so the
+    router's own 404 passed it and the delete was never reached.
+    """
+    root = api_client.app.state.trcc.dispatch(GetPaths()).user_content_dir
+    Path(root).mkdir(parents=True, exist_ok=True)   # the theme is missing, not the root
+    resp = api_client.request(
+        "DELETE", "/theme",
+        json={"path": str(Path(root) / "definitely-not-real-9zq")},
+    )
+    assert resp.status_code == 400
+    assert "not found" in resp.json()["detail"]
+
+
+def test_system_fonts_listing(api_client: TestClient) -> None:
+    resp = api_client.get("/system/fonts")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_system_disks_listing(api_client: TestClient) -> None:
+    resp = api_client.get("/system/disks")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+# --- Tier 4 — overlay element CRUD ----------------------------------------
+
+
+def test_overlay_add_returns_id(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/overlay-elements",
+        json={"type": "text", "x": 5, "y": 10, "text": "hi"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["element"]["id"].startswith("el_")
+
+
+def test_overlay_add_rejects_bad_type(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/devices/0402:3922/display/overlay-elements",
+        json={"type": "bogus"},
+    )
+    assert resp.status_code == 422
+
+
+def test_overlay_update_unknown(api_client: TestClient) -> None:
+    resp = api_client.patch(
+        "/devices/0402:3922/display/overlay-elements/el_nope",
+        json={"x": 5},
+    )
+    assert resp.status_code == 400
+
+
+def test_overlay_delete_unknown(api_client: TestClient) -> None:
+    resp = api_client.delete(
+        "/devices/0402:3922/display/overlay-elements/el_nope",
+    )
+    assert resp.status_code == 400
+
+
+def test_overlay_round_trip(api_client: TestClient) -> None:
+    """Add → update → delete one element via the API."""
+    add = api_client.post(
+        "/devices/0402:3922/display/overlay-elements",
+        json={"type": "text", "text": "hi", "element_id": "el_api"},
+    )
+    assert add.status_code == 200
+    eid = add.json()["element"]["id"]
+    upd = api_client.patch(
+        f"/devices/0402:3922/display/overlay-elements/{eid}",
+        json={"text": "bye"},
+    )
+    assert upd.status_code == 200
+    rm = api_client.delete(
+        f"/devices/0402:3922/display/overlay-elements/{eid}",
+    )
+    assert rm.status_code == 200
+
+
+def test_overlay_set_config_bulk(api_client: TestClient) -> None:
+    """PUT replaces the element list wholesale."""
+    resp = api_client.put(
+        "/devices/0402:3922/display/overlay-elements",
+        json={"elements": [
+            {"id": "a", "type": "text", "text": "one"},
+            {"id": "b", "type": "metric", "metric": "cpu_temp"},
+        ]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert len(body["elements"]) == 2
+
+
+# --- Tier 5 — cloud themes (offline list) ----------------------------------
+
+
+def test_theme_cloud_list_returns_catalog(api_client: TestClient) -> None:
+    resp = api_client.get("/theme/cloud")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert any(c["prefix"] == "a" for c in body["categories"])
+    assert any(t["id"] == "a001" for t in body["themes"])
+
+
+def test_theme_cloud_list_unknown_category(api_client: TestClient) -> None:
+    resp = api_client.get("/theme/cloud", params={"category": "zzz"})
+    # Result.ok = False → http_error_if_failed → 400
+    assert resp.status_code == 400
+
+
+def test_theme_web_gallery_lists_downloaded_previews(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """``GET /theme/web`` lists the ``a001.png`` previews on disk with the
+    preview/download URLs + a has_video flag from the sibling .mp4."""
+    web_dir = fake_platform.paths().cloud_theme_dir(320, 320)
+    web_dir.mkdir(parents=True, exist_ok=True)
+    (web_dir / "a001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (web_dir / "a001.mp4").write_bytes(b"x")          # → has_video
+    (web_dir / "b002.png").write_bytes(b"\x89PNG\r\n\x1a\n")   # no video
+
+    resp = api_client.get("/theme/web", params={"resolution": "320x320"})
+    assert resp.status_code == 200
+    items = {i["id"]: i for i in resp.json()}
+    assert set(items) == {"a001", "b002"}
+    assert items["a001"]["category"] == "a"
+    assert items["a001"]["preview_url"] == "/static/web/320320/a001.png"
+    assert items["a001"]["has_video"] is True
+    assert items["b002"]["has_video"] is False
+
+
+def test_theme_web_gallery_empty_without_data(api_client: TestClient) -> None:
+    resp = api_client.get("/theme/web", params={"resolution": "640x480"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_theme_web_gallery_bad_resolution_400(api_client: TestClient) -> None:
+    resp = api_client.get("/theme/web", params={"resolution": "nonsense"})
+    assert resp.status_code == 400
+
+
+def test_static_web_serves_a_preview_file(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """The /static/web mount serves files the gallery points at."""
+    web_dir = fake_platform.paths().cloud_theme_dir(320, 320)
+    web_dir.mkdir(parents=True, exist_ok=True)
+    (web_dir / "a001.png").write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+
+    resp = api_client.get("/static/web/320320/a001.png")
+    assert resp.status_code == 200
+    assert resp.content.startswith(b"\x89PNG")
+
+
+def test_theme_init_bad_resolution_400(api_client: TestClient) -> None:
+    resp = api_client.post("/theme/init", params={"resolution": "nope"})
+    assert resp.status_code == 400
+
+
+def test_theme_init_dispatches_prefetch(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``POST /theme/init`` runs the prefetch and reports the per-archive
+    ok flags (ensure_all stubbed at the class — no network in the test)."""
+    from trcc.services.data_install import DataInstallService, EnsureDataResult
+    monkeypatch.setattr(
+        DataInstallService, "ensure_all",
+        lambda self, resolution: EnsureDataResult(
+            resolution=resolution, themes_ok=True, web_ok=True, masks_ok=True,
+        ),
+    )
+    resp = api_client.post("/theme/init", params={"resolution": "320x320"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["width"] == 320
+    assert body["height"] == 320
+    assert body["web_ok"] is True
+
+
+# --- i18n --------------------------------------------------------------------
+
+
+def test_list_languages_returns_full_set(api_client: TestClient) -> None:
+    """``GET /system/languages`` lists every i18n code."""
+    resp = api_client.get("/system/languages")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    codes = {lang["code"] for lang in body["languages"]}
+    assert {"en", "zh", "fr", "de", "ja"} <= codes
+
+
+def test_set_language_rejects_unknown_code(api_client: TestClient) -> None:
+    """``POST /config/language`` with an unknown ISO code returns 400."""
+    resp = api_client.post(
+        "/config/language", json={"language": "zz_unknown"},
+    )
+    assert resp.status_code == 400
+
+
+# --- Diagnostics ------------------------------------------------------------
+
+
+def test_system_health(api_client: TestClient) -> None:
+    resp = api_client.get("/system/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "checks" in body
+    assert any(c["name"] == "python-version" for c in body["checks"])
+
+
+def test_system_doctor(api_client: TestClient) -> None:
+    resp = api_client.get("/system/doctor")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "checks" in body
+    assert "rendered" in body
+
+
+def test_system_debug_report_in_memory(api_client: TestClient) -> None:
+    resp = api_client.post("/system/debug-report", json={"log_tail_lines": 50})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert "## Platform" in body["rendered_text"]
+    assert body["output_path"] == ""
+
+
+def test_system_debug_report_writes_nothing_where_a_client_says(
+    api_client: TestClient, tmp_path,
+) -> None:
+    """It wrote to any server path in ``output_path`` — over an existing file
+    included, measured — so the field is gone and the text comes back instead.
+    A client that still sends it gets the report and no file."""
+    victim = tmp_path / "precious.txt"
+    victim.write_text("USER DATA\n", encoding="utf-8")
+    resp = api_client.post(
+        "/system/debug-report",
+        json={"output_path": str(victim), "log_tail_lines": 10},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["rendered_text"]
+    assert victim.read_text(encoding="utf-8") == "USER DATA\n"
+
+
+# =========================================================================
+# system router
+# =========================================================================
+
+
+def test_system_info_returns_platform_metadata(api_client: TestClient) -> None:
+    resp = api_client.get("/system/info")
+    assert resp.status_code == 200
+    body = resp.json()
+    # GetPlatformInfo Command surfaces distro + install method
+    assert "distro" in body or "ok" in body
+
+
+def test_system_sensors_returns_readings_list(api_client: TestClient) -> None:
+    resp = api_client.get("/system/sensors")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert isinstance(body["readings"], list)
+
+
+def test_system_sensor_catalog_lists_what_exists(api_client: TestClient) -> None:
+    """/system/sensors answers "what do they read"; this answers "what exists".
+
+    ListSensors was reachable from the CLI (`system list-sensors`) and from
+    nowhere else -- so a script could not ask the first question a script asks.
+    The API is the unified UI: a capability it cannot reach is not universal.
+    """
+    resp = api_client.get("/system/sensors/catalog")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert isinstance(body["sensors"], list)
+    for entry in body["sensors"]:
+        # descriptors, NOT values -- that is what makes it distinct from
+        # /system/sensors and cheap enough to populate a picker with.
+        assert "sensor_id" in entry and "category" in entry
+        assert "value" not in entry
+
+
+def test_system_metrics_returns_flat_dict(api_client: TestClient) -> None:
+    """``GET /system/metrics`` is the flat ``{sensor_id: value}`` shape."""
+    resp = api_client.get("/system/metrics")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, dict)
+    for value in body.values():
+        assert isinstance(value, (int, float))
+
+
+def test_device_detail_not_found_404(api_client: TestClient) -> None:
+    """``GET /devices/{key}`` for an undiscovered device is a 404."""
+    resp = api_client.get("/devices/dead:beef")
+    assert resp.status_code == 404
+
+
+def test_device_detail_returns_discovered_device(
+    api_client: TestClient,
+    fake_platform: FakePlatform,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A discovered device's detail comes back as its product schema."""
+    from trcc.core.models import DeviceInfo
+    monkeypatch.setattr(
+        fake_platform, "scan_devices",
+        lambda: [DeviceInfo(vid=0x0402, pid=0x3922)],
+    )
+    resp = api_client.get("/devices/0402:3922")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["key"] == "0402:3922"
+    assert body["vid"] == 0x0402
+    assert body["pid"] == 0x3922
+
+
+# =========================================================================
+# config router
+# =========================================================================
+
+
+def test_config_set_temp_unit_round_trips(api_client: TestClient) -> None:
+    resp = api_client.post("/config/temp-unit", json={"unit": "F"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["unit"] == "F"
+
+
+def test_config_set_language_round_trips(api_client: TestClient) -> None:
+    resp = api_client.post("/config/language", json={"language": "de"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_config_set_refresh_interval_round_trips(api_client: TestClient) -> None:
+    resp = api_client.post(
+        "/config/refresh-interval", json={"seconds": 3.0},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+
+
+def test_config_set_time_format_round_trips(api_client: TestClient) -> None:
+    resp = api_client.post("/config/time-format", json={"fmt": "12h"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["fmt"] == "12h"
+
+
+def test_config_set_time_format_rejects_bad_value(api_client: TestClient) -> None:
+    resp = api_client.post("/config/time-format", json={"fmt": "bogus"})
+    assert resp.status_code == 422  # Pydantic pattern validation
+
+
+def test_config_set_date_format_round_trips(api_client: TestClient) -> None:
+    resp = api_client.post("/config/date-format", json={"fmt": "dd.MM.yyyy"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["fmt"] == "dd.MM.yyyy"
+
+
+def test_no_route_restores_a_whole_device_config(api_client: TestClient) -> None:
+    """``POST /theme/config/import-upload`` restored an entire DeviceSettings
+    with no path confinement: a mask_path aimed at any readable file came back
+    inside the next ``GET /theme/{key}/download`` .tr -- a local file read,
+    re-driven 2026-10-06.  Deleted with ExportConfig/ImportConfig; it must not
+    come back."""
+    from trcc.core import commands
+
+    upload = api_client.post(
+        "/theme/config/import-upload", params={"key": "0402:3922"},
+        files={"config": ("x.json", b"{}", "application/json")})
+    download = api_client.get("/theme/0402:3922/config-download")
+
+    assert upload.status_code in (404, 405)
+    assert download.status_code in (404, 405)
+    assert not hasattr(commands, "ImportConfig")
+    assert not hasattr(commands, "ExportConfig")
+
+
+def test_theme_save_requires_key(api_client: TestClient) -> None:
+    """SaveTheme needs a connected device + active theme; unknown key
+    returns a structured error, not a 500."""
+    resp = api_client.post(
+        "/theme/save",
+        json={"key": "dead:beef", "name": "test"},
+    )
+    assert resp.status_code in (400, 404, 422)
+
+
+def test_theme_list_returns_empty_under_empty_dir(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """ListThemes against an empty directory returns ok with an empty
+    list — proves the route reaches Command dispatch + Result
+    serialization end-to-end."""
+    library = fake_platform.paths().user_content_dir() / "library"
+    library.mkdir(parents=True)
+    resp = api_client.get("/theme/list", params={"directory": str(library)})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["themes"] == []
+    assert body["directory"] == str(library.resolve())
+
+
+def test_theme_list_refuses_a_directory_outside_trcc(
+    api_client: TestClient, tmp_path: Path,
+) -> None:
+    """``?directory=`` listed any directory the process could read."""
+    resp = api_client.get("/theme/list", params={"directory": str(tmp_path)})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == (
+        "path must name an existing file inside TRCC's data directories "
+        "(~/.trcc or ~/.trcc-user)")
+
+
+def test_theme_list_finds_themes_in_dir(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """ListThemes returns each theme directory containing config.json."""
+    library = fake_platform.paths().user_content_dir() / "library"
+    theme_dir = library / "MyTheme"
+    theme_dir.mkdir(parents=True)
+    (theme_dir / "trcc.json").write_text(
+        '{"width": 480, "height": 480, "elements": []}',
+    )
+    resp = api_client.get("/theme/list", params={"directory": str(library)})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert len(body["themes"]) == 1
+    assert body["themes"][0]["name"] == "MyTheme"
+    assert body["themes"][0]["resolution"] == [480, 480]
+
+
+# =========================================================================
+# Display tick — the headless animation poller
+# =========================================================================
+
+
+def test_display_tick_dispatches_only_the_animation_tick(
+        api_client: TestClient) -> None:
+    """``POST /display/tick`` dispatches ``TickDisplay`` and nothing else.
+
+    * No restore: it used to self-prime with ``RestoreDeviceState`` on EVERY
+      poll — a push lasted one poll, and a failing restore cost 22 log records
+      per request.  The API runs a session now, and the session primes a panel
+      on connect (``App._prime``), once.
+    * the tick itself must be ``TickDisplay``; with ``RenderAndSend`` the
+      cursor never moves and a polled video sits on frame 0 (#239).
+    """
+    from trcc.core.commands import TickDisplay
+
+    trcc = api_client.app.state.trcc          # type: ignore[attr-defined]
+    # Depth-tracked: a Command may dispatch others, and this pins what the
+    # ROUTE chooses, not how TickDisplay composes itself.
+    route_dispatched: list[str] = []
+    every_dispatch: list[str] = []
+    depth = 0
+    real_dispatch = trcc.dispatch
+
+    def _recording_dispatch(cmd):             # type: ignore[no-untyped-def]
+        nonlocal depth
+        every_dispatch.append(type(cmd).__name__)
+        if depth == 0:
+            route_dispatched.append(type(cmd).__name__)
+        depth += 1
+        try:
+            return real_dispatch(cmd)
+        finally:
+            depth -= 1
+
+    trcc.dispatch = _recording_dispatch       # type: ignore[method-assign]
+    try:
+        # No device attached, so the tick reports failure — the ORDER and the
+        # choice of Commands is what this pins, not the render succeeding.
+        api_client.post("/devices/dead:beef/display/tick")
+    finally:
+        trcc.dispatch = real_dispatch         # type: ignore[method-assign]
+
+    assert route_dispatched == [TickDisplay.__name__], (
+        f"expected only the animation tick, got {route_dispatched}")
+    # #239: RenderAndSend may be TickDisplay's child, but the route must not
+    # choose it — with it the cursor never advances and a video sits on frame 0.
+    assert "RenderAndSend" not in route_dispatched
+    assert every_dispatch.index("TickDisplay") < every_dispatch.index(
+        "RenderAndSend"), "RenderAndSend must be nested under TickDisplay"
+
+
+# =========================================================================
+# Per-SKU artwork libraries reached through the API
+#
+# A resolution does not identify an artwork library (FormCZTV.cs:1290-1353,
+# FormCZTV.cs:5746).  ``ListMasks`` / ``ListWebThemes`` have carried an optional
+# ``key`` since the libraries landed, and the CLI (ui/cli/display.py) and qtgui
+# (ui/qtgui/panels/mask_browser.py) both pass it -- the API did not, so the same
+# device answered one way through three UIs and another way through the fourth.
+# =========================================================================
+
+
+def _attach_sku_device(
+    trcc: App, key: str, fbl: int, pm: int, sub: int,
+) -> None:
+    """Attach a device whose handshake selects a per-SKU library.
+
+    Real ``ProductInfo`` + real ``get_profile`` rather than a stub carrying
+    only a resolution: ``/display/masks?key=`` resolves through ``DeviceState``,
+    which reads wire/kind/model/fbl off the registry row, and a stub hides
+    which of those fields are load-bearing.
+    """
+    from types import SimpleNamespace
+
+    from trcc.core.models import HandshakeResult
+    from trcc.core.protocol import get_profile
+    from trcc.core.registry import ALL_DEVICES
+
+    vid, pid = (int(part, 16) for part in key.split(":"))
+    profile = get_profile(fbl, pm)
+    info = ALL_DEVICES.get((vid, pid)) or SimpleNamespace(
+        key=key, native_resolution=profile.resolution,
+    )
+    trcc.devices[key] = SimpleNamespace(   # type: ignore[assignment]
+        profile=profile,
+        needs_keepalive=False,             # every Device answers it (#228)
+        # The REAL dataclass, not a namespace carrying two bytes.  The stub
+        # version omitted ``fbl`` — a field every HandshakeResult has — and got
+        # away with it only while nothing read it.  The moment ``DeviceState``
+        # started reporting the handshake-derived FBL, the stub raised
+        # AttributeError, which is the same lesson this helper's docstring
+        # already makes about ProductInfo.
+        handshake=HandshakeResult(
+            resolution=profile.resolution, model_id=fbl,
+            pm_byte=pm, sub_byte=sub, fbl=fbl,
+        ),
+        info=info,
+        is_connected=True,
+        is_led=False,
+    )
+
+
+def test_display_masks_reads_the_devices_own_mask_library(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """``GET /display/masks?key=`` scans the device's library, not the generic.
+
+    480x480 at PM 3 keeps its masks in ``zt480480y`` (FormCZTV.cs:5746) -- the
+    one library arm keyed on PM rather than SUB.  The route already resolved
+    ``key`` into a resolution; it dropped the key itself when building the
+    Command, so it read ``zt480480`` while the CLI and qtgui read ``zt480480y``.
+
+    MUTATION CHECK -- drop ``key=key or ""`` from the ``ListMasks(...)`` call in
+    ``ui/api/display.py`` and this fails with the generic mask.
+    """
+    key = "87ad:70db"                     # GrandVision 360 AIO, FBL 72, 480x480
+    _attach_sku_device(
+        api_client.app.state.trcc,        # type: ignore[attr-defined]
+        key, fbl=72, pm=3, sub=0,
+    )
+
+    paths = fake_platform.paths()
+    # BOTH libraries on disk, each holding a DIFFERENT mask: if only the
+    # variant existed, the fallback would make the generic case pass too and
+    # the test would not distinguish them.
+    for variant, mask_id in (("", "generic01"), ("y", "sku01")):
+        mask_dir = paths.cloud_mask_dir(480, 480, variant) / mask_id
+        mask_dir.mkdir(parents=True, exist_ok=True)
+        (mask_dir / "01.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert paths.cloud_mask_dir(480, 480, "y").name == "zt480480y"
+
+    resp = api_client.get("/display/masks", params={"key": key})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert [m["name"] for m in body["masks"]] == ["sku01"], (
+        "a PM-3 480x480 panel must browse zt480480y, as it does in the "
+        f"CLI and qtgui — got {body['masks']}"
+    )
+
+
+def test_theme_web_gallery_reads_the_devices_own_library(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """``GET /theme/web?key=`` scans the SKU library AND names it in the URL.
+
+    1600x720 ships six theme libraries picked by SUB crossed with orientation
+    (FormCZTV.cs:1290-1353); SUB 3 browses ``1600720l``.  Two separate facts
+    have to follow the device, and the second is the one that bites: the
+    ``preview_url`` used to be re-spelled as ``f"/static/web/{w}{h}/..."``, so
+    even with the right entries it addressed ``1600720`` -- a directory the
+    file is not in.
+
+    MUTATION CHECK -- drop ``key=key`` from the ``ListWebThemes(...)`` call and
+    the entries go generic; put the ``{w}{h}`` literal back and the URL does.
+    """
+    key = "0416:5408"
+    _attach_sku_device(
+        api_client.app.state.trcc,        # type: ignore[attr-defined]
+        key, fbl=114, pm=64, sub=3,
+    )
+
+    paths = fake_platform.paths()
+    for variant, preview_id in (("", "a001"), ("l", "a077")):
+        web_dir = paths.cloud_theme_dir(1600, 720, variant)
+        web_dir.mkdir(parents=True, exist_ok=True)
+        (web_dir / f"{preview_id}.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert paths.cloud_theme_dir(1600, 720, "l").name == "1600720l"
+
+    resp = api_client.get(
+        "/theme/web", params={"resolution": "1600x720", "key": key},
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [i["id"] for i in items] == ["a077"], (
+        f"SUB 3 must browse 1600720l — got {items}"
+    )
+    assert items[0]["preview_url"] == "/static/web/1600720l/a077.png", (
+        "the URL must name the directory the file is actually in"
+    )
+
+
+def test_theme_web_gallery_without_a_key_stays_generic(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """No ``key`` → the generic library, so the resolution-only contract holds.
+
+    ``?key=`` is additive: a client that only knows a resolution (and has no
+    device to ask) must keep getting exactly what it got before.
+    """
+    web_dir = fake_platform.paths().cloud_theme_dir(1600, 720)
+    web_dir.mkdir(parents=True, exist_ok=True)
+    (web_dir / "a001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = api_client.get("/theme/web", params={"resolution": "1600x720"})
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [i["id"] for i in items] == ["a001"]
+    assert items[0]["preview_url"] == "/static/web/1600720/a001.png"
+
+
+def test_theme_web_gallery_falls_back_when_the_sku_library_is_absent(
+    api_client: TestClient, fake_platform: FakePlatform,
+) -> None:
+    """Variant dir not on disk → generic entries AND a generic URL.
+
+    The suffixed libraries are a separate download, so the fallback is the one
+    path that must not produce a URL nobody can serve: deriving the segment
+    from the directory the query REPORTS reading keeps the two in step, where
+    re-spelling from the variant would 404.
+    """
+    key = "0416:5409"
+    _attach_sku_device(
+        api_client.app.state.trcc,        # type: ignore[attr-defined]
+        key, fbl=114, pm=64, sub=3,
+    )
+
+    web_dir = fake_platform.paths().cloud_theme_dir(1600, 720)   # generic only
+    web_dir.mkdir(parents=True, exist_ok=True)
+    (web_dir / "a078.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert not fake_platform.paths().cloud_theme_dir(1600, 720, "l").exists()
+
+    resp = api_client.get(
+        "/theme/web", params={"resolution": "1600x720", "key": key},
+    )
+    assert resp.status_code == 200
+    items = resp.json()
+    assert [i["id"] for i in items] == ["a078"]
+    assert items[0]["preview_url"] == "/static/web/1600720/a078.png"
+
+
+# =========================================================================
+# Gate B — capabilities the bus had but only one UI could reach
+# =========================================================================
+#
+# Each route below dispatches a Command that existed and was reachable from
+# exactly one UI, so a user of every OTHER surface could not do the thing at
+# all.  They are asserted to EXIST and to reach their Command; the behaviour
+# itself is covered where that Command is tested.  A route that 404s because
+# nobody registered it is the failure this guards.
+
+
+def test_device_reset_route_exists(api_client: TestClient) -> None:
+    """``POST /devices/{key}/reset`` — disconnect AND drop cached state.
+
+    Distinct from ``/display/reset``, which blanks the panel to a colour and
+    leaves the device connected.  That difference is why this was a real gap
+    rather than a duplicate.
+    """
+    resp = api_client.post("/devices/dead:beef/reset")
+    assert resp.status_code in (200, 404), resp.text
+    assert "Not Found" not in resp.text or resp.status_code == 404
+
+
+def test_send_image_keeps_nothing_on_disk(tmp_path: Path) -> None:
+    """#306: every upload became a saved theme and left two files behind —
+    ``uploads/<uuid>.png`` and ``single-image/<uuid>/`` — forever.  A status
+    dashboard pushing on every change wrote 305,810 pairs (26 GB) in 11 days.
+
+    Driven through the real route against a real panel, three times, because
+    a leak only shows across calls.  ``/push-image`` went in the same change:
+    the same job from a server path nothing confined.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path),
+               renderer=renderer)
+    with loopback_client(build_app(trcc=trcc)) as client:
+        for _ in range(3):
+            resp = client.post("/devices/0402:3922/display/send-image",
+                               files={"image": ("frame.png", png, "image/png")})
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["ok"] is True
+        schema = client.get("/openapi.json").json()["paths"]
+
+    content = trcc.platform.paths().user_content_dir()
+    assert list((content / "uploads").iterdir()) == []
+    assert not (content / "single-image").exists()
+    assert trcc.settings.for_device("0402:3922").current_theme is None
+    assert "/devices/{key}/display/push-image" not in schema
+
+
+def test_create_theme_keeps_only_what_a_command_still_reads(tmp_path: Path) -> None:
+    """``create-theme`` staged every upload in ``uploads/`` and never removed
+    one.  An image background is COPIED by LoadImage, so its staged file is
+    debris at once; a refused request left everything it had staged.  A mask
+    stays: ApplyMask persists the path it was given.
+    MUTATION CHECK: drop the ``finally`` cleanup -> both halves fail.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path),
+               renderer=renderer)
+    route = "/devices/0402:3922/display/create-theme"
+    with loopback_client(build_app(trcc=trcc)) as client:
+        for _ in range(3):
+            resp = client.post(route, files={"background": ("bg.png", png, "image/png")})
+            assert resp.status_code == 200, resp.text
+        refused = client.post(route, files={
+            "background": ("bg.png", png, "image/png"),
+            "mask": ("mask.txt", b"not an image", "text/plain")})
+        assert refused.status_code == 400
+        with_mask = client.post(route, files={
+            "background": ("bg.png", png, "image/png"),
+            "mask": ("mask.png", png, "image/png")})
+        assert with_mask.status_code == 200, with_mask.text
+
+    uploads = trcc.platform.paths().user_content_dir() / "uploads"
+    mask = trcc.settings.for_device("0402:3922").mask_path
+    assert [p.name for p in uploads.iterdir()] == [Path(mask).name]
+
+
+
+def test_create_theme_reports_the_panels_size_not_the_catalogs(
+    tmp_path: Path,
+) -> None:
+    """The route re-derived the canvas from DeviceState itself; it asks the
+    one ladder now (DeviceCanvas).  A Mjolnir answers 320x240 on a USB id
+    the catalog calls 480x480."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    png = renderer.encode_png(renderer.create_surface(64, 64, color=(0, 0, 255, 255)))
+    trcc = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                            tmp_path), renderer=renderer)
+    assert trcc.dispatch(ConnectDevice(key="87ad:70db")).ok
+    with loopback_client(build_app(trcc=trcc)) as client:
+        resp = client.post("/devices/87ad:70db/display/create-theme",
+                           files={"background": ("bg.png", png, "image/png")})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["resolution"] == "320x240"
+
+
+def test_device_state_names_the_cooler_and_the_catalogs_guess(
+    tmp_path: Path,
+) -> None:
+    """``/devices/{key}`` is the catalog row -- one name for every cooler on
+    the USB id.  ``/state`` is what the handshake found (#272)."""
+    from trcc.core.commands import ConnectDevice
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    trcc = App(MockPlatform([{"vid": "87ad", "pid": "70db", "pm": 5, "sub": 1}],
+                            tmp_path), renderer=_SmokeRenderer())
+    with loopback_client(build_app(trcc=trcc)) as client:
+        missing = client.get("/devices/87ad:70db/state")
+        assert trcc.dispatch(ConnectDevice(key="87ad:70db")).ok
+        body = client.get("/devices/87ad:70db/state").json()
+
+    assert missing.status_code == 404
+    assert (body["product"], body["resolution"]) == ("Mjolnir Vision", [320, 240])
+    assert (body["catalog_product"], body["catalog_resolution"]) == (
+        "GrandVision 360 AIO", [480, 480])
+
+
+def test_new_capability_routes_are_registered(api_client: TestClient) -> None:
+    """Every Gate B route this session added is in the OpenAPI schema."""
+    schema = api_client.get("/openapi.json").json()["paths"]
+    for route in (
+        "/devices/{key}/display/background",        # SetBackground
+        "/devices/{key}/display/render-dc",         # RenderDcStandalone
+        "/devices/{key}/led/zone-sync-zones",       # SetLedZoneSyncZones
+        "/devices/{key}/reset",                     # ResetDevice
+        "/theme/export-overlay",                    # ExportOverlay
+    ):
+        assert route in schema, f"route not registered: {route}"
+
+
+def test_quickstart_route_returns_the_sequence(api_client: TestClient) -> None:
+    """``POST /system/quickstart`` — doctor then scan, as ONE answer.
+
+    /system/doctor and /devices each answer half; nothing returned the sequence,
+    so a REST client had to know the order and the stop-on-first-failure rule
+    itself.  Asserting the steps come back is the point: a 200 with no steps
+    would be the route existing without the capability.
+    """
+    resp = api_client.post("/system/quickstart")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("steps"), "quickstart returned no steps"
+    assert all("name" in s and "status" in s for s in body["steps"])
+
+
+# =========================================================================
+# The connect divergence — the API had no equivalent of the CLI's
+# ``_ctx.ensure_connected``, so the SAME intent behaved differently:
+#
+#     trcc display color 0416:5302 ff0000     -> works
+#     POST /devices/.../display/color         -> {"detail": "Not attached"}
+#
+# ...until the client remembered a ``POST /connect`` that nothing documented.
+# =========================================================================
+
+
+def _bus_of(client: TestClient) -> Any:
+    """The App behind a ``TestClient``.
+
+    ``TestClient.app`` is typed ``ASGIApp``, which has no ``.state``.  A cast
+    states what we know instead of suppressing what the checker sees.
+    """
+    return cast("FastAPI", client.app).state.trcc
+
+
+def test_a_wire_route_attaches_itself_like_the_cli_does(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wire route must not require the caller to connect first.
+
+    Gated by watching for the ``EnsureConnected`` dispatch rather than a
+    successful frame, because the fake platform has no device to attach: the
+    contract under test is "the route asks", not "the attach succeeds".
+    """
+    from trcc.core.commands import EnsureConnected
+
+    seen: list[str] = []
+    original = _bus_of(api_client).dispatch
+
+    def spy(cmd: object):
+        seen.append(type(cmd).__name__)
+        return original(cmd)
+
+    monkeypatch.setattr(_bus_of(api_client), "dispatch", spy)
+    api_client.post("/devices/0402:3922/display/color",
+                    json={"r": 255, "g": 0, "b": 0})
+
+    assert EnsureConnected.__name__ in seen, (
+        "a wire route dispatched no EnsureConnected — an API client would have "
+        f"to POST /connect first, which the CLI never requires.  saw: {seen}"
+    )
+
+
+def test_settings_routes_do_NOT_force_an_attach(
+    api_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard is per-ROUTE, and this is why.
+
+    Only 9 of the 63 device-scoped routes need a device.  ``SetBrightness`` /
+    ``SetOrientation`` / ``StopVideo`` / ``RestoreDeviceState`` were each
+    verified to answer ``ok=True`` with nothing attached, so a router-wide
+    dependency would have made every one of them start failing on a machine
+    with no hardware.
+    """
+    from trcc.core.commands import EnsureConnected
+
+    seen: list[str] = []
+    original = _bus_of(api_client).dispatch
+
+    def spy(cmd: object):
+        seen.append(type(cmd).__name__)
+        return original(cmd)
+
+    monkeypatch.setattr(_bus_of(api_client), "dispatch", spy)
+    api_client.post("/devices/0402:3922/display/brightness", json={"percent": 50})
+
+    assert EnsureConnected.__name__ not in seen, (
+        "a settings route forced an attach — it works fine unattached, and "
+        f"requiring hardware for it is a regression.  saw: {seen}"
+    )
+
+
+# ── The trust boundary: no server paths, no browsers (2026-09-26) ─────────
+#
+# Measured before this pass: 14 of 18 routes that took a server path opened or
+# wrote any file the process could reach — debug-report overwrote one — and a
+# token-less server answered any web page in the user's browser, streaming the
+# live preview to it.
+
+_BOUNDARY = ("path must name an existing file inside TRCC's data directories "
+             "(~/.trcc or ~/.trcc-user)")
+_KEY = "0402:3922"
+_ROUTES_THAT_READ = [
+    ("POST", f"/devices/{_KEY}/display/background", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/play-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/load-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/export-video", "json", "path"),
+    ("POST", f"/devices/{_KEY}/display/media-player", "json", "uri"),
+    ("POST", f"/devices/{_KEY}/display/upload-mask", "json", "source"),
+    ("POST", f"/devices/{_KEY}/display/render-dc", "json", "dc_path"),
+    ("GET", "/display/video-duration", "params", "path"),
+]
+
+
+@pytest.fixture
+def panel_api(tmp_path: Path) -> Iterator[tuple[TestClient, App]]:
+    """A real 320x320 panel behind the API, with one theme and one image."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    renderer = QtRenderer()
+    app = App(MockPlatform([{"vid": "0402", "pid": "3922"}], tmp_path / "root"),
+              renderer=renderer)
+    paths = app.platform.paths()
+    theme = paths.user_data_dir() / "theme320320" / "demo"
+    theme.mkdir(parents=True)
+    (theme / "trcc.json").write_text(json.dumps({
+        "name": "demo", "width": 320, "height": 320, "elements": [{
+            "type": "clock", "x": 10, "y": 10, "color": "#ffffff", "size": 24,
+            "bold": False, "italic": False, "source": "time"}],
+    }), encoding="utf-8")
+    image = renderer.encode_png(renderer.create_surface(32, 32, color=(0, 0, 255, 255)))
+    (theme / "00.png").write_bytes(image)
+    (paths.user_content_dir() / "inside.png").write_bytes(image)
+    with loopback_client(build_app(trcc=app)) as client:
+        assert client.post(f"/devices/{_KEY}/connect").status_code == 200
+        yield client, app
+
+
+def _read(client: TestClient, verb: str, url: str, where: str, field: str,
+          path: str) -> Any:
+    body = {field: path, "width": 320, "height": 320}
+    return client.request(verb, url, **{where: body})
+
+
+@pytest.mark.parametrize("verb,url,where,field", _ROUTES_THAT_READ)
+def test_a_route_refuses_a_path_outside_trcc(
+    panel_api: tuple[TestClient, App], tmp_path: Path,
+    verb: str, url: str, where: str, field: str,
+) -> None:
+    client, _ = panel_api
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    resp = _read(client, verb, url, where, field, str(outside))
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == _BOUNDARY
+
+
+@pytest.mark.parametrize("verb,url,where,field", _ROUTES_THAT_READ)
+def test_a_route_accepts_a_path_inside_trcc(
+    panel_api: tuple[TestClient, App],
+    verb: str, url: str, where: str, field: str,
+) -> None:
+    """Past the boundary; whatever the Command then says about a PNG it
+    expected to be a video is its own answer, not the boundary's.  FastAPI's
+    own "Not Found" is excluded by name: a route that does not exist is not
+    past anything, and this assertion passed on one until it said so."""
+    client, app = panel_api
+    inside = app.platform.paths().user_content_dir() / "inside.png"
+
+    resp = _read(client, verb, url, where, field, str(inside))
+
+    assert resp.json().get("detail") not in (_BOUNDARY, "Not Found")
+
+
+def test_a_web_url_is_not_a_path(panel_api: tuple[TestClient, App]) -> None:
+    client, app = panel_api
+    resp = client.post(f"/devices/{_KEY}/display/media-player",
+                       json={"uri": "https://example.com/stream.m3u8"})
+    assert resp.status_code == 200
+    assert app.settings.for_device(_KEY).media_player_uri == (
+        "https://example.com/stream.m3u8")
+
+
+@pytest.fixture
+def private_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The system temp dir, made private to this test so a leak is countable."""
+    import tempfile
+    private = tmp_path / "systmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    return private
+
+
+def test_the_exports_come_back_as_bytes_and_leave_nothing(
+    panel_api: tuple[TestClient, App], private_tmp: Path,
+) -> None:
+    client, app = panel_api
+    body = {"key": _KEY, "theme_name": "demo"}
+    demo = app.platform.paths().user_data_dir() / "theme320320" / "demo"
+    assert app.dispatch(LoadTheme(key=_KEY, path=demo)).ok
+
+    overlay = client.post("/theme/export-overlay", json=body)
+    dc = client.post("/theme/demo/export-dc", json={"key": _KEY})
+    archive = client.get(f"/theme/{_KEY}/demo/download")
+    shown = client.get(f"/theme/{_KEY}/download")
+    (app.platform.paths().user_content_dir() / "demo.dc").write_bytes(dc.content)
+    png = client.post(f"/devices/{_KEY}/display/render-dc", json={
+        "dc_path": str(app.platform.paths().user_content_dir() / "demo.dc"),
+        "width": 320, "height": 320})
+
+    assert [r.status_code for r in (overlay, dc, archive, shown, png)
+            ] == [200] * 5
+    assert shown.content[:4] == b"\xdd\xdc\xdd\xdc"     # a Windows .tr
+    assert json.loads(overlay.content)["elements"][0]["type"] == "clock"
+    assert overlay.headers["content-disposition"] == (
+        'attachment; filename="demo-overlay.json"')
+    assert dc.headers["content-disposition"] == (
+        'attachment; filename="config1.dc"')
+    reimported = client.post(
+        "/theme/import-upload", params={"key": _KEY, "name": "roundtrip"},
+        files={"archive": ("demo.tr", archive.content, "application/octet-stream")})
+    assert reimported.status_code == 200, reimported.text
+    assert png.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert list(private_tmp.iterdir()) == []
+
+
+def test_a_malformed_range_leaves_no_temp_file(
+    panel_api: tuple[TestClient, App], private_tmp: Path,
+) -> None:
+    """``FileResponse`` skipped its cleanup task on a bad ``Range`` header:
+    3 of 3 requests leaked their tempfile.  Bytes in a plain Response do not."""
+    client, _ = panel_api
+    for bad in ("bytes=abc", "bytes=99999999-"):
+        client.get(f"/theme/{_KEY}/demo/download", headers={"range": bad})
+        client.get(f"/theme/{_KEY}/download", headers={"range": bad})
+    assert list(private_tmp.iterdir()) == []
+
+
+@pytest.mark.parametrize("headers", [
+    {"host": "evil.example"},
+    {"origin": "https://evil.example"},
+    {"origin": "null"},
+])
+def test_a_tokenless_server_refuses_a_browser(
+    panel_api: tuple[TestClient, App], headers: dict[str, str],
+) -> None:
+    client, _ = panel_api
+    resp = client.get("/devices", headers=headers)
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "Refused: not a loopback client"
+
+
+def test_a_tokenless_server_answers_its_own_origin(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    client, _ = panel_api
+    resp = client.get("/devices", headers={"origin": "http://localhost:8080"})
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("path", [
+    f"/devices/{_KEY}/display/preview/stream", "/events"])
+def test_a_websocket_refuses_a_foreign_origin(
+    panel_api: tuple[TestClient, App], path: str,
+) -> None:
+    from starlette.websockets import WebSocketDisconnect
+
+    client, _ = panel_api
+    # Refused at the handshake, so the body never runs: reaching it means the
+    # socket was admitted, and ``raises`` fails at once instead of waiting on
+    # a stream that would never end.
+    with pytest.raises(WebSocketDisconnect) as refused:
+        with client.websocket_connect(
+                path, headers={"origin": "https://evil.example"}):
+            pass
+    assert refused.value.code == 1008
+
+
+def test_with_a_token_the_token_governs(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """A LAN bind needs a token, and then any Host is fine — the token is the
+    credential a page cannot forge."""
+    from trcc.ui.api.main import configure_auth
+
+    client, _ = panel_api
+    configure_auth("secret-token")
+    try:
+        resp = client.get("/devices", headers={
+            "host": "192.168.1.20:8080", "X-API-Token": "secret-token"})
+    finally:
+        configure_auth(None)
+    assert resp.status_code == 200
+
+
+def test_keepalive_cannot_run_until_interrupted_over_http(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """``count=0`` loops until Ctrl-C, which no HTTP request can send — the
+    default body held a server worker forever."""
+    client, _ = panel_api
+    resp = client.post(f"/devices/{_KEY}/display/keepalive", json={"count": 0})
+    assert resp.status_code == 422
+
+
+def test_a_tick_poller_leaves_a_pushed_image_on_the_panel(
+    panel_api: tuple[TestClient, App],
+) -> None:
+    """``/tick`` self-primes with a restore on every poll, which reloaded the
+    saved theme over ``/send-image`` one poll later (#306's second hole)."""
+    client, app = panel_api
+    image = (app.platform.paths().user_content_dir() / "inside.png").read_bytes()
+    assert client.post(f"/devices/{_KEY}/display/send-image",
+                       files={"image": ("x.png", image, "image/png")}).json()["ok"]
+
+    tick = client.post(f"/devices/{_KEY}/display/tick")
+
+    assert tick.status_code == 200
+    assert tick.json()["message"] == "held by a pushed frame"
+    assert _KEY not in app.active_themes
+
+
+def test_a_route_connects_the_device_itself(tmp_path: Path) -> None:
+    """The API decided "connect first" per route, and 6 routes did not -- so
+    ``/sleep`` and ``/media-player`` failed "Not attached" where the CLI
+    worked.  Now the Command connects, whichever face dispatched it."""
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.ui.api.main import build_app
+
+    from .mock_platform import MockPlatform
+
+    app = App(MockPlatform([{"vid": "0402", "pid": "3922"},
+                            {"type": "led", "vid": "0416", "pid": "8001",
+                             "pm": 208}], tmp_path), renderer=QtRenderer())
+    with loopback_client(build_app(trcc=app)) as client:
+        sleep = client.post("/devices/0402:3922/display/sleep")
+        led = client.post("/devices/0416:8001/led/render", json={"phase": 0})
+
+    assert (sleep.status_code, led.status_code) == (200, 200)
+    assert app.devices["0402:3922"].is_connected
+    assert app.devices["0416:8001"].is_connected
+
+
+def test_screencast_stop_is_one_command(
+        api_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``POST /screencast/stop`` sends StopScreencast alone -- which ends the
+    capture driver too.  Every UI used to pair a StopScreencastDriver with it by
+    hand, and the CLI's ``stop-screencast`` did not."""
+    seen: list[str] = []
+    original = _bus_of(api_client).dispatch
+    monkeypatch.setattr(_bus_of(api_client), "dispatch",
+                        lambda cmd: (seen.append(type(cmd).__name__),
+                                     original(cmd))[1])
+
+    response = api_client.post("/devices/0402:3922/display/screencast/stop")
+
+    assert response.status_code == 200, response.text
+    assert seen == ["StopScreencast"]
+
+
+def test_system_rgb_follow_status_and_off(api_client: TestClient) -> None:
+    """#160: nothing follows by default; off needs no OpenRGB."""
+    status = api_client.get("/system/rgb-follow").json()
+    assert (status["mode"], status["host"], status["port"]) == (
+        "off", "127.0.0.1", 6742)
+    resp = api_client.post("/system/rgb-follow",
+                           json={"mode": "off", "port": 6800})
+    assert resp.status_code == 200
+    assert (resp.json()["mode"], resp.json()["port"]) == ("off", 6800)
+    assert resp.json()["message"] == (
+        "Nothing follows -- TRCC sends no colours to other lights")
+
+
+def test_system_rgb_follow_takes_a_host_not_a_url(api_client: TestClient) -> None:
+    for host in ("http://evil", "a/b", "x y"):
+        resp = api_client.post("/system/rgb-follow",
+                               json={"mode": "off", "host": host})
+        assert resp.status_code == 422, host
+    for bad in ({"mode": "off", "port": 70000}, {"mode": "rainbow"}):
+        assert api_client.post("/system/rgb-follow", json=bad
+                               ).status_code == 422, bad
+
+
+def test_system_ram_lighting_on_an_os_without_it(api_client: TestClient) -> None:
+    status = api_client.get("/system/ram-lighting").json()
+    assert (status["state"], status["message"]) == (
+        "unsupported", "RAM lighting is not available on FakePlatform yet")
+    resp = api_client.post("/system/ram-lighting", json={"enabled": True})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "RAM lighting is not available on FakePlatform yet"
+    assert api_client.post("/system/ram-lighting", json={}).status_code == 422
+
+
+def test_system_rgb_routes_on_an_os_without_the_bus(api_client: TestClient) -> None:
+    listed = api_client.get("/system/rgb").json()
+    assert (listed["scanned"], listed["lights"]) == (False, [])
+    scan = api_client.post("/system/rgb/scan")
+    assert scan.status_code == 400
+    assert scan.json()["detail"].startswith("RAM: no SMBus access on FakePlatform")
+    moved = api_client.post("/system/rgb/scan",
+                            json={"host": "10.0.0.2", "port": 6800})
+    assert moved.status_code == 400   # still no SMBus -- but the address moved
+    assert api_client.get("/system/rgb-follow").json()["host"] == "10.0.0.2"
+    assert api_client.post("/system/rgb/scan",
+                           json={"host": "http://x/"}).status_code == 422
+    effect = api_client.post("/system/ram-effect", json={"effect": "rainbow"})
+    assert effect.status_code == 400
+    assert api_client.post("/system/ram-effect",
+                           json={"effect": "disco"}).status_code == 422
+    assert api_client.post("/system/ram-effect", json={
+        "effect": "static", "brightness": 999}).status_code == 422
+
+
+def test_system_aura_leds_route(api_client: TestClient) -> None:
+    """Dispatches SetAuraLeds; the schema refuses what the board cannot take."""
+    refused = api_client.post("/system/aura-leds", json={"header": 1, "leds": 8})
+    assert refused.status_code == 400
+    assert refused.json()["detail"] == (
+        "no ARGB header 1 -- press Find lights to list the board's headers")
+    for body in ({"header": 0, "leds": 8}, {"header": 1, "leds": 121},
+                 {"header": 1}):
+        assert api_client.post("/system/aura-leds", json=body).status_code == 422

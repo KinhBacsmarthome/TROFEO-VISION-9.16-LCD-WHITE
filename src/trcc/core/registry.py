@@ -1,0 +1,203 @@
+"""Product registry — `(vid, pid) → ProductInfo` map.
+
+Adding a new device = append a row.  Zero code changes elsewhere — the
+App picks the right Device subclass via its `wire` field, and every
+other per-device value is pure data.
+
+Native resolution is the raw pixel buffer the device expects.  For HID
+and some SCSI devices the actual resolution is confirmed at handshake
+via the PM byte; the value here is the default / product-advertised
+resolution used until confirmation.
+"""
+from __future__ import annotations
+
+import logging
+
+from .models import Kind, ProductInfo, Wire
+
+log = logging.getLogger(__name__)
+
+# =========================================================================
+# Display constants used by the GUI
+# =========================================================================
+
+# Sidebar fallback button image when a device hasn't been identified
+# (e.g. a HID LCD pre-handshake).  Used by uc_device.py + trcc_app.py to
+# decide whether to render a text-only sidebar entry.
+LCD_DEFAULT_BUTTON: str = "A1CZTV"
+
+# LCD brightness levels the hardware accepts.  Cycled by the brightness
+# button on the bottom controls strip.
+BRIGHTNESS_STEPS: tuple[int, ...] = (25, 50, 100)
+
+# =========================================================================
+# ALL_DEVICES — hardware registry
+# =========================================================================
+
+
+ALL_DEVICES: dict[tuple[int, int], ProductInfo] = {
+
+    # --- SCSI LCD (USB mass-storage passthrough) -----------------------
+    (0x87CD, 0x70DB): ProductInfo(
+        vid=0x87CD, pid=0x70DB,
+        vendor="Thermalright",
+        product="LCD Display",
+        wire=Wire.SCSI, kind=Kind.LCD,
+        device_type=1, fbl=100,
+        native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+    ),
+    (0x0416, 0x5406): ProductInfo(
+        vid=0x0416, pid=0x5406,
+        vendor="Winbond",
+        product="LCD Display",
+        # Elite Vision 360 ARGB (#212).  Driven by the C# worker
+        # ThreadSendDeviceDataALi, which speaks the F5 protocol — the SAME one
+        # HidLcd's type 3 speaks for 0418:5303/5304 (identical init packet,
+        # frame header and identity bytes; see adapters/device/_f5.py).  It had
+        # its own Wire and its own class until 2026-08-19; the only thing
+        # keeping them apart was a keepalive policy keyed on the wire, which is
+        # now the per-device volatile_frames below.
+        wire=Wire.HID, kind=Kind.LCD,
+        device_type=3, fbl=100,
+        volatile_frames=True,
+        native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+    ),
+    (0x0402, 0x3922): ProductInfo(
+        vid=0x0402, pid=0x3922,
+        vendor="Thermalright",
+        product="LCD Display",
+        wire=Wire.SCSI, kind=Kind.LCD,
+        device_type=1, fbl=100,
+        native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+        model="FROZEN_WARFRAME",
+    ),
+
+    # --- HID LCD Type 2 ("H" variant, DA/DB/DC/DD) ---------------------
+    (0x0416, 0x5302): ProductInfo(
+        vid=0x0416, pid=0x5302,
+        vendor="Winbond",
+        product="USBDISPLAY",
+        wire=Wire.HID, kind=Kind.LCD,
+        device_type=2,
+        # (0, 0) is "the catalog does not know" -- the same spelling the LED
+        # row uses -- and it is the TRUTH here.  This one USB id covers at
+        # least 240x320, 320x240 and 1280x480; the panel is identified by its
+        # PM byte, which only a handshake supplies.
+        #
+        # Declaring a guess did REAL harm, because a guess is not inert:
+        # `DiscoverDevices` never handshakes, and it installs themes/masks for
+        # whatever this field says.  On a 1280x480 Trofeo Vision it fetched
+        # theme240320 and the browser then pointed there -- "locked at
+        # 240x320" -- two minutes AFTER the handshake had correctly reported
+        # (1280, 480).  Six reporters: #240, #244, #257, #267, #268, #300.
+        #
+        # Nothing downstream needs the guess.  `DiscoverDevices` skips a
+        # (0, 0) row, `_resolve_resolution` returns None for it,
+        # `DeviceCanvas` refuses it (so no browser authors for 0x0), and
+        # `ConnectDevice` installs for the HANDSHAKE resolution -- so a
+        # device that connects still gets its data.  The
+        # cost is that a device which NEVER connects shows empty grids
+        # instead of wrong-sized ones, which is the better failure: empty
+        # self-heals on connect (DataInstalled -> notify_data_ready), wrong
+        # is what pinned those five.
+        native_resolution=(0, 0),
+        orientations=(0, 90, 180, 270),
+    ),
+
+    # --- HID LCD Type 3 ("ALi" variant, F5 prefix) ---------------------
+    (0x0418, 0x5303): ProductInfo(
+        vid=0x0418, pid=0x5303,
+        vendor="ALi Corp",
+        product="LCD Display",
+        wire=Wire.HID, kind=Kind.LCD,
+        device_type=3, fbl=100,
+        native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+    ),
+    (0x0418, 0x5304): ProductInfo(
+        vid=0x0418, pid=0x5304,
+        vendor="ALi Corp",
+        product="LCD Display",
+        wire=Wire.HID, kind=Kind.LCD,
+        device_type=3, fbl=100,
+        native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+    ),
+
+    # --- Raw bulk LCD (USBLCDNew vendor-specific) ----------------------
+    (0x87AD, 0x70DB): ProductInfo(
+        vid=0x87AD, pid=0x70DB,
+        vendor="ChiZhu Tech",
+        product="GrandVision 360 AIO",
+        wire=Wire.BULK, kind=Kind.LCD,
+        device_type=4, fbl=72,
+        volatile_frames=True,
+        native_resolution=(480, 480),
+        orientations=(0, 90, 180, 270),
+        model="GRAND_VISION",
+        button_image="A1GRAND VISION",
+    ),
+
+    # --- LY bulk LCD (Trofeo Vision 9.16 ultrawide) --------------------
+    # orientations: all four, per the C# oracle.  FormCZTV.cs:2690 has an
+    # explicit `is1920x462` directionB switch covering 0/90/180/270 — the panel
+    # rotates in the official app, and our encode table already matches it
+    # exactly (FBL 192: encode_base=180 invert=True → 0:180 90:90 180:0
+    # 270:270).  The cutover declared (0, 180), so SetOrientation rejected 90
+    # before the render was ever reached and the panel was stuck in landscape
+    # on a build whose rotation was already correct (#207).
+    (0x0416, 0x5408): ProductInfo(
+        vid=0x0416, pid=0x5408,
+        vendor="Winbond",
+        product="Trofeo Vision 9.16 LCD",
+        wire=Wire.LY, kind=Kind.LCD,
+        device_type=5, fbl=192,
+        volatile_frames=True,
+        native_resolution=(1920, 462),
+        orientations=(0, 90, 180, 270),
+    ),
+    (0x0416, 0x5409): ProductInfo(
+        vid=0x0416, pid=0x5409,
+        vendor="Winbond",
+        product="Trofeo Vision 9.16 LCD",
+        wire=Wire.LY, kind=Kind.LCD,
+        device_type=5, fbl=192,
+        volatile_frames=True,
+        native_resolution=(1920, 462),
+        orientations=(0, 90, 180, 270),
+    ),
+
+    # --- RGB LED controllers (HID 64-byte reports) ---------------------
+    (0x0416, 0x8001): ProductInfo(
+        vid=0x0416, pid=0x8001,
+        vendor="Winbond",
+        product="LED Controller",
+        wire=Wire.LED, kind=Kind.LED,
+        device_type=1,
+        native_resolution=(0, 0),
+        orientations=(0,),
+        model="LED_DIGITAL",
+        button_image="A1KVMALEDC6",
+        # led_style resolved at runtime from PM byte
+    ),
+}
+
+
+# =========================================================================
+# Lookups
+# =========================================================================
+
+
+def find_product(vid: int, pid: int) -> ProductInfo | None:
+    """Look up a product by VID/PID, or None if unknown."""
+    log.debug("find_product: vid=%04x pid=%04x", vid, pid)
+    return ALL_DEVICES.get((vid, pid))
+
+
+def products_by_wire(wire: Wire) -> list[ProductInfo]:
+    """Return all products using a given wire protocol."""
+    log.debug("products_by_wire: wire=%s", wire)
+    return [p for p in ALL_DEVICES.values() if p.wire is wire]

@@ -1,0 +1,343 @@
+"""BulkLcd — Device implementation for raw-bulk USBLCDNew devices.
+
+Vendor-specific (bInterfaceClass=255) LCD hardware that doesn't speak
+SCSI or HID.  Protocol from USBLCDNew.exe ThreadSendDeviceData
+(87AD:70DB GrandVision series and related products).
+
+Handshake:   write 64-byte request → read 1024-byte response.
+             PM at resp[24], SUB at resp[36].
+Frame send:  64-byte header + payload (JPEG or raw RGB565),
+             chunked into 16 KiB USB writes, ZLP on 512-byte alignment.
+"""
+from __future__ import annotations
+
+import dataclasses
+import logging
+import struct
+
+from ...core.errors import (
+    HandshakeError,
+    TransportError,
+)
+from ...core.logs import Blob, per_frame
+from ...core.models import HandshakeResult, ProductInfo, Wire
+from ...core.ports import BulkTransport
+from ...core.protocol import (
+    DeviceProfile,
+    get_profile,
+    in_pm_ladder,
+    pm_to_fbl,
+    resolve_encode_base,
+    resolve_encode_rotation,
+)
+from ._base import BaseBulkDevice
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+# ── Wire constants ─────────────────────────────────────────────────────
+
+_HANDSHAKE_PAYLOAD = bytes([
+    0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    0, 0, 0, 0,
+])
+
+_HANDSHAKE_READ_SIZE = 1024
+_HANDSHAKE_TIMEOUT_MS = 1000
+_WRITE_TIMEOUT_MS = 5000
+_WRITE_CHUNK_SIZE = 16 * 1024
+
+# PMs the C# moves off mode 2, so they encode RGB565 (cmd=3); every other PM
+# encodes JPEG (cmd=2).  FormCZTVInit: pm 32 → mode 4 (:873), pm 50 → mode 3
+# with SPI mode 2 (:878), and every encode site is `myDeviceMode == 2 ?
+# ImageToJpg : ImageTo565`.
+_RGB565_PMS: frozenset[int] = frozenset({32, 50})
+# ...and the PMs whose RGB565 is BIG-endian: pm 50's SPI mode 2 takes
+# ImageTo565's big-endian branch (FormCZTV.cs:884, :4268).  FBL 50's own
+# profile is little-endian, so the table alone sent its colours swapped.
+_BIG_ENDIAN_PMS: frozenset[int] = frozenset({50})
+
+# Bulk base FBL is 72 (480x480, hardcoded by USBLCDNew.exe).  The C# resolves
+# every bulk AND LY panel through ``FormCZTVInit(fbl=72, m=2, pm, pmSub)``
+# (``FormCZTV.cs:858``, from the one call site ``Form1.cs:1071``) — base
+# 480x480, overridden for the PMs its ladder names (``in_pm_ladder``).
+# Any other PM stays on the base; echoing it as an FBL is #176.  This used to be
+# a hand-written set that had drifted to 11 of the ladder's 21 PMs.
+_BULK_BASE_FBL = 72
+
+
+# JPEG start-of-frame markers carry the image's real dimensions.  C4/C8/CC
+# are Huffman/extension segments, not frames, so they are excluded.
+_JPEG_SOF_MARKERS = frozenset(
+    m for m in range(0xC0, 0xD0) if m not in (0xC4, 0xC8, 0xCC)
+)
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Read a JPEG's ``(width, height)`` from its SOF segment, or None.
+
+    Header-only: it walks the segment markers rather than decoding pixels, so
+    it is cheap enough to run on every frame and needs no imaging library at
+    the wire layer.  Returns None for RGB565 payloads and anything malformed.
+    """
+    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    i, n = 2, len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        if marker in _JPEG_SOF_MARKERS:
+            height = int.from_bytes(data[i + 5:i + 7], "big")
+            width = int.from_bytes(data[i + 7:i + 9], "big")
+            frame_log.debug("jpeg_dimensions: %dx%d", width, height)
+            return (width, height)
+        i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    log.debug("jpeg_dimensions: no SOF segment in %d bytes", n)
+    return None
+
+
+def bulk_profile(pm: int, sub: int, key: str = "?") -> tuple[int, DeviceProfile]:
+    """Resolve a mode-2 handshake's PM/SUB bytes to its ``(FBL, profile)``.
+
+    The one implementation of the C#'s ``FormCZTVInit(72, 2, pm, sub)``, which
+    serves BOTH wires that reach it: :meth:`BulkLcd.connect` and
+    :meth:`LyLcd.connect` (``Form1.cs:1071`` makes the one call for both), plus
+    the bench auditor (``dev/decompiler/audit_rotation.py``).  It is a pure
+    function of the two handshake bytes so an auditor can resolve a device
+    with no USB.
+
+    Keep it that way: LY carried a second copy that echoed an unknown PM as an
+    FBL and never set the portrait mount, and a hand-copy in the auditor
+    dropped the ``in_pm_ladder`` guard below and invented a phantom FBL 6,
+    which then reported our (reporter-confirmed, #137) FW360 Ultra rotation as
+    a 180° bug.  An oracle that re-implements the thing it audits proves
+    nothing about the code that ships.
+    """
+    if in_pm_ladder(pm, sub):
+        fbl = pm_to_fbl(pm, sub)
+    else:
+        log.info("bulk_profile %s: PM=%d SUB=%d is not in the C# pm ladder — "
+                 "FBL %d (480x480), as FormCZTVInit leaves it", key, pm, sub,
+                 _BULK_BASE_FBL)
+        fbl = _BULK_BASE_FBL
+    # get_profile spends the SUB byte on the mount and the catalog rotation.
+    base = get_profile(fbl, pm, sub)
+    # The FW360 Ultra (PM=6) mounts 180° rotated: a device-only baseline. (#137)
+    encode_baseline = resolve_encode_base(base, pm)
+    # The encoder is the PM's, not the FBL table's default, and it must be
+    # settled BEFORE the rotation is resolved: the two C# switches disagree on
+    # the same resolution (320x240 is base 0 under ImageToJpg, 90 under
+    # ImageTo565).
+    jpeg = pm not in _RGB565_PMS
+    rotation = resolve_encode_rotation(base.resolution, jpeg, sub)
+    log.info("bulk_profile %s: PM=%d SUB=%d → FBL %d %dx%d jpeg=%s encode "
+             "base %d° invert=%s baseline %d° mounted=%s", key, pm, sub, fbl,
+             base.width, base.height, jpeg, rotation.base, rotation.invert,
+             encode_baseline, base.portrait_mounted)
+    return fbl, dataclasses.replace(
+        base, jpeg=jpeg, encode_baseline=encode_baseline,
+        encode_base=rotation.base, encode_invert=rotation.invert,
+        big_endian=base.big_endian or pm in _BIG_ENDIAN_PMS)
+
+
+class BulkLcd(BaseBulkDevice, wire=Wire.BULK):
+    """Raw USB bulk LCD device (USBLCDNew protocol).
+
+    ``self._profile`` is cached at handshake.  It carries PM-derived resolution
+    from the FBL tables plus the Bulk-specific JPEG-vs-RGB565 override —
+    USBLCDNew uses JPEG (cmd=2) for every PM except 32, which forces RGB565
+    (cmd=3), and ``FBL_PROFILES`` alone wouldn't capture that.
+    """
+
+    _EP_WRITE = 0x01
+
+    def __init__(self, info: ProductInfo, transport: BulkTransport) -> None:
+        log.debug("__init__: info=%s transport=%s", info, transport)
+        super().__init__(info, transport)
+        self._pm: int = 0
+        self._sub: int = 0
+
+    # ── Device ABC ────────────────────────────────────────────────────
+
+    def _do_handshake(self) -> HandshakeResult:
+        resp = self._exchange(_HANDSHAKE_PAYLOAD, _HANDSHAKE_READ_SIZE,
+                              _HANDSHAKE_TIMEOUT_MS)
+        self._trace_reply(resp)
+
+        if len(resp) < 41 or resp[24] == 0:
+            log.error(
+                "BulkLcd %s: handshake validation failed (len=%d, resp[24]=%s)",
+                self.info.key, len(resp),
+                resp[24] if len(resp) > 24 else "N/A",
+            )
+            raise HandshakeError(
+                f"BulkLcd handshake validation failed "
+                f"(len={len(resp)}, resp[24]={resp[24] if len(resp) > 24 else 'N/A'})"
+            )
+
+        self._pm = resp[24]
+        self._sub = resp[36]
+
+        fbl, self._profile = bulk_profile(self._pm, self._sub, self.info.key)
+
+        return HandshakeResult(
+            resolution=self._profile.resolution,
+            model_id=self._pm,
+            pm_byte=self._pm,
+            sub_byte=self._sub,
+            fbl=fbl,
+            raw_response=bytes(resp),
+        )
+
+    def _handshake_detail(self, result: HandshakeResult) -> str:
+        """Which encoder the PM byte selected, and how the panel is mounted.
+
+        Appended to the ``handshake OK: PM=… SUB=… resolution=…`` line that
+        ``dev/tools/diagnose.py`` and ``diagnostics/debug_report.py`` scrape —
+        so the prefix shape is fixed and only this suffix may grow.
+
+        The mount is worth saying out loud.  It is knowable from the SUB byte
+        (see :func:`is_portrait_mounted`), it explains why an owner has to
+        rotate to 90° to get an upright picture, and it was invisible in every
+        report we had: #262 and #203 turned out to share ``PM=11 SUB=5`` and
+        nobody could see it, including me, until I read the C# catalog rule.
+        """
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
+        if self._profile is None:
+            return ""
+        encoder = " (JPEG)" if self._profile.jpeg else " (RGB565)"
+        if self._profile.portrait_mounted:
+            return f"{encoder} portrait-mounted"
+        return encoder
+
+    def _require_connected(self) -> None:
+        """Also demand the handshake profile — the header needs its geometry."""
+        super()._require_connected()
+        if self._profile is None:
+            log.error("BulkLcd %s: send() called before connect()", self.info.key)
+            raise TransportError(
+                f"BulkLcd {self.info.key} not connected — call connect() first"
+            )
+
+    def _warn_if_payload_shape_disagrees(
+        self, payload: bytes, width: int, height: int, *, jpeg: bool,
+    ) -> None:
+        """Say so when the frame we are about to send is not the shape we claim.
+
+        The header declares the profile's resolution, and the firmware uses it
+        to de-block the JPEG or interpret the RGB565 buffer — so a payload of a
+        different shape is painted only where the two overlap.  That is #262:
+        ``display send-image`` on an 854x480 panel emits a 480x854 JPEG under
+        an 854x480 header, and roughly a third of the screen lights up.
+
+        It failed silently, which is the worst part: the command reports
+        success, the log says the frame went out, and only the glass disagrees.
+        A warning here makes it self-reporting from any user's ``trcc report``,
+        with both shapes named, before anyone has to reproduce it.
+
+        Diagnostic only — the frame is still sent.  This must never be the
+        thing that stops a panel drawing.
+        """
+        actual = jpeg_dimensions(payload) if jpeg else None
+        if actual is not None and actual != (width, height):
+            log.warning(
+                "BulkLcd %s: frame is %dx%d but the header declares %dx%d — "
+                "the panel will paint only the overlap (#262)",
+                self.info.key, actual[0], actual[1], width, height,
+            )
+            return
+        if not jpeg:
+            expected = width * height * 2      # RGB565
+            if payload and len(payload) != expected:
+                log.warning(
+                    "BulkLcd %s: RGB565 frame is %d bytes but %dx%d needs %d "
+                    "— the panel will paint only part of it (#262)",
+                    self.info.key, len(payload), width, height, expected,
+                )
+                return
+        frame_log.debug("_warn_if_payload_shape_disagrees: %s matches %dx%d",
+                  self.info.key, width, height)
+
+    def _prepare_frame(self, payload: bytes) -> bytes:
+        """64-byte USBLCDNew header + payload.
+
+        Resolution + encoding come from the handshake-derived profile; the
+        header carries the actual w/h, which the firmware uses to de-block the
+        JPEG or interpret the RGB565 buffer.
+        """
+        if self._profile is None:      # pragma: no cover — _require_connected
+            raise TransportError(f"BulkLcd {self.info.key} has no profile")
+        width, height = self._profile.resolution
+        cmd = 2 if self._profile.jpeg else 3
+        self._warn_if_payload_shape_disagrees(
+            payload, width, height, jpeg=self._profile.jpeg)
+
+        header = bytearray(64)
+        header[0:4] = _HANDSHAKE_PAYLOAD[0:4]
+        struct.pack_into("<I", header, 4, cmd)
+        struct.pack_into("<I", header, 8, width)
+        struct.pack_into("<I", header, 12, height)
+        struct.pack_into("<I", header, 56, 2)
+        struct.pack_into("<I", header, 60, len(payload))
+
+        frame = bytes(header) + payload
+        frame_log.debug("BulkLcd %s: sending %d-byte frame (%s, %dx%d)",
+                  self.info.key, len(frame),
+                  "JPEG" if self._profile.jpeg else "RGB565", width, height)
+        return frame
+
+    def _write_frame(self, frame: bytes) -> bool:
+        """16 KiB bulk writes, with a ZLP delimiter on 512-byte alignment.
+
+        **The transferred count is checked.**  ``BulkTransport.write`` is
+        documented to return bytes transferred, and this discarded it and
+        returned ``True`` unconditionally — so a SHORT write, where the
+        transport accepted only part of a chunk without raising, was
+        indistinguishable from a full one.  The CLI then reported
+        ``Sent 204800 bytes`` from the payload length, i.e. what we intended,
+        never what moved.
+
+        That is the difference between "your panel is dead" and "we did not
+        finish writing to it", and we were telling users the first with no
+        evidence.  #284 is a reporter who saw every command succeed and the
+        glass never change, matched a known-working setup byte for byte, and
+        reasonably concluded his hardware was faulty.  It may well be — but
+        this code could not have told him otherwise.
+
+        ``<`` rather than ``!=``, copying ``HidLcd``: a transport may report
+        MORE than the chunk (Windows HID prepends a Report ID, so 512 reads
+        back as 513, and ``!=`` wrongly failed every Windows Type-2 frame —
+        #240).  Over-count is not a short write.
+
+        The ZLP is exempt: it is a zero-length delimiter, so there is no
+        payload to come up short.
+        """
+        frame_log.debug("_write_frame: frame=%s", Blob(frame))
+        for offset in range(0, len(frame), _WRITE_CHUNK_SIZE):
+            chunk = frame[offset:offset + _WRITE_CHUNK_SIZE]
+            if self._transport.write(
+                self._EP_WRITE, chunk, _WRITE_TIMEOUT_MS,
+            ) < len(chunk):
+                log.warning(
+                    "BulkLcd %s: SHORT write at offset %d of %d — the panel "
+                    "received only part of this frame, which looks identical "
+                    "to a dead screen from the outside",
+                    self.info.key, offset, len(frame),
+                )
+                return False
+        # Zero-length packet on 512-byte alignment (frame delimiter)
+        if len(frame) % 512 == 0:
+            self._transport.write(self._EP_WRITE, b"", _WRITE_TIMEOUT_MS)
+        return True

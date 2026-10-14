@@ -1,0 +1,199 @@
+"""CloudThemeBrowser — browse + download Thermalright's hosted catalog.
+
+User flow:
+* Pick a category from the dropdown (or "All" for everything).
+* Pick a theme from the list (id + category shown).
+* Pick a device + click Apply → download + load.
+
+Downloads happen in the foreground so the user sees the status update
+immediately ("Downloading a001…").  No background threads — keeps
+errors visible.  A long-running download will pin the UI; if/when that
+matters we move to a worker thread.
+
+Error messages are designed for non-technical readers: instead of
+``HttpFetchError: GET ... → URL error``, the user sees "Couldn't reach
+the theme server.  Check your internet connection."
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidgetItem,
+    QPushButton,
+    QVBoxLayout,
+)
+
+from ....core.commands import ListCloudThemes, LoadCloudTheme
+from ..assets import thumbnail_icon
+from ..device_picker import DevicePickerWidget
+from ._browser_base import AssetBrowserPanel
+
+log = logging.getLogger(__name__)
+
+_ALL_CATEGORIES = "all"
+
+
+class CloudThemeBrowser(AssetBrowserPanel):
+    """Browse + apply themes from Thermalright's cloud catalog."""
+
+    def _setup_ui(self) -> None:
+        log.debug("_setup_ui")
+        self._picker = DevicePickerWidget(
+            self.app, self._bus, kind_filter="lcd",
+            parent=self, selection=self._selection,
+        )
+
+        self._category = QComboBox(self)
+        self._category.addItem("All categories", userData=_ALL_CATEGORIES)
+        self._category.currentIndexChanged.connect(self._on_category_changed)
+
+        key_form = QFormLayout()
+        key_form.addRow("Device key:", self._picker)
+        key_form.addRow("Category:", self._category)
+
+        # Each catalog entry shows its extracted preview PNG
+        # (data/web/{w}{h}/<id>.png) in the grid every asset browser shares.
+        self._list = self._build_asset_list()
+        # Re-fill on device change so previews resolve to the picked device's
+        # resolution (the local/mask browsers do the same).
+        self._picker.key_changed.connect(self._on_key_changed)
+
+        self._refresh_btn = QPushButton("Refresh", self)
+        self._refresh_btn.clicked.connect(self.refresh)
+
+        self._apply_btn = QPushButton("Download + apply", self)
+        self._apply_btn.clicked.connect(self._on_apply)
+
+        button_row = QHBoxLayout()
+        button_row.addWidget(self._refresh_btn)
+        button_row.addWidget(self._apply_btn)
+        button_row.addStretch(1)
+
+        self._status = QLabel(
+            "Pick a category and refresh to load the catalog.", self,
+        )
+        self._status.setWordWrap(True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(8)
+        root.addLayout(key_form)
+        root.addWidget(self._list, stretch=1)
+        root.addLayout(button_row)
+        root.addWidget(self._status)
+
+        # Categories are static — populate the dropdown once on open
+        # (the catalog list dispatch returns them).
+        self._populate_categories()
+
+    # ── Populate ──────────────────────────────────────────────────────
+
+    def _populate_categories(self) -> None:
+        """Fill the category dropdown from the catalog (offline-safe)."""
+        log.debug("_populate_categories")
+        result = self.dispatch(ListCloudThemes(
+            category=_ALL_CATEGORIES, resolution=self._resolution()))
+        # Categories never change after this — they're a static table.
+        existing = {
+            self._category.itemData(i) for i in range(self._category.count())
+        }
+        for cat in result.categories:
+            if cat.prefix in existing:
+                continue
+            self._category.addItem(
+                f"{cat.name}  ({cat.count} themes)",
+                userData=cat.prefix,
+            )
+        # Fill the initial list too.
+        self._fill_list_from_result(result)
+
+    def refresh(self) -> None:
+        """Re-list the catalog -- the Refresh button, and the base's re-list
+        when the first-run archives (the preview PNGs) land."""
+        log.info("refresh")
+        self._on_category_changed()
+
+    def _on_category_changed(self) -> None:
+        log.info("_on_category_changed")
+        cat = str(self._category.currentData() or _ALL_CATEGORIES)
+        result = self.dispatch(ListCloudThemes(
+            category=cat, resolution=self._resolution()))
+        self._fill_list_from_result(result)
+
+    def _on_key_changed(self, _key: str) -> None:
+        log.info("_on_key_changed: re-filling cloud list for device resolution")
+        self._on_category_changed()
+
+    def _resolution(self) -> tuple[int, int] | None:
+        """The picked device's canvas resolution, or None if unresolvable."""
+        log.debug("_resolution")
+        key = self._picker.current_key()
+        # The one ladder (DeviceCanvas), as every sibling browser asks it.
+        # This walked a copy of it off DeviceState.
+        return self._target_resolution(key) if key else None
+
+    def _fill_list_from_result(self, result) -> None:
+        log.debug("_fill_list_from_result: result=%s", result)
+        self._list.clear()
+        # ListCloudThemes carries each entry's preview path (resolved for the
+        # device resolution we passed).  Thin UI: just read entry.preview.
+        for entry in result.themes:
+            item = QListWidgetItem(thumbnail_icon(Path(entry.preview)),
+                                   f"{entry.id}\n{entry.category_name}")
+            item.setData(Qt.ItemDataRole.UserRole, entry.id)
+            self._list.addItem(item)
+        if result.ok:
+            self._status.setText(result.message)
+        else:
+            self._status.setText(_user_friendly_error(result.message))
+
+    # ── Apply ─────────────────────────────────────────────────────────
+
+    def _on_apply(self) -> None:
+        log.info("_on_apply")
+        item = self._list.currentItem()
+        if item is None:
+            self._status.setText("Pick a theme from the list first.")
+            return
+        key = self._device_key()
+        if key is None:
+            return
+        theme_id = str(item.data(Qt.ItemDataRole.UserRole))
+        self._status.setText(
+            f"Downloading {theme_id}… this can take a few seconds on the "
+            "first download (subsequent loads are cached).",
+        )
+        self._status.repaint()
+        result = self.dispatch(LoadCloudTheme(key=key, theme_id=theme_id))
+        if result.ok:
+            self._status.setText(result.message)
+        else:
+            self._status.setText(_user_friendly_error(result.message))
+
+
+def _user_friendly_error(message: str) -> str:
+    """Translate adapter-layer error strings into plain-language hints."""
+    log.debug("_user_friendly_error: message=%s", message)
+    lower = message.lower()
+    if "url error" in lower or "timed out" in lower:
+        return (
+            "Couldn't reach the theme server.  Check your internet "
+            "connection and try Refresh again."
+        )
+    if "http 4" in lower:
+        return (
+            "The server says that theme isn't available right now.  "
+            "Try a different theme or refresh the list."
+        )
+    if "http 5" in lower:
+        return (
+            "The theme server returned an error.  Try again in a minute."
+        )
+    return message

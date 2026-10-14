@@ -1,0 +1,776 @@
+"""Pydantic request/response schemas for the REST API.
+
+Pydantic models live here (in the UI adapter) — they're HTTP concerns,
+not domain concerns.  Core ports stay framework-blind.
+"""
+from __future__ import annotations
+
+from typing import Generic, TypeVar
+
+from pydantic import BaseModel, ConfigDict, Field, RootModel
+
+from ...core.models import (
+    CUTTER_DEFAULT_FPS,
+    DEFAULT_REFRESH_INTERVAL_S,
+    MAX_ARGB_LEDS,
+    MAX_REFRESH_INTERVAL_S,
+    MIN_REFRESH_INTERVAL_S,
+    OVERLAY_DEFAULT_CLOCK_SOURCE,
+    OVERLAY_DEFAULT_COLOR,
+    OVERLAY_DEFAULT_FORMAT,
+    OVERLAY_DEFAULT_SIZE,
+    EffectDirection,
+    EffectSpeed,
+    FitMode,
+    FollowColors,
+    FollowMapping,
+    RamEffect,
+    RgbFollowMode,
+)
+from ...core.results import ConnectionIssuesResult, ConnectResult
+
+# =========================================================================
+# Wire views — a Result serialized verbatim, with device bytes as hex
+# =========================================================================
+
+T = TypeVar("T")
+
+
+class WireView(RootModel[T], Generic[T]):
+    """A Command Result on the wire, with raw device bytes as lowercase hex.
+
+    ``bytes`` has no JSON form, so every text boundary must choose an
+    encoding: the IPC socket picks base64 (lossless round-trip), and the
+    diagnostics print hex.  HTTP follows the diagnostics — a handshake read
+    off ``/devices/{key}/connect`` then matches, character for character,
+    the one in a ``trcc report`` pasted into an issue.
+
+    The choice is declared HERE, in the adapter, rather than on the Result:
+    ``core`` stays framework-blind (no pydantic import, no pydantic naming),
+    and pydantic propagates this config into the nested dataclasses it
+    serializes.  Subclass per Result — that binds ``T`` and gives the
+    OpenAPI component a name.
+    """
+    model_config = ConfigDict(ser_json_bytes="hex")
+
+
+class ConnectView(WireView[ConnectResult]):
+    """``POST /devices/{key}/connect`` — the whole ConnectResult.
+
+    Carries the handshake (including ``raw_response`` as hex), the LED
+    handshake, and the per-OS ``hints`` shown when a connect fails.
+    """
+
+
+class ConnectionIssuesView(WireView[ConnectionIssuesResult]):
+    """``GET /devices/issues`` — every device that failed to connect, with
+    the same per-OS hints the GUIs show."""
+
+
+# =========================================================================
+# Response shapes
+# =========================================================================
+
+
+class ResultBase(BaseModel):
+    ok: bool
+    message: str = ""
+
+
+class ProductSchema(BaseModel):
+    """HTTP view of ``ProductInfo`` — a projection, NOT a mirror.
+
+    Kept deliberately: ``ProductInfo.key`` is a derived ``@property``, and
+    serializing the dataclass directly emits fields only, so the identifier
+    every client keys on would silently vanish.  This view materializes it.
+    """
+    key: str
+    vid: int
+    pid: int
+    vendor: str
+    product: str
+    wire: str
+    kind: str
+    native_resolution: tuple[int, int]
+    orientations: tuple[int, ...]
+
+
+class DiscoverResponse(ResultBase):
+    products: list[ProductSchema] = []
+
+
+class ThemeResponse(ResultBase):
+    """Deliberately narrower than ``ThemeResult``: ``theme_path`` is a
+    server-side absolute path and is not disclosed over HTTP."""
+    key: str = ""
+    theme_name: str = ""
+    # SaveTheme sets this when the save was refused ONLY because a theme of
+    # that name exists — lets a REST client offer the same one-click
+    # overwrite the GUIs offer, instead of guessing from the message text.
+    target_exists: bool = False
+
+
+# ── Control-center settings ──────────────────────────────────────────
+
+
+# =========================================================================
+# Request bodies
+# =========================================================================
+
+
+class OrientationRequest(BaseModel):
+    degrees: int = Field(..., ge=0, le=270)
+
+
+class BrightnessRequest(BaseModel):
+    percent: int = Field(..., ge=0, le=100)
+
+
+class ThemeRequest(BaseModel):
+    path: str
+
+
+class LedColorsRequest(BaseModel):
+    colors: list[tuple[int, int, int]] = Field(..., min_length=1)
+    global_on: bool = True
+    brightness: int = Field(100, ge=0, le=100)
+
+
+class LedRenderRequest(BaseModel):
+    """Sensor-driven render.  ``color`` is an optional STATIC override."""
+    color: tuple[int, int, int] | None = None
+    phase: int = Field(0, ge=0)
+
+
+class LedModeRequest(BaseModel):
+    """Set the global animation mode for an LED device."""
+    mode: str = Field(
+        ..., pattern="^(static|breathing|colorful|rainbow|temp_linked|load_linked)$",
+        description="Case-insensitive mode name.",
+    )
+
+
+class LedColorRequest(BaseModel):
+    color: tuple[int, int, int] = Field(...)
+
+
+class LedBrightnessRequest(BaseModel):
+    percent: int = Field(..., ge=0, le=100)
+
+
+class LedTestModeRequest(BaseModel):
+    enabled: bool
+
+
+class LedSourceRequest(BaseModel):
+    """Source body for ``temp-source`` / ``load-source`` endpoints."""
+    source: str = Field(..., pattern="^(cpu|gpu)$")
+
+
+class LedToggleRequest(BaseModel):
+    """Toggle body — ``on`` is the desired state; ``zone`` targets one zone."""
+    on: bool
+    zone: int | None = Field(None, ge=0)
+
+
+class LedZoneColorRequest(BaseModel):
+    zone: int = Field(..., ge=0)
+    color: tuple[int, int, int]
+
+
+class LedZoneModeRequest(BaseModel):
+    """Per-zone variant of :class:`LedModeRequest`."""
+    zone: int = Field(..., ge=0)
+    mode: str = Field(
+        ..., pattern="^(static|breathing|colorful|rainbow|temp_linked|load_linked)$",
+        description="Case-insensitive mode name.",
+    )
+
+
+class LedZoneBrightnessRequest(BaseModel):
+    """Per-zone variant of :class:`LedBrightnessRequest`."""
+    zone: int = Field(..., ge=0)
+    percent: int = Field(..., ge=0, le=100)
+
+
+class LedZoneSyncRequest(BaseModel):
+    enabled: bool
+    interval_ticks: int | None = Field(None, ge=1)
+
+
+class LedSelectZoneRequest(BaseModel):
+    zone: int = Field(..., ge=0)
+
+
+# Tier-2 request/response shapes
+class ClockFormatRequest(BaseModel):
+    is_24h: bool
+
+
+class WeekStartRequest(BaseModel):
+    sunday_first: bool
+
+
+class MemoryRatioRequest(BaseModel):
+    ratio: int          # DDR multiplier: 1, 2, or 4
+
+
+class HddEnabledRequest(BaseModel):
+    enabled: bool
+
+
+class RgbFollowRequest(BaseModel):
+    """Pick what follows the cooler (#160): off, openrgb or ram.
+
+    ``host`` is OpenRGB's, a hostname or IP address only -- no scheme, path
+    or port -- so the API cannot point TRCC at an arbitrary URL.  Empty keeps
+    the saved one; ``port`` 0 likewise.
+    """
+    mode: RgbFollowMode
+    host: str = Field("", max_length=253, pattern=r"^[A-Za-z0-9.:\-]*$")
+    port: int = Field(0, ge=0, le=65535)
+    #: The device that leads -- an LCD's key, or "" for the first LED
+    #: cooler; None keeps the saved one.
+    source: str | None = Field(None, max_length=64,
+                               pattern=r"^([0-9a-fA-F]{4}:[0-9a-fA-F]{4}(@[\w.:-]+)?)?$")
+    mapping: FollowMapping | None = None
+    #: How a region of that picture becomes a light's colour; None keeps
+    #: the saved one.
+    colors: FollowColors | None = None
+    #: The lights that follow (refs); [] for every one; None keeps the saved.
+    targets: list[str] | None = Field(None, max_length=64)
+
+
+class RgbScanRequest(BaseModel):
+    """Where to look for OpenRGB -- a hostname or IP address only, as in
+    ``RgbFollowRequest``.  Empty keeps the saved address, ``port`` 0 likewise;
+    a new one is saved."""
+    host: str = Field(default="", max_length=253,
+                      pattern=r"^[A-Za-z0-9.:\-]*$")
+    port: int = Field(default=0, ge=0, le=65535)
+
+
+class AuraLedsRequest(BaseModel):
+    """How many LEDs ASUS Aura ARGB ``header`` (from 1) drives."""
+    header: int = Field(..., ge=1, le=16)
+    leds: int = Field(..., ge=0, le=MAX_ARGB_LEDS)
+
+
+class RamEffectRequest(BaseModel):
+    """One of the memory's own effects, saved on the sticks named by
+    ``sticks`` (refs; [] for every stick)."""
+    effect: RamEffect
+    sticks: list[str] = Field(default_factory=list, max_length=16)
+    speed: EffectSpeed = EffectSpeed.MEDIUM
+    direction: EffectDirection | None = None
+    colors: list[tuple[int, int, int]] = Field(default_factory=list,
+                                               max_length=2)
+    random_colors: bool = False
+    brightness: int = Field(255, ge=0, le=255)
+
+
+class RamLightingRequest(BaseModel):
+    """Switch the opt-in RAM-lighting grant on or off.  The App asks for the
+    password at the desktop; the API cannot grant the bus by itself."""
+    enabled: bool
+
+
+class SensorBindingRequest(BaseModel):
+    """One dashboard row: a display label bound to a sensor id."""
+    label: str = ""
+    #: Empty means "nothing here" — the row renders ``--`` and the next read
+    #: offers to auto-map it again.
+    sensor_id: str = ""
+    unit: str = ""
+
+
+class PanelRequest(BaseModel):
+    """One dashboard panel — a name and its rows."""
+    #: 1=CPU 2=GPU 3=Memory 4=Disk 5=Network 6=Fan; 0 for a custom panel.
+    #: Drives both the panel artwork and which auto-map targets apply.
+    category_id: int = 0
+    name: str = "Custom"
+    sensors: list[SensorBindingRequest] = Field(default_factory=list)
+
+
+class SensorDashboardRequest(BaseModel):
+    """A replacement dashboard layout.
+
+    Bulk replace, matching the Command — the caller sends the whole grid it
+    just edited, exactly as ``/display/overlay/config`` does for overlays.
+    """
+    panels: list[PanelRequest] = Field(default_factory=list)
+
+
+class BackgroundFileRequest(BaseModel):
+    """A file to use as the persistent background override."""
+    path: str
+
+
+class RenderDcRequest(BaseModel):
+    """Render a .dc standalone — no device, so the size is explicit."""
+    dc_path: str
+    width: int = Field(..., gt=0)
+    height: int = Field(..., gt=0)
+
+
+class ExportOverlayRequest(BaseModel):
+    """Copy a theme's overlay config file out."""
+    key: str
+    theme_name: str
+
+
+class ZoneSyncZonesRequest(BaseModel):
+    """Which zones take part in the zone-sync carousel."""
+    zones: list[bool]
+
+
+class BackgroundModeRequest(BaseModel):
+    mode: str = Field(..., pattern="^(theme|color|transparent)$")
+
+
+class OverlayBackgroundRequest(BaseModel):
+    color: tuple[int, int, int]
+
+
+# Tier 3 schemas
+class PauseVideoRequest(BaseModel):
+    paused: bool
+
+
+class SeekVideoRequest(BaseModel):
+    frame: int = Field(..., ge=0)
+
+
+class LoopVideoRequest(BaseModel):
+    loop: bool
+
+
+class MaskUploadRequest(BaseModel):
+    """Server-side mask path — same shape as theme import requests."""
+    source: str
+
+
+# Overlay element CRUD
+class OverlayElementSchema(BaseModel):
+    """One element inside a ``SetOverlayConfig`` body — request-side only.
+
+    Responses carry the domain ``OverlayElementEntry`` verbatim; this is the
+    validated *input* shape.
+    """
+    id: str
+    type: str
+    x: int = 0
+    y: int = 0
+    color: str = OVERLAY_DEFAULT_COLOR
+    size: int = OVERLAY_DEFAULT_SIZE
+    #: Font family; "" keeps the theme default (OverlayElement.font).
+    font: str = ""
+    bold: bool = False
+    italic: bool = False
+    text: str = ""
+    metric: str = ""
+    format: str = OVERLAY_DEFAULT_FORMAT
+    show_unit: bool = True
+    source: str = OVERLAY_DEFAULT_CLOCK_SOURCE
+
+
+class OverlayElementAddRequest(BaseModel):
+    type: str = Field(..., pattern="^(text|metric|clock)$")
+    x: int = 0
+    y: int = 0
+    color: str = OVERLAY_DEFAULT_COLOR
+    size: int = Field(OVERLAY_DEFAULT_SIZE, ge=1)
+    #: Font family; "" keeps the theme default (OverlayElement.font).
+    font: str = ""
+    bold: bool = False
+    italic: bool = False
+    text: str = ""
+    metric: str = ""
+    format: str = OVERLAY_DEFAULT_FORMAT
+    show_unit: bool = True
+    source: str = OVERLAY_DEFAULT_CLOCK_SOURCE
+    element_id: str = ""
+
+
+class OverlayElementUpdateRequest(BaseModel):
+    x: int | None = None
+    y: int | None = None
+    color: str | None = None
+    size: int | None = Field(None, ge=1)
+    #: Font family; ``None`` leaves the element's current typeface alone.
+    font: str | None = None
+    bold: bool | None = None
+    italic: bool | None = None
+    text: str | None = None
+    metric: str | None = None
+    format: str | None = None
+    show_unit: bool | None = None
+    source: str | None = None
+
+
+class OverlayConfigRequest(BaseModel):
+    elements: list[OverlayElementSchema] = []
+
+
+# Cloud themes
+class WebThemeSchema(BaseModel):
+    """One cloud-theme preview on disk for a resolution.
+
+    ``preview_url`` / ``download_url`` resolve against the API itself —
+    the preview is served by the ``/static/web`` mount.
+    """
+    id: str
+    category: str
+    preview_url: str
+    has_video: bool
+    download_url: str
+
+
+class CloudThemeLoadRequest(BaseModel):
+    theme_id: str
+
+
+class CloudThemeDownloadRequest(BaseModel):
+    """A cloud theme to cache locally, without applying it anywhere."""
+    theme_id: str
+    #: Oriented catalog size — 854x480 and 480x854 are different libraries.
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+class ThemeDcExportRequest(BaseModel):
+    """Which device's copy of the theme to export; the DC comes back as bytes.
+
+    ``key`` is required — the device's resolution scopes the source
+    lookup and the device's user-overlay elements are layered into the
+    exported DC.
+    """
+    key: str = Field(..., min_length=1)
+
+
+# Diagnostics
+class DebugReportRequest(BaseModel):
+    log_tail_lines: int = Field(1000, ge=0, le=100_000)
+
+
+# Update + upgrade
+class UpgradeRequest(BaseModel):
+    dry_run: bool = False
+
+
+# Slideshow + keepalive
+class SlideshowToggleRequest(BaseModel):
+    enabled: bool
+
+
+class SlideshowConfigureRequest(BaseModel):
+    themes: list[str] | None = None
+    interval_s: float | None = Field(None, ge=1.0)
+
+
+class KeepaliveRequest(BaseModel):
+    """Keepalive-loop parameters.
+
+    * ``count`` — how many iterations, at least 1.  The CLI's ``0`` (run until
+      Ctrl-C) cannot exist here: nothing interrupts an HTTP request, so it
+      held a server worker forever.
+    * ``interval_s`` — fast-resend cadence.  Default 0.150 s is below
+      the 2-3 s firmware-revert threshold on Bulk/LY devices.
+    * ``metric_interval_s`` — how often to re-render the overlay so
+      sensor values stay current.  Set to 0 to disable refresh.
+    """
+    count: int = Field(1, ge=1)
+    interval_s: float = Field(0.150, ge=0.05)
+    metric_interval_s: float = Field(1.0, ge=0.0)
+
+
+# First-run + legacy migration
+class ColorRequest(BaseModel):
+    """Solid-color frame request — three 0-255 channels."""
+    r: int = Field(..., ge=0, le=255)
+    g: int = Field(..., ge=0, le=255)
+    b: int = Field(..., ge=0, le=255)
+
+
+class FitModeRequest(BaseModel):
+    mode: str = Field(..., pattern="^(width|height|stretch)$")
+
+
+class OverlayRequest(BaseModel):
+    enabled: bool
+
+
+class SplitModeRequest(BaseModel):
+    mode: int = Field(..., ge=0, le=3)
+
+
+class GameModeRequest(BaseModel):
+    """Either half alone, or both; the threshold is the C#'s two digits."""
+    enabled: bool | None = None
+    threshold: int | None = Field(None, ge=0, le=99)
+
+
+class MaskApplyRequest(BaseModel):
+    """Path to a mask image file (resolved server-side for security)."""
+    path: str = Field(..., min_length=1)
+
+
+class MaskPositionRequest(BaseModel):
+    """Either both x,y set (offsets ≥ 0) or both None (clear)."""
+    x: int | None = Field(None, ge=0)
+    y: int | None = Field(None, ge=0)
+
+
+class MaskVisibilityRequest(BaseModel):
+    visible: bool
+
+
+class ThemeSaveRequest(BaseModel):
+    """Save the device's active theme under a new name (basename only)."""
+    key: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    #: Replace an existing theme of that name.  The save stages and swaps, so
+    #: an overwrite that fails leaves the previous theme intact -- which
+    #: delete-then-save, the only workaround a client had before this field,
+    #: does not.
+    overwrite: bool = False
+
+
+class DeleteThemeRequest(BaseModel):
+    """Delete a theme directory by absolute path.
+
+    Path-based to match the Command shape — the caller already has the
+    resolved path from a prior list call.  Server confines deletion to
+    ``user_content_dir`` regardless.
+    """
+    path: str = Field(..., min_length=1)
+
+
+class CreateThemeResponse(ResultBase):
+    """Result of a multipart-upload create-theme request.
+
+    ``animated`` is True when the uploaded background was a supported
+    video format (mp4/mov/webm/mkv/avi/zt) and a video playback was
+    started; False for a static image.  ``resolution`` echoes the
+    device's pixel size for the caller.
+    """
+    key: str = ""
+    animated: bool = False
+    resolution: str = ""
+
+
+class AutostartRequest(BaseModel):
+    """``POST /system/autostart`` body — toggle the OS autostart entry."""
+    enabled: bool
+    #: WHICH ui login brings up; ``None`` keeps the platform default.
+    #: OPTIONAL so a body that predates it stays valid.  NOT validated here on
+    #: purpose — pydantic accepts any string, so an unknown target would reach
+    #: the adapter and raise; ``EnableAutostart`` refuses it with a Result that
+    #: names the valid set.
+    target: str | None = None
+
+
+class AppStatusEntry(BaseModel):
+    """One device in :class:`AppStatusResponse`.
+
+    Small shape — full per-device state lives under the device-specific
+    snapshot routes (``/devices/{key}/display/snapshot`` for LCD,
+    ``/devices/{key}/led/snapshot`` for LED).
+    """
+    key: str = ""
+    product: str = ""
+    connected: bool = False
+
+
+class AppStatusResponse(ResultBase):
+    """Unified ``GET /system/status`` snapshot: app prefs + device counts.
+
+    Composed from in-process state — no Command dispatched.  Clients
+    that want full per-device detail follow up with the device-specific
+    snapshot routes.  Legacy parity with ``GET /app/status``.
+    """
+    language: str = ""
+    temp_unit: str = "C"
+    hdd_enabled: bool = False
+    refresh_interval_s: float = DEFAULT_REFRESH_INTERVAL_S
+    active_gpu: str | None = None
+    autostart_enabled: bool = False
+    lcd_devices: list[AppStatusEntry] = []
+    led_devices: list[AppStatusEntry] = []
+
+
+class DaemonKillResponse(ResultBase):
+    """Result of a ``POST /trcc/kill`` request."""
+
+
+class DaemonStatusResponse(ResultBase):
+    """Snapshot of the running daemon.
+
+    ``running=False`` indicates no daemon is bound on the singleton
+    socket; in that state the other fields are zero / undefined.
+    """
+    running: bool = False
+    pid: int = 0
+    uptime_seconds: int = 0
+    lcd_count: int = 0
+    led_count: int = 0
+
+
+class ScreencastStartRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/screencast/start``.
+
+    No region (all 0, the default) casts the device's stored one.
+    """
+    x: int = Field(0, ge=0)
+    y: int = Field(0, ge=0)
+    w: int = Field(0, ge=0)
+    h: int = Field(0, ge=0)
+    audio: bool = False
+
+
+class ScreencastRegionRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/screencast/region``."""
+    x: int = Field(..., ge=0, le=9999)
+    y: int = Field(..., ge=0, le=9999)
+    w: int = Field(..., ge=0, le=9999)
+    h: int = Field(..., ge=0, le=9999)
+    hide_border: bool | None = Field(
+        None, description="Hide the on-screen border; null leaves it as it is.")
+
+
+class VisualRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/visual``: the audio visual
+    (``GET /display/visuals``), its preset and slider values by name;
+    '' stops it."""
+    visual: str = Field("", max_length=64, pattern=r"^[a-z0-9-]*$")
+    preset: str = Field("", max_length=512)
+    sliders: dict[str, float] = Field(default_factory=dict, max_length=16)
+
+
+class VisualSettingsRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/visual/settings``: slider
+    values by name for the playing visual."""
+    sliders: dict[str, float] = Field(default_factory=dict, max_length=16)
+
+
+class VisualPictureRequest(BaseModel):
+    """Body for ``POST /display/visual-picture``: the centre picture on or
+    off, and its fire (0 to 1) -- each only when given."""
+    shown: bool | None = None
+    fire: float | None = Field(None, ge=0.0, le=1.0)
+
+
+class VisualCenterRequest(BaseModel):
+    """Body for ``POST /display/visual-center``: a picture in TRCC's own
+    folders; '' for none."""
+    path: str = Field("", max_length=1024)
+
+
+class MediaPlayerRequest(BaseModel):
+    """Body for ``POST /devices/{key}/display/media-player``."""
+    uri: str = Field(
+        "", description=("A local file path, or an http/https/rtsp URL played "
+                         "live. '' clears."),
+    )
+
+
+class VideoStatusResponse(ResultBase):
+    """Current playback state for a device's video background override.
+
+    ``playing`` is False when there is no active playback for the
+    device; the other fields are zero / empty in that case.  Read-only —
+    state-changing routes are :class:`PlayVideo` / :class:`StopVideo` /
+    :class:`PauseVideo` / :class:`SeekVideo` / :class:`LoopVideo`.
+    """
+    key: str = ""
+    playing: bool = False
+    paused: bool = False
+    cursor: int = 0
+    frame_count: int = 0
+    fps: int = 0
+    loop: bool = False
+
+
+class BootAnimationRequest(BaseModel):
+    """Boot-animation upload — a directory of frames + per-frame dwell."""
+    frames_dir: str = Field(
+        ..., description="Filesystem directory containing 1–248 image frames "
+                         "(PNG / JPG / BMP / WebP), sorted alphabetically.",
+    )
+    delay_ds: int = Field(
+        10, ge=1, le=25,
+        description="Uniform dwell per frame in deciseconds (10 = 1.0 s, max 25 = 2.5 s).",
+    )
+
+
+class PlayVideoRequest(BaseModel):
+    """Play a video as a device's background. Server-side path."""
+    path: str = Field(..., min_length=1)
+    fps: int = Field(15, ge=1, le=60)
+
+
+class LoadVideoRequest(BaseModel):
+    """Stage a video as a one-file theme and apply it. Server-side path."""
+    path: str = Field(..., min_length=1)
+    start_ms: int = Field(0, ge=0)
+    end_ms: int | None = Field(None, ge=1)
+    rotation: int = Field(0)
+
+
+class ExportVideoRequest(BaseModel):
+    """Encode a clip into a loose ``Theme.zt`` for the device's panel.
+
+    No target resolution: ``ExportVideoClip`` resolves the canvas from
+    the device (or the product registry), so a client cannot supply a
+    size that disagrees with the panel.
+    """
+    path: str = Field(..., min_length=1)
+    start_ms: int = Field(0, ge=0)
+    #: ``None`` means "to the end of the source", probed server-side.
+    end_ms: int | None = Field(None, ge=1)
+    rotation: int = Field(0)
+    #: ``None`` is the auto fit -- scale inside the panel, never crop.
+    #: ``width`` / ``height`` pin that axis and crop the overflow (the C#
+    #: buttonTPJCW / buttonTPJCH arms); ``stretch`` fills both.  A ``.zt`` is
+    #: encoded AT canvas size, so this choice is baked in and the device's
+    #: render-time ``fit_mode`` cannot recover it afterwards.
+    fit_mode: FitMode | None = None
+    #: Frames per second: 15 (the Windows app's default) or 24.
+    fps: int = Field(CUTTER_DEFAULT_FPS)
+
+
+# ── Control-center settings ──────────────────────────────────────────
+
+
+class TempUnitRequest(BaseModel):
+    unit: str = Field(..., pattern="^[CF]$")
+
+
+class LanguageRequest(BaseModel):
+    language: str = Field(..., min_length=1)
+
+
+class GpuDeviceRequest(BaseModel):
+    gpu_key: str = Field("", description="Sensor key, e.g. 'nvidia:0'. '' = auto.")
+
+
+class RefreshIntervalRequest(BaseModel):
+    seconds: float = Field(
+        ..., ge=MIN_REFRESH_INTERVAL_S, le=MAX_REFRESH_INTERVAL_S,
+    )
+
+
+class TimeFormatRequest(BaseModel):
+    fmt: str = Field(..., pattern="^(12h|24h)$")
+    key: str | None = None
+
+
+class DateFormatRequest(BaseModel):
+    fmt: str = Field(..., min_length=1)
+    key: str | None = None
+
+
+class DiskDeviceRequest(BaseModel):
+    """Body for ``POST /system/disk-sensors/active``."""
+    disk_key: str = ""

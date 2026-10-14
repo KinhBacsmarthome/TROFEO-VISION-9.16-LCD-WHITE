@@ -1,0 +1,1449 @@
+"""CLI `display` group — orientation, brightness, theme, send."""
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+
+import typer
+
+from ...core._colors import parse_hex
+from ...core.commands import (
+    AddOverlayElement,
+    ApplyMask,
+    BuildPreview,
+    ConfigureSlideshow,
+    ConnectDevice,
+    ControlCenterSnapshot,
+    DeleteOverlayElement,
+    DiscoverDevices,
+    EnableOverlay,
+    ExportVideoClip,
+    KeepAliveLoop,
+    LcdSnapshot,
+    ListMasks,
+    ListVisuals,
+    LoadImage,
+    LoadTheme,
+    LoadVideo,
+    LoopVideo,
+    PauseVideo,
+    PlayVideo,
+    PlayVisual,
+    ProbeVideoDuration,
+    RenderDcStandalone,
+    ResolveOverlay,
+    RestoreDeviceState,
+    SeekVideo,
+    SendColor,
+    SendImage,
+    SetBackground,
+    SetBackgroundMode,
+    SetBrightness,
+    SetFitMode,
+    SetGameMode,
+    SetMaskPosition,
+    SetMaskVisible,
+    SetMediaPlayer,
+    SetOrientation,
+    SetOverlayBackground,
+    SetScreencastRegion,
+    SetSlideshow,
+    SetSplitMode,
+    SetVisualCenter,
+    SetVisualPicture,
+    SetVisualSettings,
+    SleepDevice,
+    StartScreencast,
+    StopScreencast,
+    StopVideo,
+    StopVisual,
+    TickDisplay,
+    ToggleVideo,
+    UpdateOverlayElement,
+    UploadBootAnimation,
+    UploadCustomMask,
+    VideoStatus,
+    VisualTile,
+)
+from ...core.errors import TrccError
+from ...core.models import CUTTER_DEFAULT_FPS, MEDIA, FitMode, MediaKind
+from ..presentation.display_source import describe_game_mode, describe_source
+from ._ctx import (
+    daemon_owns_the_panels,
+    dispatch_echo,
+    emit_json,
+    get_app,
+    parse_on_off,
+    recover_or_exit,
+    resolution_for,
+)
+
+log = logging.getLogger(__name__)
+
+#: Ceiling on ``--wait``.  The encoder allows ffmpeg 600 s and a
+#: five-minute clip is the documented maximum, so a terminal that
+#: gave up sooner would report a failure that had not happened.
+_EXPORT_WAIT_S = 660.0
+
+app = typer.Typer(help="Configure device display (theme / orientation / brightness).",
+                  no_args_is_help=True)
+
+
+@app.command("set-orientation")
+def set_orientation(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    degrees: int = typer.Argument(..., help="Rotation: 0, 90, 180, or 270"),
+) -> None:
+    """Set per-device rotation."""
+    log.info("cli display set-orientation: key=%s degrees=%s", key, degrees)
+    dispatch_echo(SetOrientation(key=key, degrees=degrees))
+
+
+@app.command("set-brightness")
+def set_brightness(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    percent: int = typer.Argument(..., help="Brightness 0–100"),
+) -> None:
+    """Set per-device display brightness."""
+    log.info("cli display set-brightness: key=%s percent=%s", key, percent)
+    dispatch_echo(SetBrightness(key=key, percent=percent))
+
+
+def _parse_hex_color(hex_str: str) -> tuple[int, int, int] | None:
+    """Parse a 6-char hex color into ``(r, g, b)``; ``None`` on miss."""
+    log.debug("_parse_hex_color: hex_str=%s", hex_str)
+    try:
+        r, g, b, _a = parse_hex(hex_str)
+    except ValueError:
+        return None
+    return (r, g, b)
+
+
+@app.command("color")
+def color(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    hex_color: str = typer.Argument(..., metavar="HEX",
+                                    help="Hex color (e.g. ff0000 for red)"),
+) -> None:
+    """Display a single solid color on the LCD.
+
+    Smallest path that exercises the full wire chain (handshake-derived
+    profile + DisplayService encoder + Device.send). Useful diagnostic
+    for confirming a device class works end-to-end on real hardware.
+    """
+    log.info("cli display color: key=%s hex=%s", key, hex_color)
+    rgb = _parse_hex_color(hex_color)
+    if rgb is None:
+        typer.echo(f"Invalid hex color: {hex_color!r} "
+                   "(expected 6 hex chars, e.g. ff0000)", err=True)
+        raise typer.Exit(code=2)
+    r, g, b = rgb
+    app_obj = get_app()
+    result = app_obj.dispatch(SendColor(key=key, r=r, g=g, b=b))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("set-fit-mode")
+def set_fit_mode(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    mode: str = typer.Argument(
+        ..., help="Fit mode: 'width' (letterbox), 'height' (pillarbox), 'stretch'",
+    ),
+) -> None:
+    """Set how the background fits the canvas."""
+    log.info("cli display set-fit-mode: key=%s mode=%s", key, mode)
+    dispatch_echo(SetFitMode(key=key, mode=mode.lower()))
+
+
+@app.command("overlay")
+def overlay(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    state: str = typer.Argument(..., help="'on' or 'off'"),
+) -> None:
+    """Toggle the metric overlay layer."""
+    log.info("cli display overlay: key=%s state=%s", key, state)
+    state_normalized = state.lower()
+    if state_normalized in ("on", "true", "1", "yes"):
+        enabled = True
+    elif state_normalized in ("off", "false", "0", "no"):
+        enabled = False
+    else:
+        typer.echo(f"Invalid state: {state!r} (expected on/off)", err=True)
+        raise typer.Exit(code=2)
+    dispatch_echo(EnableOverlay(key=key, enabled=enabled))
+
+
+@app.command("apply-mask")
+def apply_mask(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Image file path (png/jpg/jpeg/bmp/webp)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Override the active theme's mask with a user-supplied image."""
+    log.info("cli display apply-mask: key=%s path=%s", key, path)
+    app_obj = get_app()
+    result = app_obj.dispatch(ApplyMask(key=key, path=path))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("mask-position")
+def mask_position(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    x: int = typer.Argument(..., help="X offset in pixels (≥ 0)"),
+    y: int = typer.Argument(..., help="Y offset in pixels (≥ 0)"),
+) -> None:
+    """Position the mask overlay within the canvas."""
+    log.info("cli display mask-position: key=%s x=%s y=%s", key, x, y)
+    dispatch_echo(SetMaskPosition(key=key, x=x, y=y))
+
+
+@app.command("mask-visible")
+def mask_visible(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    state: str = typer.Argument(..., help="'on' or 'off'"),
+) -> None:
+    """Toggle mask visibility."""
+    log.info("cli display mask-visible: key=%s state=%s", key, state)
+    state_normalized = state.lower()
+    if state_normalized in ("on", "true", "1", "yes", "show"):
+        visible = True
+    elif state_normalized in ("off", "false", "0", "no", "hide"):
+        visible = False
+    else:
+        typer.echo(f"Invalid state: {state!r} (expected on/off)", err=True)
+        raise typer.Exit(code=2)
+    dispatch_echo(SetMaskVisible(key=key, visible=visible))
+
+
+@app.command("split-mode")
+def split_mode(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    mode: int = typer.Argument(..., help="0 (off), 1 (style A), 2 (B), 3 (C)"),
+) -> None:
+    """Set the Dynamic Island style (widescreen panels only)."""
+    log.info("cli display split-mode: key=%s mode=%s", key, mode)
+    dispatch_echo(SetSplitMode(key=key, mode=mode))
+
+
+@app.command("game")
+def game(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    state: str | None = typer.Argument(
+        None, help="'on' / 'off'; omit to change only the threshold"),
+    threshold: int | None = typer.Option(
+        None, "--threshold", min=0, max=99,
+        help="CPU usage % above which game mode takes the panel (0-99)"),
+) -> None:
+    """Game mode: while CPU usage stays above the threshold for 11 seconds,
+    the panel shows only its overlay, on black, until it falls back."""
+    log.info("cli display game: key=%s state=%s threshold=%s",
+             key, state, threshold)
+    if state is not None and state.lower() not in ("on", "off"):
+        raise typer.BadParameter(f"state must be 'on' or 'off', got {state!r}")
+    dispatch_echo(SetGameMode(
+        key=key, enabled=None if state is None else state.lower() == "on",
+        threshold=threshold))
+
+
+@app.command("load-image")
+def load_image(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Image file (PNG / JPG / JPEG / BMP / WEBP)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Show a single image on the LCD.
+
+    Stages the image as a one-file theme so the existing render pipeline
+    handles fit + brightness + rotation.  Re-runnable: subsequent loads
+    of the same image are cheap (no re-copy).
+    """
+    log.info("cli display load-image: key=%s path=%s", key, path)
+    # LoadImage → LoadTheme renders on the wire; attach the device first so a
+    # fresh CLI process doesn't fail "not connected".  Idempotent.  (#150)
+    app_obj = get_app()
+    result = app_obj.dispatch(LoadImage(key=key, path=path))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("load-video")
+def load_video(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Video file (MP4 / MOV / WEBM / MKV / AVI / ZT)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+    start_ms: int = typer.Option(
+        0, "--start", "-s", min=0,
+        help="Cut from here, in milliseconds (default: 0).",
+    ),
+    end_ms: int = typer.Option(
+        None, "--end", "-e", min=1,
+        help="Cut to here, in milliseconds (default: the file's end).",
+    ),
+    rotation: int = typer.Option(
+        0, "--rotation", "-r",
+        help="Rotation in degrees: 0 / 90 / 180 / 270.",
+    ),
+) -> None:
+    """Play a video on the LCD as a single-video theme.
+
+    The file plays as it is, with the device's fit (``display
+    set-fit-mode``) applied live.  Any of --start / --end / --rotation cuts
+    it instead: that clip is baked into a ``Theme.zt`` at the panel's size
+    and the current fit, as the Windows trimmer does (.zt inputs always go
+    in as they are).  Device must be attached so we know the panel's size.
+    """
+    log.info(
+        "cli display load-video: key=%s path=%s start_ms=%s end_ms=%s "
+        "rotation=%s",
+        key, path, start_ms, end_ms, rotation,
+    )
+    result = get_app().dispatch(LoadVideo(
+        key=key, path=path, start_ms=start_ms, end_ms=end_ms,
+        rotation=rotation,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("export-video")
+def export_video(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Video file (MP4 / MOV / WEBM / MKV / AVI)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+    start_ms: int = typer.Option(
+        0, "--start", "-s", min=0,
+        help="Clip start in milliseconds (default: 0).",
+    ),
+    end_ms: int = typer.Option(
+        None, "--end", "-e", min=1,
+        help="Clip end in milliseconds (default: the whole clip).",
+    ),
+    rotation: int = typer.Option(
+        0, "--rotation", "-r",
+        help="Rotation in degrees: 0 / 90 / 180 / 270.",
+    ),
+    fit: FitMode = typer.Option(
+        None, "--fit", "-f",
+        help="Fit the clip to the panel: 'width' / 'height' pin that axis "
+             "and crop the overflow, 'stretch' fills both.  Omit for the "
+             "auto fit -- scale inside the panel, never crop.  A .zt is "
+             "encoded AT canvas size, so this is baked in.",
+    ),
+    fps: int = typer.Option(
+        CUTTER_DEFAULT_FPS, "--fps",
+        help="Frames per second: 15 (default, as the Windows app) or 24.",
+    ),
+    wait: bool = typer.Option(
+        True, "--wait/--no-wait",
+        help="Follow progress until the encode finishes (default), or "
+             "print the token and return.",
+    ),
+) -> None:
+    """Encode a clip into a loose ``Theme.zt`` sized for the device's panel.
+
+    Distinct from ``load-video``, which stages a whole theme directory and
+    applies it.  This gives you the ``.zt`` file itself — to set as a
+    background, to keep, or to hand to ``set-background``.
+
+    The encode runs in the background and reports on the event bus, so
+    ``--wait`` follows it and ``--no-wait`` returns immediately with the
+    token.  The work happens in the shared App and this terminal only
+    watches it, which is why the progress can be followed from a process
+    that is not doing the encoding.
+    """
+    log.info("cli display export-video: key=%s path=%s start_ms=%s end_ms=%s "
+             "rotation=%s fps=%s wait=%s", key, path, start_ms, end_ms,
+             rotation, fps, wait)
+    app_obj = get_app()
+    # Subscribe BEFORE dispatching: a fast encode can finish between the
+    # dispatch returning and a later subscribe, and the finished event is
+    # published once and not replayed.
+    from ...core.events import Event, VideoExportFinished, VideoExportProgress
+    outcome: list[VideoExportFinished] = []
+    token = ""
+
+    def on_progress(event: Event) -> None:
+        if isinstance(event, VideoExportProgress) and event.token == token:
+            log.debug("export-video progress: %d%% %s",
+                      event.percent, event.message)
+            typer.echo(f"  {event.percent:3d}%  {event.message}")
+
+    def on_finished(event: Event) -> None:
+        if isinstance(event, VideoExportFinished) and event.token == token:
+            log.info("export-video finished: ok=%s path=%s",
+                     event.ok, event.path)
+            outcome.append(event)
+
+    if wait:
+        app_obj.events.subscribe(VideoExportProgress, on_progress)
+        app_obj.events.subscribe(VideoExportFinished, on_finished)
+
+    result = app_obj.dispatch(ExportVideoClip(
+        key=key, path=path, start_ms=start_ms, end_ms=end_ms,
+        rotation=rotation, fit_mode=fit, fps=fps,
+    ))
+    if not result.ok:
+        typer.echo(result.message, err=True)
+        raise typer.Exit(code=1)
+    token = result.token
+    if not wait:
+        typer.echo(f"{result.token}\t{result.source}")
+        return
+
+    typer.echo(f"Encoding {path.name} at "
+               f"{result.target_w}x{result.target_h}…")
+    deadline = time.monotonic() + _EXPORT_WAIT_S
+    while not outcome and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not outcome:
+        typer.echo(f"Timed out after {_EXPORT_WAIT_S:.0f}s waiting for the "
+                   f"encode (token {result.token}).", err=True)
+        raise typer.Exit(code=1)
+    finished = outcome[0]
+    typer.echo(finished.message)
+    if not finished.ok:
+        raise typer.Exit(code=1)
+    typer.echo(finished.path)
+
+
+@app.command("video-duration")
+def video_duration(
+    path: Path = typer.Argument(
+        ..., help="Video file to probe", exists=True,
+        file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Print a video's duration in milliseconds (via ffprobe)."""
+    log.info("cli display video-duration: path=%s", path)
+    result = get_app().dispatch(ProbeVideoDuration(path=path))
+    typer.echo(result.duration_ms if result.ok else result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("load-theme")
+def load_theme(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(..., help="Theme directory",
+                                exists=True, file_okay=False, dir_okay=True),
+) -> None:
+    """Load a theme: parse, persist, render+send if device is connected."""
+    log.info("cli display load-theme: key=%s path=%s", key, path)
+    app_obj = get_app()
+    result = app_obj.dispatch(LoadTheme(key=key, path=path))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("play-video")
+def play_video(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Video path (mp4/mov/webm/mkv/avi/zt)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+    fps: int = typer.Option(
+        15, "--fps", help="Decode FPS (default: 15)",
+    ),
+) -> None:
+    """Decode a video and start playing it on the device.
+
+    Overrides the active theme's background until ``stop-video`` runs.
+    Frames advance on each ``display play`` tick.
+    """
+    log.info("cli display play-video: key=%s path=%s fps=%s", key, path, fps)
+    app_obj = get_app()
+    # PlayVideo persists the background path itself — reaching for
+    # app_obj.settings here crashed under TRCC_DAEMON=1, where AppProxy
+    # exposes dispatch() only (#249).
+    result = app_obj.dispatch(PlayVideo(key=key, path=path, fps=fps))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("stop-video")
+def stop_video(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Clear the video playback override (returns to the active theme)."""
+    log.info("cli display stop-video: key=%s", key)
+    result = get_app().dispatch(StopVideo(key=key))
+    typer.echo(result.message)
+
+
+@app.command("boot-anim")
+def boot_anim(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922 (SCSI only)"),
+    frames_dir: Path = typer.Argument(
+        ..., help="Directory of image frames (sorted alphabetically; 1–248 frames)",
+        exists=True, file_okay=False, dir_okay=True,
+    ),
+    delay_ds: int = typer.Option(
+        10, "--delay", "-d", min=1, max=25,
+        help="Dwell time per frame in deciseconds (10 = 1.0 s, max 25 = 2.5 s)",
+    ),
+) -> None:
+    """Upload a multi-frame compressed boot animation to a SCSI LCD's flash.
+
+    The animation plays from device flash on every boot until overwritten.
+    Only SCSI panels with 240×240 / 240×320 / 320×240 / 320×320 resolution
+    support boot animations.
+
+    Frame files are picked up in alphabetical order from *frames_dir* —
+    PNG / JPG / JPEG / BMP / WebP.  Each frame uses the same dwell time
+    via --delay (per-frame delays via the API only).
+    """
+    log.info(
+        "cli display boot-anim: key=%s frames_dir=%s delay_ds=%s",
+        key, frames_dir, delay_ds,
+    )
+    frame_paths = sorted(
+        p for p in frames_dir.iterdir()
+        if p.is_file() and MEDIA.kind_of(p) is MediaKind.IMAGE
+    )
+    if not frame_paths:
+        typer.echo(f"No supported image frames found under {frames_dir}", err=True)
+        raise typer.Exit(code=1)
+
+    delays = [delay_ds] * len(frame_paths)
+    typer.echo(f"Uploading {len(frame_paths)} boot-animation frames to {key} "
+               f"({delay_ds * 0.1:.1f}s each)…")
+    app_obj = get_app()
+    result = app_obj.dispatch(UploadBootAnimation(
+        key=key, frame_paths=frame_paths, delays_ds=delays,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("play")
+def play(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    interval: float = typer.Option(
+        None, "--interval", "-i",
+        help="Tick interval in seconds (default: AppSettings.refresh_interval_s)",
+    ),
+) -> None:
+    """Run the render-and-send ticker until Ctrl-C.
+
+    Dispatches TickDisplay every tick with live sensors — that Command
+    advances an active video playback and renders, so the loop needs no
+    handle on MediaService.  Keeps SCSI devices from timing out
+    (static-blink fix).  Stops cleanly on SIGINT.
+    """
+    log.info("cli display play: key=%s interval=%s", key, interval)
+    import time
+
+    app_obj = get_app()
+    # Self-prime: a fresh CLI process holds no in-memory theme, so RenderAndSend
+    # would fail "No active theme".  The restore also connects the device
+    # (USES_DEVICE) and fails with the reason when it cannot.  (#150)
+    # Unconditional on purpose, unlike keepalive: "play" asks for the SAVED
+    # display, so it replaces a push; keepalive keeps whatever is showing.
+    restore = app_obj.dispatch(RestoreDeviceState(key=key))
+    if not restore.ok:
+        typer.echo(restore.message, err=True)
+        raise typer.Exit(code=1)
+    if daemon_owns_the_panels(app_obj):
+        # The daemon runs the session loops: its VideoLoop paces video and its
+        # MetricsLoop refreshes the rest.  Ticking here as well would advance
+        # every video frame twice (#249).
+        log.info("cli display play: %s is driven by the daemon — not ticking", key)
+        typer.echo(f"The daemon is playing {key} — it keeps the panel updated.")
+        return
+    if interval is not None:
+        tick_s = interval
+    else:
+        # Via the Command bus, not app_obj.settings — under TRCC_DAEMON=1
+        # app_obj is an AppProxy that exposes dispatch() only, so touching
+        # .settings raised AttributeError and `display play` died before the
+        # first frame (#249).
+        tick_s = app_obj.dispatch(ControlCenterSnapshot()).refresh_interval_s
+    tick_s = max(0.05, tick_s)
+
+    typer.echo(f"Playing on {key} at {tick_s:.2f}s intervals (Ctrl-C to stop)…")
+    try:
+        while True:
+            # Video-paced tick: ONE Command advances the cursor and renders, so
+            # a play-video override animates headlessly (#239) without this loop
+            # reaching into MediaService — `app_obj.media` raised AttributeError
+            # under TRCC_DAEMON=1, where app_obj is an AppProxy exposing
+            # dispatch() only (#249).  The Result carries the cursor and the
+            # per-frame interval, so the loop paces itself off the video when
+            # one is playing and off the metrics interval otherwise.
+            try:
+                result = app_obj.dispatch(TickDisplay(key=key))
+            except TrccError as e:
+                recover_or_exit(app_obj, key, str(e))
+                continue
+            if not result.ok:
+                # A lost panel is reconnected, not the end of the command (#270).
+                recover_or_exit(app_obj, key, result.message)
+                continue
+            if result.frame_count is not None:
+                typer.echo(
+                    f"  sent {result.bytes_sent} bytes (theme={result.theme_name!r}"
+                    f", video frame {result.cursor}/{result.frame_count})")
+                time.sleep(max(0.02, (result.interval_ms or 33) / 1000.0))
+            else:
+                typer.echo(f"  sent {result.bytes_sent} bytes "
+                           f"(theme={result.theme_name!r})")
+                time.sleep(tick_s)
+    except KeyboardInterrupt:
+        typer.echo("\nStopped.")
+
+
+@app.command("pause-video")
+def pause_video(
+    key: str = typer.Argument(..., help="Device key"),
+    state: str = typer.Argument(..., help="'on' (pause) or 'off' (resume)"),
+) -> None:
+    """Pause or resume video playback."""
+    log.info("cli display pause-video: key=%s state=%s", key, state)
+    if state.lower() not in ("on", "off"):
+        raise typer.BadParameter(f"state must be 'on' or 'off', got {state!r}")
+    result = get_app().dispatch(
+        PauseVideo(key=key, paused=state.lower() == "on"),
+    )
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("toggle-video")
+def toggle_video(
+    key: str = typer.Argument(..., help="Device key"),
+) -> None:
+    """Flip video playback between paused / playing (single-verb helper)."""
+    log.info("cli display toggle-video: key=%s", key)
+    dispatch_echo(ToggleVideo(key=key))
+
+
+@app.command("seek-video")
+def seek_video(
+    key: str = typer.Argument(..., help="Device key"),
+    frame: int = typer.Argument(..., help="Frame index to jump to"),
+) -> None:
+    """Jump the playback cursor to a specific frame."""
+    log.info("cli display seek-video: key=%s frame=%s", key, frame)
+    dispatch_echo(SeekVideo(key=key, frame=frame))
+
+
+@app.command("video-status")
+def video_status(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Report what the device's video playback is doing (read-only).
+
+    Answers "is a video loaded, where is it, how fast" without rendering a
+    frame — the query half of the video surface, alongside ``play-video`` /
+    ``stop-video`` / ``pause-video`` / ``seek-video`` / ``loop-video``.
+    """
+    log.info("cli display video-status: key=%s", key)
+    dispatch_echo(VideoStatus(key=key))
+
+
+@app.command("loop-video")
+def loop_video(
+    key: str = typer.Argument(..., help="Device key"),
+    state: str = typer.Argument(..., help="'on' (loop) or 'off' (single-pass)"),
+) -> None:
+    """Toggle whether video wraps at the end or sticks at the last frame."""
+    log.info("cli display loop-video: key=%s state=%s", key, state)
+    dispatch_echo(LoopVideo(key=key, loop=parse_on_off(state)))
+
+
+@app.command("upload-mask")
+def upload_mask(
+    key: str = typer.Argument(..., help="Device key"),
+    source: Path = typer.Argument(
+        ..., help="Mask image file to copy + apply",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Copy a mask into user_content_dir/masks and apply it to the device."""
+    log.info("cli display upload-mask: key=%s source=%s", key, source)
+    result = get_app().dispatch(UploadCustomMask(key=key, source=source))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("list-masks")
+def list_masks(
+    key: str | None = typer.Argument(
+        None,
+        help=("Device key (e.g. 0402:3922) — its resolution scopes the scan. "
+              "Required unless --dir is given."),
+    ),
+    directory: Path | None = typer.Option(
+        None, "--dir", "-d",
+        help="Override: scan an explicit directory instead of the device's mask dirs",
+    ),
+) -> None:
+    """List mask images for the device's resolution.
+
+    By default, scans both the cloud-downloaded mask dir
+    (``data/web/zt{W}{H}``) and the user-created mask dir
+    (``user_content_dir/data/web/zt{W}{H}``).
+    """
+    log.info("cli display list-masks: key=%s directory=%s", key, directory)
+    if directory is not None:
+        result = get_app().dispatch(ListMasks(directory=directory))
+    elif key:
+        result = get_app().dispatch(ListMasks(resolution=resolution_for(key), key=key))
+    else:
+        typer.echo("Provide a device key, or --dir DIRECTORY.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(result.message)
+    for entry in result.masks:
+        typer.echo(f"  {entry.name:30} {entry.path}")
+
+
+@app.command("overlay-list")
+def overlay_list(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Show what is currently drawn on the device's screen.
+
+    The read half of overlay.  ``overlay-update`` / ``overlay-delete`` /
+    ``overlay-flash`` all take an element id, and until this existed the only
+    source of one was the line ``overlay-add`` printed when you created it —
+    so the ids were unrecoverable the moment the terminal scrolled.
+    """
+    log.info("cli display overlay-list: key=%s", key)
+    result = get_app().dispatch(ResolveOverlay(key=key))
+    typer.echo(
+        f"{len(result.elements)} element(s) from the {result.source or 'theme'} "
+        f"layer, overlay {'on' if result.enabled else 'OFF'}"
+        + (f" — {result.theme_name}" if result.theme_name else ""),
+    )
+    for element in result.elements:
+        payload = (
+            repr(element.text) if element.type == "text"
+            else element.metric or element.source
+        )
+        typer.echo(
+            f"  {element.id:14} {element.type:6} "
+            f"({element.x:>4},{element.y:>4})  {payload}  "
+            f"size={element.size} {element.color}",
+        )
+
+
+@app.command("overlay-add")
+def overlay_add(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    type_: str = typer.Argument(
+        ..., metavar="TYPE", help="'text' / 'metric' / 'clock'",
+    ),
+    x: int = typer.Option(0, "--x", help="X position"),
+    y: int = typer.Option(0, "--y", help="Y position"),
+    text: str = typer.Option("", "--text", help="Text content (type=text)"),
+    metric: str = typer.Option("", "--metric", help="Metric id (type=metric)"),
+    fmt: str = typer.Option(
+        "{value}", "--format", help="Metric format string",
+    ),
+    source: str = typer.Option(
+        "time", "--source", help="Clock source: time / weekday / date",
+    ),
+    color: str = typer.Option("#ffffff", "--color"),
+    size: int = typer.Option(16, "--size"),
+    font: str = typer.Option(
+        "", "--font",
+        help="Font family, e.g. 'Microsoft YaHei' (list them with `trcc system list-fonts`); empty keeps the theme default",
+    ),
+    bold: bool = typer.Option(False, "--bold"),
+    italic: bool = typer.Option(False, "--italic"),
+    show_unit: bool = typer.Option(
+        True, "--show-unit/--hide-unit",
+        help="Draw the metric's unit (°C/%/MHz/RPM) after the number, or the "
+             "bare number when the unit is baked into the theme art",
+    ),
+    element_id: str = typer.Option(
+        "", "--id", help="Explicit element id (default: auto-generated UUID)",
+    ),
+) -> None:
+    """Add a user-edited overlay element to a device."""
+    log.info(
+        "cli display overlay-add: key=%s type=%s x=%s y=%s metric=%s "
+        "show_unit=%s element_id=%s",
+        key, type_, x, y, metric, show_unit, element_id,
+    )
+    result = get_app().dispatch(AddOverlayElement(
+        key=key, type=type_, x=x, y=y, text=text, metric=metric,
+        format=fmt, source=source, color=color, size=size, font=font,
+        bold=bold, italic=italic, show_unit=show_unit, element_id=element_id,
+    ))
+    typer.echo(result.message)
+    if result.ok and result.element is not None:
+        typer.echo(f"  id: {result.element.id}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("overlay-update")
+def overlay_update(
+    key: str = typer.Argument(...),
+    element_id: str = typer.Argument(..., help="ID returned by overlay-add"),
+    x: int | None = typer.Option(None, "--x"),
+    y: int | None = typer.Option(None, "--y"),
+    color: str | None = typer.Option(None, "--color"),
+    size: int | None = typer.Option(None, "--size"),
+    font: str | None = typer.Option(
+        None, "--font",
+        help="Font family, e.g. 'Microsoft YaHei' (list them with `trcc system list-fonts`); omit to leave the typeface alone",
+    ),
+    text: str | None = typer.Option(None, "--text"),
+    metric: str | None = typer.Option(None, "--metric"),
+    fmt: str | None = typer.Option(None, "--format"),
+    source: str | None = typer.Option(None, "--source"),
+    bold: bool | None = typer.Option(None, "--bold/--no-bold"),
+    italic: bool | None = typer.Option(None, "--italic/--no-italic"),
+    show_unit: bool | None = typer.Option(
+        None, "--show-unit/--hide-unit",
+        help="Draw the metric's unit (°C/%/MHz/RPM) after the number, or the "
+             "bare number when the unit is baked into the theme art",
+    ),
+) -> None:
+    """Mutate fields on an existing user-edited overlay element."""
+    log.info(
+        "cli display overlay-update: key=%s element_id=%s show_unit=%s",
+        key, element_id, show_unit,
+    )
+    result = get_app().dispatch(UpdateOverlayElement(
+        key=key, element_id=element_id,
+        x=x, y=y, color=color, size=size, font=font, text=text,
+        metric=metric, format=fmt, source=source,
+        bold=bold, italic=italic, show_unit=show_unit,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("overlay-delete")
+def overlay_delete(
+    key: str = typer.Argument(...),
+    element_id: str = typer.Argument(..., help="ID returned by overlay-add"),
+) -> None:
+    """Remove a user-edited overlay element by id."""
+    log.info(
+        "cli display overlay-delete: key=%s element_id=%s", key, element_id,
+    )
+    result = get_app().dispatch(
+        DeleteOverlayElement(key=key, element_id=element_id),
+    )
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("slideshow")
+def slideshow(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    state: str = typer.Argument(..., help="'on' / 'off'"),
+) -> None:
+    """Toggle the per-device slideshow on/off."""
+    log.info("cli display slideshow: key=%s state=%s", key, state)
+    if state.lower() not in ("on", "off"):
+        raise typer.BadParameter(f"state must be 'on' or 'off', got {state!r}")
+    result = get_app().dispatch(
+        SetSlideshow(key=key, enabled=state.lower() == "on"),
+    )
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("background")
+def background(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Image or video file to use as the background",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Set a file as the device's persistent background override.
+
+    Distinct from ``background-mode``, which picks WHAT fills the panel
+    (theme / colour / transparent).  This supplies the file itself, and it
+    survives a theme change until cleared.
+    """
+    log.info("cli display background: key=%s path=%s", key, path)
+    dispatch_echo(SetBackground(key=key, path=path))
+
+
+@app.command("configure-slideshow")
+def configure_slideshow(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    themes: list[str] = typer.Argument(
+        ..., help="Theme names (directories under user_content_dir) — order matters",
+    ),
+    interval: float = typer.Option(
+        60.0, "--interval", "-i", min=1.0,
+        help="Seconds between theme swaps (default 60).",
+    ),
+) -> None:
+    """Set the slideshow theme list + interval."""
+    log.info(
+        "cli display configure-slideshow: key=%s themes=%s interval=%s",
+        key, themes, interval,
+    )
+    result = get_app().dispatch(ConfigureSlideshow(
+        key=key, themes=tuple(themes), interval_s=interval,
+    ))
+    typer.echo(result.message)
+    for t in result.themes:
+        typer.echo(f"  {t}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("keepalive")
+def keepalive(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    interval: float = typer.Option(
+        0.150, "--interval", "-i", min=0.05,
+        help=("Seconds between resends.  Bulk/LY firmware reverts to "
+              "the built-in logo after ~2-3 s without a frame; default "
+              "0.150 s keeps the screen pinned."),
+    ),
+    count: int = typer.Option(
+        0, "--count", "-c", min=0,
+        help="Number of resends; 0 means loop forever (until Ctrl-C).",
+    ),
+    metric_interval: float = typer.Option(
+        1.0, "--metric-interval", min=0.0,
+        help=("Seconds between overlay re-renders (live sensor refresh).  "
+              "0 disables — last frame's metrics stay frozen on screen."),
+    ),
+) -> None:
+    """Periodically resend the device's last frame.
+
+    Workaround for Bulk/LY firmware that drops the displayed image when
+    the internal buffer ages out.  Render at least once before starting
+    the loop so there's a cached frame to resend.
+
+    ``count=0`` (default) runs open-ended and exits cleanly on Ctrl-C —
+    the Command itself owns the loop + signal handling so the CLI
+    doesn't need a user-space ``while`` wrapper.
+    """
+    log.info(
+        "cli display keepalive: key=%s interval=%s count=%s "
+        "metric_interval=%s",
+        key, interval, count, metric_interval,
+    )
+    if count == 0:
+        typer.echo(
+            f"Keepalive on {key} every {interval:.3f}s "
+            f"(metric refresh every {metric_interval:.1f}s, Ctrl-C to stop)…"
+        )
+    app_obj = get_app()
+    # One Command, like the API: KeepAliveLoop shows the saved display itself
+    # when there is nothing to resend, and keeps a push when there is (#267).
+    result = app_obj.dispatch(KeepAliveLoop(
+        key=key, count=count,
+        interval_s=interval, metric_interval_s=metric_interval,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("background-mode")
+def background_mode(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    mode: str = typer.Argument(
+        ..., help="'theme' / 'color' / 'transparent'",
+    ),
+) -> None:
+    """Pick what fills the LCD behind overlays."""
+    log.info("cli display background-mode: key=%s mode=%s", key, mode)
+    dispatch_echo(SetBackgroundMode(key=key, mode=mode.lower()))
+
+
+@app.command("overlay-background")
+def overlay_background(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    hex_color: str = typer.Argument(
+        ..., metavar="HEX", help="Hex color (e.g. 000000 for black)",
+    ),
+) -> None:
+    """Set the solid color used when background-mode=color."""
+    log.info("cli display overlay-background: key=%s hex=%s", key, hex_color)
+    rgb = _parse_hex_color(hex_color)
+    if rgb is None:
+        typer.echo(f"Invalid hex color: {hex_color!r}", err=True)
+        raise typer.Exit(code=2)
+    dispatch_echo(SetOverlayBackground(key=key, color=rgb))
+
+
+@app.command("restore-theme")
+def restore_theme(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Restore the device's saved display (theme + background; Theme1 if none)."""
+    log.info("cli display restore-theme: key=%s", key)
+    dispatch_echo(RestoreDeviceState(key=key))
+
+
+@app.command("resume")
+def resume(
+    retries: int = typer.Option(
+        10, "--retries", min=1,
+        help="Discovery attempts before giving up (1 attempt = 2 s delay)",
+    ),
+) -> None:
+    """Send each detected device's last-used theme (headless, no GUI).
+
+    Use case: cron / systemd unit / udev hook that runs at boot or
+    after a suspend cycle.  Enumerates every TRCC-known device on the
+    bus, connects, and replays the saved theme so the displays come
+    back to their pre-boot / pre-suspend state without the GUI.
+
+    Bulk/LY devices fade after ~2-3 s without a fresh frame — pair
+    this with ``trcc display keepalive`` per device for those, or
+    ``trcc display play`` for the full render-loop.
+    """
+    log.info("cli display resume: retries=%s", retries)
+    import time
+
+    app_obj = get_app()
+    keys: list[str] = []
+    for attempt in range(1, retries + 1):
+        result = app_obj.dispatch(DiscoverDevices())
+        if result.ok and result.products:
+            keys = [key for key, _ in result.units()]
+            break
+        typer.echo(
+            f"Waiting for device... ({attempt}/{retries})", err=True,
+        )
+        time.sleep(2)
+
+    if not keys:
+        typer.echo("No compatible TRCC device detected.", err=True)
+        raise typer.Exit(code=1)
+
+    sent = 0
+    for key in keys:
+        connect_result = app_obj.dispatch(ConnectDevice(key=key))
+        if not connect_result.ok:
+            typer.echo(f"  [{key}] connect failed: {connect_result.message}",
+                       err=True)
+            continue
+        theme_result = app_obj.dispatch(RestoreDeviceState(key=key))
+        if not theme_result.ok:
+            typer.echo(f"  [{key}] {theme_result.message}", err=True)
+            continue
+        typer.echo(f"  [{key}] resumed: {theme_result.theme_name}")
+        sent += 1
+
+    if sent == 0:
+        typer.echo(
+            "No themes were sent.  Use the GUI to set a theme first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Resumed {sent} device(s).")
+
+
+@app.command("test")
+def test(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    seconds: float = typer.Option(
+        1.0, "--seconds", "-s", min=0.1,
+        help="Hold each color for this many seconds.",
+    ),
+) -> None:
+    """Color-cycle the LCD: red → green → blue → black.
+
+    Smallest end-to-end exercise of the wire chain.  Useful when
+    porting a new device class to confirm handshake → frame build →
+    USB send all work before fighting overlay/theme bugs.
+    """
+    log.info("cli display test: key=%s seconds=%s", key, seconds)
+    import time
+
+    app_obj = get_app()
+    sequence = (
+        ("red",   (0xFF, 0x00, 0x00)),
+        ("green", (0x00, 0xFF, 0x00)),
+        ("blue",  (0x00, 0x00, 0xFF)),
+        ("black", (0x00, 0x00, 0x00)),
+    )
+    for name, (r, g, b) in sequence:
+        typer.echo(f"  {name}...")
+        result = app_obj.dispatch(SendColor(key=key, r=r, g=g, b=b))
+        if not result.ok:
+            typer.echo(result.message, err=True)
+            raise typer.Exit(code=1)
+        time.sleep(seconds)
+    typer.echo("Color cycle complete.")
+
+
+@app.command("sleep")
+def sleep(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Blank the panel so it goes dark (the shutdown / turn-off action).
+
+    Sends a solid-black frame (LCD) or an all-off payload (LED) — the same
+    Command the GUI + daemon fire at PC shutdown so the screen doesn't hold
+    its last image lit.  Idempotent; auto-connects in a fresh process.
+    """
+    log.info("cli display sleep: key=%s", key)
+    app_obj = get_app()
+    result = app_obj.dispatch(SleepDevice(key=key))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("test-lcd")
+def test_lcd(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    cols: int = typer.Option(
+        60, "--cols", "-c", min=10, max=200,
+        help="Width of the ANSI preview in terminal cells.",
+    ),
+) -> None:
+    """Print an ANSI true-color preview of the LCD's current render.
+
+    Same pipeline as ``display play`` but stops at the renderer
+    surface — no wire send.  Useful for headless / sshell debugging
+    where you can't see the physical device.
+    """
+    log.info("cli display test-lcd: key=%s cols=%s", key, cols)
+    from ._ansi import image_to_ansi
+
+    result = get_app().dispatch(BuildPreview(key=key, sample_cols=cols))
+    if not result.ok:
+        typer.echo(result.message, err=True)
+        raise typer.Exit(code=1)
+    if not result.pixels:
+        # Attached, but nothing loaded to sample — ok, just not printable.
+        typer.echo(f"No active theme on {key} — load one first", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(image_to_ansi(result.pixels))
+
+
+@app.command("send-image")
+def send_image(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    path: Path = typer.Argument(
+        ..., help="Image file (PNG/JPG/BMP/WEBP)",
+        exists=True, file_okay=True, dir_okay=False,
+    ),
+) -> None:
+    """Push an image to the LCD once — no theme staging, no persistence.
+
+    Companion to ``load-image`` (which materialises a single-image
+    theme and persists ``DeviceSettings.current_theme``).  Use this
+    when you want ephemeral display: boot logos, quick previews, API
+    upload pipelines.
+    """
+    log.info("cli display send-image: key=%s path=%s", key, path)
+    app_obj = get_app()
+    result = app_obj.dispatch(SendImage(key=key, path=path))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("overlay-render")
+def overlay_render(
+    dc_path: Path = typer.Argument(
+        ..., help="DC file or theme directory containing config1.dc",
+    ),
+    output: Path = typer.Option(
+        ..., "--output", "-o",
+        help="Output PNG path for the rendered preview.",
+    ),
+    width: int = typer.Option(
+        320, "--width", "-w", min=1, help="Render canvas width (px)",
+    ),
+    height: int = typer.Option(
+        320, "--height", "-h", min=1, help="Render canvas height (px)",
+    ),
+) -> None:
+    """Render a DC config to a PNG preview — no active device required.
+
+    Mirrors legacy ``trcc overlay`` — composites every element from
+    ``config1.dc`` onto a solid-black canvas at *width × height* and
+    writes the result as PNG.  Useful when iterating on a theme's
+    metric positions without unplugging the device or sending frames.
+    """
+    log.info(
+        "cli display overlay-render: dc_path=%s output=%s width=%s height=%s",
+        dc_path, output, width, height,
+    )
+    result = get_app().dispatch(RenderDcStandalone(
+        dc_path=dc_path, output_path=output,
+        width=width, height=height,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("screencast")
+def screencast(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    x: int = typer.Argument(0, min=0, help="Top-left X of the capture region (px)"),
+    y: int = typer.Argument(0, min=0, help="Top-left Y of the capture region (px)"),
+    w: int = typer.Argument(
+        0, min=0, help="Capture region width (px); 0 0 0 0 casts the stored region"),
+    h: int = typer.Argument(0, min=0, help="Capture region height (px)"),
+    audio: bool = typer.Option(
+        False, "--audio/--no-audio",
+        help="Pipe system audio alongside the video feed (Linux: PipeWire)",
+    ),
+) -> None:
+    """Stream a screen region to the LCD until interrupted.
+
+    Wraps :class:`StartScreencast`, which starts capturing.  Ctrl-C calls
+    :class:`StopScreencast` for clean teardown.  Without a region it casts the
+    device's stored one (``screencast-region``, or the loaded theme's); a given
+    region is stored as the device's.
+    """
+    log.info(
+        "cli display screencast: key=%s x=%s y=%s w=%s h=%s audio=%s",
+        key, x, y, w, h, audio,
+    )
+    import signal
+
+    app_obj = get_app()
+    result = app_obj.dispatch(StartScreencast(
+        key=key, x=x, y=y, w=w, h=h, audio=audio,
+    ))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Capturing on {key} — Ctrl-C to stop.")
+    stopped = {"flag": False}
+
+    def _handle(*_args: object) -> None:
+        log.debug("_handle")
+        stopped["flag"] = True
+
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+    while not stopped["flag"]:
+        signal.pause()
+
+    stop_result = app_obj.dispatch(StopScreencast(key=key))
+    typer.echo(stop_result.message)
+    if not stop_result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("screencast-region")
+def screencast_region(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    x: int = typer.Argument(..., min=0, max=9999, help="Top-left X on screen (px)"),
+    y: int = typer.Argument(..., min=0, max=9999, help="Top-left Y on screen (px)"),
+    w: int = typer.Argument(..., min=0, max=9999, help="Region width (px)"),
+    h: int = typer.Argument(..., min=0, max=9999, help="Region height (px)"),
+    hide_border: bool | None = typer.Option(
+        None, "--hide-border/--show-border",
+        help="Hide the on-screen border around the region (default: unchanged)",
+    ),
+) -> None:
+    """Set the device's screen-cast region; a running cast follows it."""
+    log.info("cli display screencast-region: key=%s (%d,%d %dx%d) hide_border=%s",
+             key, x, y, w, h, hide_border)
+    dispatch_echo(SetScreencastRegion(
+        key=key, x=x, y=y, w=w, h=h, hide_border=hide_border))
+
+
+@app.command("stop-screencast")
+def stop_screencast(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Stop an active screencast started by another process (daemon/API)."""
+    log.info("cli display stop-screencast: key=%s", key)
+    dispatch_echo(StopScreencast(key=key))
+
+
+@app.command("media-player")
+def media_player(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    uri: str = typer.Argument(
+        "", help="Source: a local file path, or a web URL/stream. '' clears.",
+    ),
+) -> None:
+    """Set the media-player source — a local file or a web URL/stream.
+
+    Wraps :class:`SetMediaPlayer`: a local file plays through the video
+    pipeline; a web URL (http, https, rtsp) plays as a live stream.
+    An empty URI clears the source.
+    """
+    log.info("cli display media-player: key=%s uri=%s", key, uri)
+    app_obj = get_app()
+    result = app_obj.dispatch(SetMediaPlayer(key=key, uri=uri))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("visuals")
+def visuals(
+    key: str = typer.Argument("", help="A device key: also show what it plays."),
+) -> None:
+    """List the audio visuals this computer can draw, and their presets."""
+    log.info("cli display visuals: key=%r", key)
+    result = get_app().dispatch(ListVisuals(key=key))
+    for info in result.visuals:
+        sliders = ", ".join(f"{a.name} {a.minimum:g}-{a.maximum:g}"
+                            for a in info.adjustments)
+        typer.echo(f"  {info.kind:<12} {info.title}  ({sliders})")
+    for name in result.presets:
+        typer.echo(f"    preset: {name}")
+    typer.echo(f"  centre picture: {result.center or 'none'}")
+    if key:
+        sliders = ", ".join(f"{n} {v:g}" for n, v in result.sliders.items())
+        typer.echo(f"  {key} plays: {result.playing or 'no audio visual'}"
+                   + (f" {result.preset}" if result.preset else "")
+                   + (f" ({sliders})" if sliders else "")
+                   + (" -- hearing nothing" if result.playing
+                      and not result.hearing else ""))
+
+
+def _visual_settings(pairs: list[str]) -> dict[str, float]:
+    """``NAME=VALUE`` pairs as slider values."""
+    log.debug("_visual_settings: %s", pairs)
+    values: dict[str, float] = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        try:
+            values[name.strip()] = float(value)
+        except ValueError:
+            raise typer.BadParameter(f"a setting is NAME=VALUE -- got {pair!r}") from None
+        if not sep or not name.strip():
+            raise typer.BadParameter(f"a setting is NAME=VALUE -- got {pair!r}")
+    return values
+
+
+@app.command("visual")
+def visual(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    name: str = typer.Argument(
+        "", help="The audio visual (see `trcc display visuals`); '' stops it."),
+    preset: str = typer.Option(
+        "", "--preset", help="A preset file, for a visual that draws presets."),
+    setting: list[str] | None = typer.Option(
+        None, "--set", help="NAME=VALUE for one slider; repeat for more."),
+) -> None:
+    """Draw the panel's background from what is playing, with an audio
+    visual -- or stop it."""
+    log.info("cli display visual: key=%s name=%r preset=%r", key, name, preset)
+    command = (PlayVisual(key=key, visual=name, preset=preset,
+                          settings=_visual_settings(setting or []))
+               if name else StopVisual(key=key))
+    dispatch_echo(command)
+
+
+@app.command("visual-set")
+def visual_set(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    setting: list[str] = typer.Option(
+        ..., "--set", help="NAME=VALUE for one slider; repeat for more."),
+) -> None:
+    """Move the playing audio visual's sliders -- live, it keeps playing."""
+    log.info("cli display visual-set: key=%s %s", key, setting)
+    dispatch_echo(SetVisualSettings(key=key, settings=_visual_settings(setting)))
+
+
+@app.command("visual-picture")
+def visual_picture(
+    shown: str = typer.Argument("", help="on or off -- '' leaves it as it is."),
+    fire: float | None = typer.Option(
+        None, "--fire", help="How hot the picture burns, 0 to 1."),
+) -> None:
+    """Switch the centre picture on or off (it is kept while off) and set
+    its fire."""
+    log.info("cli display visual-picture: %r fire=%s", shown, fire)
+    if shown not in ("", "on", "off"):
+        raise typer.BadParameter(f"on or off -- got {shown!r}")
+    dispatch_echo(SetVisualPicture(shown=None if not shown else shown == "on",
+                                   fire=fire))
+
+
+@app.command("visual-tile")
+def visual_tile(
+    name: str = typer.Argument(..., help="The audio visual (see `trcc display visuals`)."),
+    output: Path = typer.Option(..., "--output", "-o", help="Where to write the PNG."),
+    preset: str = typer.Option("", "--preset", help="A preset, for a visual that draws presets."),
+    size: int = typer.Option(120, "--size", help="Pixels a side."),
+) -> None:
+    """Save a visual's gallery tile: what it draws for noise."""
+    log.info("cli display visual-tile: %s %r size=%d -> %s", name, preset,
+             size, output)
+    result = get_app().dispatch(VisualTile(visual=name, preset=preset, size=size))
+    if not result.ok:
+        typer.echo(result.message)
+        raise typer.Exit(code=1)
+    output.write_bytes(result.image)
+    typer.echo(f"Saved {output} ({len(result.image)} bytes)")
+
+
+@app.command("visual-center")
+def visual_center(
+    path: str = typer.Argument(
+        "", help="Any picture for the middle of a visual; '' for none."),
+) -> None:
+    """The picture in the middle of the audio visuals that show one."""
+    log.info("cli display visual-center: %r", path)
+    dispatch_echo(SetVisualCenter(path=path))
+
+
+@app.command("snapshot")
+def snapshot(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit JSON instead of human text.",
+    ),
+) -> None:
+    """Print the persisted LCD state for a device."""
+    log.info("cli display snapshot: key=%s json_output=%s", key, json_output)
+    result = get_app().dispatch(LcdSnapshot(key=key))
+    if json_output:
+        emit_json(result)
+        raise typer.Exit(code=0 if result.ok else 1)
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+    typer.echo(f"  orientation      {result.orientation}")
+    typer.echo(f"  brightness       {result.brightness}%")
+    typer.echo(f"  current_theme    {result.current_theme}")
+    typer.echo(f"  overlay_enabled  {result.overlay_enabled}")
+    typer.echo(f"  mask_path        {result.mask_path}")
+    typer.echo(f"  mask_visible     {result.mask_visible}")
+    typer.echo(f"  mask_position    {result.mask_position}")
+    typer.echo(f"  fit_mode         {result.fit_mode}")
+    typer.echo(f"  split_mode       {result.split_mode}")
+    typer.echo(f"  game_mode        {describe_game_mode(result.game_enabled, result.game_threshold)}")
+    typer.echo(f"  time_format      {result.time_format}")
+    typer.echo(f"  date_format      {result.date_format}")
+    typer.echo(f"  temp_unit        {result.temp_unit}")
+    typer.echo(f"  background_mode  {result.background_mode}")
+    typer.echo(f"  showing          {describe_source(result.display_source, result.background_mode, result.media_player_uri)}")

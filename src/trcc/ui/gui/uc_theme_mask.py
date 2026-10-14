@@ -1,0 +1,222 @@
+"""
+UCThemeMask — Cloud + custom masks browser panel.
+
+Matches Windows TRCC.DCUserControl.UCThemeMask (732x652).
+Shows cloud layout masks with download, plus user-uploaded custom masks.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QMenu
+
+from ...core.commands import ListMasks
+from ...core.models import MaskItem
+from .base import BaseThumbnail, DownloadableThemeBrowser
+
+if TYPE_CHECKING:
+    from ...core.ports import CommandBus
+
+log = logging.getLogger(__name__)
+
+
+class MaskThumbnail(BaseThumbnail):
+    """Mask thumbnail with non-local (dashed border) state."""
+
+    def __init__(self, mask_info: MaskItem, parent=None):
+        super().__init__(mask_info, parent)
+
+    def _get_image_path(self, info: MaskItem) -> str | None:
+        return info.preview
+
+
+class UCThemeMask(DownloadableThemeBrowser):
+    """
+    Cloud + custom masks browser panel.
+
+    Windows size: 732x652
+    Background image provides header with 7 category filter buttons.
+    Grid: 5 columns, starts at (30, 60).
+    Custom masks live in ~/.trcc-user/data/web/zt{W}{H}/.
+    """
+
+    CMD_MASK_SELECTED = 16
+
+    mask_selected = Signal(object)
+
+    def __init__(self, parent=None, app: CommandBus | None = None):
+        self.mask_directory = None
+        self._resolution = ""
+        self._device_key = ""
+        self._local_masks: set[str] = set()
+        self._category = 'all'
+        # The App, for Command dispatch ONLY — the uc_about idiom.  This panel
+        # used to be handed a Paths port and a ContentStore and ask them
+        # directly; both are AttributeErrors the moment the App is an AppProxy,
+        # which is what stops the gui being a daemon client.
+        self._app = app
+        super().__init__(parent)
+
+    def _create_filter_buttons(self):
+        """Seven category buttons."""
+        from .constants import Layout
+        btn_normal, btn_active = self._load_filter_assets()
+        self.cat_buttons = {}
+        self._btn_refs = [btn_normal, btn_active]
+
+        for cat_id, x, y, w, h in Layout.WEB_CATEGORIES:
+            btn = self._make_filter_button(x, y, w, h, btn_normal, btn_active,
+                self._on_category_clicked)
+            btn.setProperty('cat_id', cat_id)
+            self.cat_buttons[cat_id] = btn
+
+        self.cat_buttons['all'].setChecked(True)
+
+    def _on_category_clicked(self, *_qt_args) -> None:
+        """Single category-button slot — reads the cat_id from sender's property."""
+        log.info("_on_category_clicked")
+        sender = self.sender()
+        if sender is None:
+            return
+        cat_id = sender.property('cat_id')
+        if cat_id is not None:
+            self._set_category(cat_id)
+
+    def _set_category(self, category: str):
+        """Filter masks by category suffix (a-e, y) or show all."""
+        if self._downloading:
+            return
+        self._category = category
+        for cat_id, btn in self.cat_buttons.items():
+            btn.setChecked(cat_id == category)
+        self.refresh_masks()
+
+    def _create_thumbnail(self, item_info: MaskItem) -> MaskThumbnail:
+        thumb = MaskThumbnail(item_info)
+        if item_info.is_custom:
+            thumb.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            thumb.customContextMenuRequested.connect(
+                self._on_custom_context_menu_requested)
+        return thumb
+
+    def _on_custom_context_menu_requested(self, _pos) -> None:
+        """Context-menu slot — reads thumb + item_info from sender."""
+        log.info("_on_custom_context_menu_requested")
+        thumb = self.sender()
+        if not isinstance(thumb, MaskThumbnail):
+            return
+        info = getattr(thumb, 'mask_info', None) or getattr(thumb, 'item_info', None)
+        if info is not None:
+            self._show_custom_context_menu(thumb, info)
+
+    def _show_custom_context_menu(self, widget: MaskThumbnail, info: MaskItem):
+        """Right-click menu for custom masks — delete option."""
+        menu = QMenu(widget)
+        delete_action = menu.addAction("Delete")
+        action = menu.exec(widget.mapToGlobal(widget.rect().center()))
+        if action == delete_action and info.path:
+            self._delete_custom_mask(Path(info.path))
+
+    def _delete_custom_mask(self, mask_dir: Path):
+        """Delete a custom mask directory and refresh the grid."""
+        if mask_dir.exists():
+            shutil.rmtree(mask_dir)
+            log.info("Deleted custom mask: %s", mask_dir)
+        self.refresh_masks()
+
+    def _no_items_message(self) -> str:
+        return "No masks found\n\nMasks can be downloaded by clicking on cloud mask thumbnails"
+
+    def set_mask_directory(self, path):
+        """Set the mask directory and load masks."""
+        log.info("uc_theme_mask.set_mask_directory: %s", path)
+        self.mask_directory = Path(path) if path else None
+        if self.mask_directory:
+            self.mask_directory.mkdir(parents=True, exist_ok=True)
+        self.refresh_masks()
+
+    def set_device_key(self, key: str) -> None:
+        """The device whose mask libraries to list.
+
+        ``ListMasks`` resolves the per-SKU cloud library from this key, so a
+        cooler with its own artwork sees its own masks.  Without it the panel
+        could only name a resolution, and two coolers sharing a panel size would
+        show each other's libraries.
+        """
+        log.debug("set_device_key: %s", key)
+        self._device_key = key
+
+    def set_resolution(self, resolution: str):
+        """Set resolution for cloud downloads."""
+        log.debug("set_resolution: %s", resolution)
+        self._resolution = resolution
+
+    def _parse_resolution(self) -> tuple[int, int]:
+        """Parse resolution string (e.g. '320x320') into (width, height)."""
+        if not self._resolution or 'x' not in self._resolution:
+            return (0, 0)
+        parts = self._resolution.split('x')
+        return (int(parts[0]), int(parts[1]))
+
+    def refresh_masks(self):
+        """Reload masks from disk — only shows what exists per device resolution."""
+        self._clear_grid()
+        self._local_masks.clear()
+
+        if self.mask_directory:
+            self.mask_directory.mkdir(parents=True, exist_ok=True)
+
+        # ONE dispatch.  ``ListMasks`` scans both the per-SKU cloud library and
+        # the user mask dir, dedupes, and resolves each tile — the work this
+        # panel used to compose out of a Paths port and a ContentStore.  The
+        # cli, the api and qtgui's mask_browser have always called it.
+        if self._app is None:
+            log.warning("refresh_masks: no App injected — no masks")
+            return
+        result = self._app.dispatch(ListMasks(
+            resolution=self._parse_resolution(), key=self._device_key,
+        ))
+        if not result.ok:
+            log.warning("refresh_masks: %s", result.message)
+            return
+
+        masks: list[MaskItem] = []
+        for m in result.masks:
+            masks.append(MaskItem(
+                name=m.name,
+                path=m.path or None,
+                preview=m.preview or None,
+                is_local=True,
+                is_custom=m.is_custom,
+            ))
+            self._local_masks.add(m.name.lower())
+
+        # Filter by category (last char of mask name matches suffix)
+        if self._category != 'all':
+            masks = [m for m in masks if m.name and m.name[-1:] == self._category]
+
+        log.info("uc_theme_mask.refresh_masks: %d mask(s), cat=%s, key=%s, "
+                 "scanned=%s", len(masks), self._category,
+                 self._device_key or "(none)", result.directory)
+        self._populate_grid(masks)
+
+    def _on_item_clicked(self, item_info: MaskItem):
+        """Handle click — select the mask.
+
+        There is no download arm.  Every tile comes from ``ListMasks``, a
+        scan of what is already on disk, and ``refresh_masks`` builds each
+        one with ``is_local=True``, so the cloud-download branch that used
+        to live here could never run — in this tree or in legacy, which
+        hardcodes it identically.  Masks arrive via the bulk
+        ``zt{W}{H}.7z`` archive, which every UI shares.
+        """
+        log.info("_on_item_clicked")
+        self._select_item(item_info)
+        self.mask_selected.emit(item_info)
+        self.theme_selected.emit(item_info)
+        self.invoke_delegate(self.CMD_MASK_SELECTED, item_info)

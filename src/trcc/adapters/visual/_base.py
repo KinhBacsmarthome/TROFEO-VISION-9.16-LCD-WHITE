@@ -1,0 +1,109 @@
+"""The audio visuals registry: every visual, by the key in its class line.
+
+The same idiom as ``DEVICES`` and ``PLATFORMS``: one shared ``Registry``,
+and a visual registers itself by naming its key where it is defined::
+
+    class TrccPipes(BaseVisual, key="trcc-pipes"): ...
+
+A new visual is one new class.  Nothing that plays visuals names one: the
+Commands take a key, the platform turns it into an engine here, and the
+Audio Visuals page draws its gallery and sliders from each class's ``INFO``.
+"""
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any, ClassVar
+
+from ...core.factory import Registry, Reject
+from ...core.models import VisualInfo
+from ...core.ports import VisualEngine, ranked_visuals
+from ._gl import GlSurface
+
+log = logging.getLogger(__name__)
+
+VISUALS: Registry[str, type[BaseVisual]] = Registry(
+    "audio visual", on_missing=Reject(OSError),
+)
+
+
+class BaseVisual(VisualEngine):
+    """An audio visual: what it is (``INFO``), and whether this machine can
+    draw it.  ``key=None`` in a class line means an intermediate base."""
+
+    INFO: ClassVar[VisualInfo]
+
+    def __init_subclass__(cls, key: str | None = None, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if key is None:
+            log.debug("%s: intermediate visual base, not registered",
+                      cls.__name__)
+            return
+        log.debug("%s: registering as visual %s", cls.__name__, key)
+        VISUALS.register(key)(cls)
+
+
+class GlVisual(BaseVisual):
+    """A visual drawn with OpenGL, on the context its platform names
+    (:func:`drawn_on`).  Listed wherever it is registered; where no context
+    opens -- or none is named -- the gallery shows it with the reason."""
+
+    #: The platform's kind of context; ``None`` until :func:`drawn_on` binds one.
+    SURFACE: ClassVar[type[GlSurface] | None] = None
+
+    @classmethod
+    def problem(cls) -> str:
+        """Why it cannot draw here -- a context is opened once to find out,
+        and the answer kept."""
+        if "_gl_problem" not in cls.__dict__:
+            cls._gl_problem = cls._try_surface()
+        problem: str = cls.__dict__["_gl_problem"]
+        log.debug("%s.problem: %r", cls.__name__, problem)
+        return problem
+
+    @classmethod
+    def _try_surface(cls) -> str:
+        """Open a context and put it away: "" if it opened, else why not."""
+        if cls.SURFACE is None:
+            log.info("%s: no OpenGL context named on this OS", cls.__name__)
+            return f"{cls.INFO.title} cannot draw on this computer yet"
+        try:
+            cls.SURFACE.open().close()
+        except OSError as e:
+            log.warning("%s: cannot draw here -- %s", cls.__name__, e)
+            return f"{cls.INFO.title} needs OpenGL 3: {e}"
+        log.info("%s: OpenGL draws here", cls.__name__)
+        return ""
+
+    def _open_surface(self) -> GlSurface:
+        """A context to draw on, current on this thread; ``OSError`` saying
+        why there is none."""
+        surface = type(self).SURFACE
+        log.info("%s._open_surface: %s", type(self).__name__,
+                 surface.__name__ if surface else None)
+        if surface is None:
+            raise OSError(type(self).problem())
+        return surface.open()
+
+
+def drawn_on(surface: type[GlSurface]) -> Mapping[str, type[VisualEngine]]:
+    """The ``VISUALS`` registry as one OS draws it: every OpenGL visual
+    bound to that OS's *surface*, the rest as they are -- what a platform
+    names as its ``VISUALS``.  Each binding is a subclass, so each keeps
+    its own answer to :meth:`GlVisual.problem`."""
+    log.info("drawn_on: %s", surface.__name__)
+    return MappingProxyType({
+        key: (type(cls.__name__, (cls,), {"SURFACE": surface,
+                                          "__module__": cls.__module__,
+                                          "__doc__": cls.__doc__})
+              if issubclass(cls, GlVisual) else cls)
+        for key, cls in VISUALS.items()})
+
+
+def catalog() -> tuple[VisualInfo, ...]:
+    """Every visual this machine can draw, in gallery order -- the same
+    ranking the platform's gallery uses."""
+    infos = ranked_visuals(VISUALS.values())
+    log.info("catalog: %s", [info.kind for info in infos])
+    return infos

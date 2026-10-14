@@ -1,0 +1,37 @@
+"""GUI panels — one class per top-level screen."""
+
+from .about_panel import AboutPanel
+from .audio_visuals import AudioVisualsPanel
+from .cloud_theme_browser import CloudThemeBrowser
+from .configuration_panel import ConfigurationPanel
+from .device_panel import DevicePanel
+from .display_panel import DisplayPanel
+from .led_panel import LedPanel
+from .local_theme_browser import LocalThemeBrowser
+from .mask_browser import MaskBrowser
+from .overlay_editor import OverlayEditorPanel
+from .preview_panel import PreviewPanel
+from .rgb_panel import RgbPanel
+from .screencast_panel import ScreencastPanel
+from .sidebar import ActivitySidebar
+from .status_panel import StatusPanel
+from .system_panel import SystemPanel
+
+__all__ = [
+    "AboutPanel",
+    "ActivitySidebar",
+    "AudioVisualsPanel",
+    "CloudThemeBrowser",
+    "ConfigurationPanel",
+    "DevicePanel",
+    "DisplayPanel",
+    "LedPanel",
+    "LocalThemeBrowser",
+    "MaskBrowser",
+    "OverlayEditorPanel",
+    "PreviewPanel",
+    "RgbPanel",
+    "ScreencastPanel",
+    "StatusPanel",
+    "SystemPanel",
+]

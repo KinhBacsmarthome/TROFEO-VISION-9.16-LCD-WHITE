@@ -1,0 +1,34 @@
+[Unit]
+# trcc-display — drives the LCD with the active theme on a timer.
+#
+# This is a USER unit. Install with:
+#     systemctl --user enable --now trcc-display.service
+#
+# Distinct from trccd.service: that one owns the IPC daemon, this one runs the
+# render-and-send ticker (`trcc display play`) so the panel shows live metrics
+# after a reboot without anyone opening the GUI.  Run one or the other — both
+# want exclusive USB access and will fight over the interface.
+Description=TRCC Linux LCD stats ticker
+Documentation=https://github.com/Lexonight1/thermalright-trcc-linux
+After=graphical-session.target
+PartOf=graphical-session.target
+# The device is often not enumerated yet at login, and only one process may
+# hold the interface — so Restart= below retries forever instead of tripping
+# the start-rate limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Optional: TRCC_DEVICE=0416:5408 to pin one panel, TRCC_BIN=/path/to/trcc for
+# a pip/pipx install.  A missing file is not an error.
+EnvironmentFile=-%h/.trcc/ticker.env
+ExecStart=/usr/bin/trcc-display-ticker
+# Blank the panel on stop rather than leaving a stale frame lit — the same
+# helper, so it is the same panel ExecStart drove (TRCC_DEVICE honoured).
+ExecStopPost=/usr/bin/trcc-display-ticker sleep
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

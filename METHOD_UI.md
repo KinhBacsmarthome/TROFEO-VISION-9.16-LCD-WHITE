@@ -1,0 +1,168 @@
+# TRCC Linux — UI Methods of Operation
+
+The companion to `METHOD.md`. That one is about matching the **device's**
+return; this one is about keeping the **four UIs** — CLI, API, GUI, qtgui — a
+single application wearing four faces, never four applications that happen to
+share a repo.
+
+## The premise
+
+There is **one** app. The GUI, the CLI, the REST API, and the qtgui skin are
+*views* onto it. A user who does something in one UI must get the identical
+result they'd get doing it in any other, because underneath they are the same
+behaviour, the same state, and the same lifecycle. A capability that works in
+one UI and not another is a **bug**, not a missing feature — the plumbing to do
+it everywhere already exists (see #150: the GUI could keep a volatile panel lit
+from persisted state; the CLI couldn't, because its entry skipped the restore
+the GUI did on connect).
+
+## The four backbones
+
+Everything a UI does resolves to one of four shared spines. A UI owns none of
+them; it only *invokes* them.
+
+1. **Behaviour → one Command.** Every user action is a single `Command`
+   dispatched on the one bus: `app.dispatch(SomeCommand(...))`. The UI
+   translates its native input (a click, an argv, a JSON body) into that
+   Command and renders the `Result`. It holds **zero** domain logic. Same
+   action → same Command in all four UIs.
+2. **State → one `Settings`, persisted to `trcc.json`.** All mutable app +
+   per-device state (resolution, orientation, current theme, background,
+   format prefs) lives in `services/settings.py` → `Settings`, persisted to
+   `paths.config_dir()/trcc.json` (`_CONFIG_FILE`). Every UI reads and writes
+   `app.settings`; **no UI keeps its own copy.** This is why a theme picked in
+   the GUI is already selected when you open the CLI — the state was never in
+   the GUI, it was in `trcc.json`.
+3. **Lifecycle → one entry sequence.** From launch to a displaying device the
+   steps are identical everywhere: **detect → ensure data → connect → restore
+   → stream** (below). A UI decides *when* to run a step (GUI on window-ready,
+   CLI on command, API on request), never *what* the step does.
+4. **Launch → one contract: `run(platform) -> int`.** Every leaf UI is injected
+   the `Platform` *port* — the abstraction the mock replaces (`MockPlatform`) —
+   and composes its own App from it (via `_boot.trcc(platform, renderer)`,
+   the one App factory). **Inject the Platform, not a pre-built App:** the GUI's
+   Qt-before-renderer and single-instance-before-build ordering can't receive an
+   injected App, so the platform is the only *uniform* seam (DIP — depend on the
+   port; each UI owns its own renderer lifecycle). The GUI + qtgui share
+   `qapp.build_qt_app(platform)`; the API composes a headless `QtRenderer`. This
+   is what lets one `dev/mock.py --ui {cli,api,gui,qtgui}` drive any UI against
+   the same `MockPlatform` (real dev-box sensors, faked device).
+
+## The UI is a thin translator — the shape of every adapter method
+
+    parse native input  →  build Command(s)  →  app.dispatch(...)  →  render Result
+
+If an adapter method does more than this — resolves a resolution, walks the
+filesystem, decides a fallback, mutates state directly — that logic belongs in a
+core Command or `Settings`, and the drift starts here. The GUI translating a
+click-index into an element id is fine (that's input translation); the GUI
+deciding *which theme to auto-load* is not (that's a lifecycle decision — it
+belongs in the shared step, see `RestoreDeviceState`).
+
+## The entry contracts — the #150 lesson, written down
+
+These are the invariants every UI must honour at its entry points. They are the
+exact things that drift silently, because each UI reaches them by a different
+path:
+
+- **A Command that uses a device connects it — in `App.dispatch`, for every
+  UI.** A one-shot Command declares `USES_DEVICE`, and dispatch attempts
+  `EnsureConnected` first. It is an attempt, never a gate: the Command says what
+  a missing device means to it (`SendColor` fails, `LoadTheme` still saves the
+  choice), and a failed connect's recorded reason ("permission denied on
+  /dev/sg1") reaches its message. Per-tick Commands never connect — a panel
+  that is unplugged would be retried at frame rate. So a UI has no connect step
+  of its own; the one left is the CLI `slideshow-run` loop (P4d). (#150, and
+  before 2026-09-28 the CLI connected before 21 verbs, the API before 9 routes
+  and 6 not at all.)
+- **A session shows each panel's saved display — `App._prime`, once, in core.**
+  Every long-lived UI (daemon, gui, qtgui, API) runs `start_session`. From
+  then on a panel that connects, or whose themes finish installing, is
+  restored with `RestoreDeviceState` — unless it already shows a theme or is
+  held by a pushed frame. With nothing saved it shows **Theme1**. The handlers
+  are subscribed in `App.__init__`, so they run before any UI hears
+  `DeviceConnected`: a UI READS what is shown and never loads it. A one-shot
+  CLI has no session, so `trcc color` does not load a theme first.
+  (#148: each UI primed its own way and the API not at all, so `/tick`
+  restored on every poll.)
+- **`RestoreDeviceState` is the one restore, and it always restores.** Every
+  UI's "restore" verb dispatches it (CLI `restore-theme` / `resume`, API
+  `restore-theme`, qtgui's button), even over a push; so do the CLI `play` and
+  `keepalive` loops, whose fresh process is blank. It needs a connected device
+  and fails with the connect reason otherwise. "Only if blank" is the session
+  prime's rule, not the Command's.
+- **Per-tick handlers log at DEBUG; one-shot actions at INFO.** (See CLAUDE.md
+  logging section — the same rule binds every UI.)
+
+The test of a good entry contract: you can state it as "at *entry X*, dispatch
+*Command Y*," and it reads the same for all four UIs.
+
+## The first-run / lifecycle sequence
+
+The whole path, launch → glass, as shared Commands:
+
+| Step | Command(s) | What it does |
+|---|---|---|
+| detect | `DiscoverDevices` | scan the bus, resolve `DeviceInfo` |
+| ensure data | `EnsureDataDownload(w, h)` | download + extract the themes/masks for this canvas |
+| connect | `ConnectDevice` / `EnsureConnected` | attach + handshake |
+| restore | `RestoreDeviceState` | persisted theme → else first theme → replay background |
+| stream | `RenderAndSend` / `KeepAliveLoop` | render live metrics + keep a volatile panel lit |
+
+**First-run parity:** a first-run user on *any* UI should get autodetect +
+download + a displayed first theme — the GUI does this on launch; the CLI, API,
+and qtgui must reach the same sequence, not a bespoke onboarding each.
+
+## Where the current UIs diverge (honest current state)
+
+The backbones exist; the *lifecycle* is not yet unified — first-run is
+reimplemented per surface, and that is the standing debt this doc names:
+
+- **CLI:** `RunQuickstart` + implicit `EnsureDataDownload` via `DiscoverDevices`
+  + `system.py`.
+- **API:** an explicit `POST /theme/init` (`EnsureDataDownload`) + `/devices`
+  scan — no single onboarding call.
+- **GUI:** `splash.py` + `trcc_app` download orchestration on launch.
+- **qtgui:** `device_picker` + `device_panel` — least verified.
+
+The target is a single shared "ensure-ready" path (detect → ensure data →
+connect → restore) each UI invokes, the way `RestoreDeviceState` unified the
+restore step. Until then, adding onboarding to one UI without the others is the
+drift to resist.
+
+## The parity gate
+
+`tests/test_ui_parity.py` pins the CLI ↔ API Command surface: the two complete
+programmatic UIs must dispatch the same Commands (today ~95 shared), and every
+intentional asymmetry lives in an annotated ledger — `_CLI_ONLY` / `_API_ONLY` —
+where each reason is tagged **`scoped:`** (legitimately one-UI) or **`gap:`**
+(should reach parity — a tracked TODO, e.g. `RunQuickstart`, the first-run
+lifecycle drift). A new Command wired into one surface but not the other **fails
+the test**, forcing the author to either reach parity or ledger it with a reason;
+a stale ledger entry (no longer diverging) also fails, so the ledger can't rot.
+A shared-surface floor guards against the collector silently returning empty and
+passing vacuously. That test is the enforceable half of this doc; the prose is
+the why. (GUI/qtgui dispatch via handlers, not top-level imports, so their
+reachability needs a dynamic collector — a future gate.)
+
+## Anti-patterns — the ways UI unity breaks
+
+- **Business logic in an adapter.** A resolution resolved, a fallback decided, a
+  theme chosen inside `ui/*` — it belongs in a Command or `Settings`. This is
+  where every divergence is born.
+- **A UI shadowing `Settings`.** A widget/handler caching its own copy of state
+  the config owns → the UIs disagree the moment one writes and the other
+  doesn't re-read.
+- **A capability wired in one UI only.** "The GUI can, the CLI can't" is a bug.
+  Add the Command once; expose it as a thin dispatch in every surface.
+- **A bespoke lifecycle per UI.** Reimplementing detect/download/restore instead
+  of invoking the shared step — the exact class of drift #150 came from.
+- **Reaching for a new Command when one exists.** Parity means *reuse* the
+  existing Command across UIs, not add a near-duplicate for one of them.
+
+## The honesty clause
+
+Same as `METHOD.md`: status comes from artifacts. "Unified" is true only when
+the parity gate is green *and* the behaviour is one Command *and* the state is in
+`trcc.json`. Say which UIs are verified and which are inferred — qtgui parity is
+the least verified today. See `CLAUDE.md` → "No progress theater".

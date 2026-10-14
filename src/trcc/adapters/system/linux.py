@@ -1,0 +1,1524 @@
+"""LinuxOS — concrete Platform implementation for Linux.
+
+This file owns every Linux-specific thing: sysfs walks, SG_IO ioctl,
+XDG paths, udev-rule checks, autostart.  Other OSes have their own
+sibling file.
+
+Key pieces:
+    LinuxPaths             — XDG + HOME resolution
+    LinuxScsiTransport     — SCSI over /dev/sgN via SG_IO ioctl
+    _resolve_scsi_path     — vid:pid → /dev/sg* via sysfs walk
+    LinuxOS          — the Platform ABC wiring
+"""
+from __future__ import annotations
+
+import ctypes
+import errno
+import logging
+import os
+import re
+import shutil
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._imc_timings import ImcTimings
+
+from ...core.errors import PermissionError_, TransportError
+from ...core.logs import per_frame
+from ...core.models import UsbPowerState
+from ...core.ports import (
+    AutostartManager,
+    HotplugMonitor,
+    PackageManager,
+    Paths,
+    RamAccess,
+    ScsiTransport,
+    SensorEnumerator,
+    SmBus,
+)
+from ..rgb.smbus import LinuxSmBus, find_smbus, silent_memory_sensors
+from ..sensors.aggregator import build_linux_sensors
+from ..sensors.gpu_detect import (
+    detect_gpu_vendors,
+    install_matching_gpu_extras,
+)
+from ..visual import EglSurface, drawn_on
+from ..visual.sound import MonitorSoundInput
+from ._base import RELEASES_URL, BaseOS, BasePaths, download_and_install
+from ._desktop_entry import XdgDesktopEntry
+from ._polkit_install import POLKIT_POLICY
+from ._polkit_install import install as install_polkit_files
+from ._ram_access import LinuxRamAccess
+from ._rgb_hardware import SysfsRgbHardware
+from ._selinux import install as install_selinux_policy
+from ._udev import install as install_udev_rules
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+# =========================================================================
+# LinuxPaths — XDG-style locations
+# =========================================================================
+
+
+class LinuxPaths(BasePaths):
+    """XDG + HOME locations for user data."""
+
+    def __init__(self) -> None:
+        home = Path.home()
+        self._root = home / ".trcc"
+        self._user_content = home / ".trcc-user"
+        log.info("LinuxPaths: root=%s user_content=%s",
+                 self._root, self._user_content)
+
+
+# =========================================================================
+# Autostart — XDG .desktop manager moved to ._autostart
+# =========================================================================
+#
+# ``XdgDesktopAutostart`` (writes ~/.config/autostart/trcc.desktop) now
+# lives in ``._autostart`` so ``BSDPlatform`` can share the same XDG
+# mechanism (legacy ran the identical code on both).  See
+# ``LinuxOS.autostart()`` below.
+
+
+# =========================================================================
+# SG_IO — Linux kernel-native SCSI passthrough
+# =========================================================================
+#
+# A single ioctl(SG_IO) bundles CDB + data phase + status, so a frame
+# chunk costs one syscall on Linux (vs. 3 for userspace USB BOT).  The
+# kernel also handles the mass-storage prelude (INQUIRY / TEST UNIT
+# READY / Get Max LUN) that raw BOT skips — which is what stalls
+# endpoints on vendor CDBs like 0xF5/0x1F5.
+
+_SG_IO = 0x2285
+_SG_DXFER_TO_DEV = -2
+_SG_DXFER_FROM_DEV = -3
+_SENSE_BUF_LEN = 32
+
+
+class _SgIoHdr(ctypes.Structure):
+    """Kernel sg_io_hdr_t — the ioctl argument for SG_IO."""
+
+    _fields_ = [
+        ('interface_id', ctypes.c_int),
+        ('dxfer_direction', ctypes.c_int),
+        ('cmd_len', ctypes.c_ubyte),
+        ('mx_sb_len', ctypes.c_ubyte),
+        ('iovec_count', ctypes.c_ushort),
+        ('dxfer_len', ctypes.c_uint),
+        ('dxferp', ctypes.c_void_p),
+        ('cmdp', ctypes.c_void_p),
+        ('sbp', ctypes.c_void_p),
+        ('timeout', ctypes.c_uint),
+        ('flags', ctypes.c_uint),
+        ('pack_id', ctypes.c_int),
+        ('usr_ptr', ctypes.c_void_p),
+        ('status', ctypes.c_ubyte),
+        ('masked_status', ctypes.c_ubyte),
+        ('msg_status', ctypes.c_ubyte),
+        ('sb_len_wr', ctypes.c_ubyte),
+        ('host_status', ctypes.c_ushort),
+        ('driver_status', ctypes.c_ushort),
+        ('resid', ctypes.c_int),
+        ('duration', ctypes.c_uint),
+        ('info', ctypes.c_uint),
+    ]
+
+
+_SG_HDR_SIZE = ctypes.sizeof(_SgIoHdr)
+
+#: Host byte the kernel completes SG_IO with once the device is being removed
+#: or has been offlined (scsi_lib.c, usb-storage scsiglue.c, uas.c).  The
+#: ioctl itself returns 0 and ``status`` stays 0.
+_DID_NO_CONNECT = 0x01
+#: ``info`` bit the kernel sets when status, host or driver byte reports any
+#: error (sg.h SG_INFO_OK_MASK).
+_SG_INFO_OK_MASK = 0x1
+
+
+def _sg_failed(hdr: _SgIoHdr, op: str, path: str) -> bool:
+    """Whether a completed SG_IO failed; raise when the device is gone.
+
+    ``status`` alone was tested, and a removed or offlined panel completes
+    with ``status`` 0 and ``host_status`` DID_NO_CONNECT -- so every frame to
+    a dead panel counted as SENT, nothing escalated, and the panel stayed
+    "connected" (#254).  That one is raised as disconnect-class (ENODEV), so
+    the recovery threshold marks it lost; any other error is a soft failure,
+    as USBLCD.exe treats every write.
+    """
+    if hdr.host_status == _DID_NO_CONNECT:
+        log.warning("SG_IO %s on %s: DID_NO_CONNECT -- the device is gone",
+                    op, path)
+        raise TransportError(
+            f"SG_IO {op} on {path}: device gone (DID_NO_CONNECT)",
+        ) from OSError(errno.ENODEV, "DID_NO_CONNECT")
+    if hdr.info & _SG_INFO_OK_MASK:
+        log.warning("SG_IO %s on %s failed: status=%d host=%d driver=%d "
+                    "info=%#x", op, path, hdr.status, hdr.host_status,
+                    hdr.driver_status, hdr.info)
+        return True
+    return False
+
+
+def _resolve_scsi_path(vid: int, pid: int,
+                       unit: str = "") -> str | None:
+    """Walk sysfs to find /dev/sgN for a given VID:PID.
+
+    *unit* restricts the search to the device in one USB port, so two
+    identical coolers do not both resolve to the first one's node (#287).
+
+    Pass 1: /sys/class/scsi_generic/sgN  (kernel `sg` module loaded)
+    Pass 2: /sys/block/sdN               (sg not loaded — block fallback)
+
+    Returns the absolute /dev path, or None if no match.
+    """
+    log.debug("_resolve_scsi_path: %04x:%04x", vid, pid)
+    for base, name_prefix in (("/sys/class/scsi_generic", "sg"),
+                              ("/sys/block", "sd")):
+        base_path = Path(base)
+        if not base_path.exists():
+            continue
+        for entry in base_path.iterdir():
+            if not entry.name.startswith(name_prefix):
+                continue
+            sysfs_device = entry / "device"
+            if not sysfs_device.exists():
+                continue
+            found, usb_dir = _walk_sysfs_for_vid_pid(sysfs_device)
+            if found == (vid, pid) and (not unit or usb_dir == unit):
+                if name_prefix == "sd":
+                    log.info("sg module not loaded — using block device /dev/%s",
+                             entry.name)
+                return f"/dev/{entry.name}"
+    return None
+
+
+def _walk_sysfs_for_vid_pid(
+    start: Path,
+) -> tuple[tuple[int, int] | None, str]:
+    """``((vid, pid), usb_dir)`` for the USB device this node hangs off.
+
+    The second value is the ancestor directory's NAME, and it is free: the
+    kernel names a USB device directory by its topology — ``1-13.4`` — which
+    is character-for-character what :func:`usb_path` builds from PyUSB's
+    ``bus`` and ``port_numbers``.  That is why the format was chosen there
+    rather than invented, and it is what lets SCSI pick a specific unit
+    (#287) without a second lookup or a second identity scheme.
+
+    VERIFIED on the dev box: ``/sys/bus/usb/devices/1-13.4`` holds
+    ``idVendor=0402``, and ``sg0``'s device link resolves through
+    ``…/usb1/1-13/1-13.4/…``.
+
+    ``(None, "")`` when no USB ancestor is found within ten levels.
+    """
+    log.debug("_walk_sysfs_for_vid_pid: start=%s", start)
+    path = Path(start).resolve()
+    for _ in range(10):
+        path = path.parent
+        vid_file = path / "idVendor"
+        pid_file = path / "idProduct"
+        if vid_file.exists() and pid_file.exists():
+            try:
+                return ((int(vid_file.read_text().strip(), 16),
+                         int(pid_file.read_text().strip(), 16)), path.name)
+            except (OSError, ValueError):
+                return (None, "")
+    return (None, "")
+
+
+class LinuxScsiTransport(ScsiTransport):
+    """SCSI transport over /dev/sgN using SG_IO ioctl.
+
+    One ioctl per CDB — the kernel bundles CDB, data phase, and status.
+    Buffer allocations are cached by data-length so the per-frame hot
+    path does only memmoves + one ioctl (no Python-side allocation).
+    """
+
+    def __init__(self, device_path: str) -> None:
+        self._path = device_path
+        self._fd: int | None = None
+        # /dev/sd* is the root-only block fallback used when the sg module
+        # isn't loaded; it takes neither the advisory claim nor the sg hint.
+        self._is_block = device_path.startswith("/dev/sd")
+        # Cache for send_cdb: {data_len: (cdb_buf, data_buf, sense_buf, hdr, ioctl_buf)}
+        self._write_bufs: dict[int, tuple] = {}
+        log.info("LinuxScsiTransport: bound to %s", device_path)
+
+    @property
+    def is_open(self) -> bool:
+        opened = self._fd is not None
+        frame_log.debug("LinuxScsiTransport.is_open → %s (fd=%s)", opened, self._fd)
+        return opened
+
+    def open(self) -> bool:
+        if self._fd is not None:
+            log.debug("LinuxScsiTransport.open: %s already open (fd=%d)",
+                      self._path, self._fd)
+            return True
+        try:
+            fd = os.open(self._path, os.O_RDWR | os.O_NONBLOCK)
+        except OSError as e:
+            log.error("LinuxScsiTransport: open failed for %s: %s", self._path, e)
+            if e.errno == errno.EACCES:
+                # A resolved-but-unreadable node almost always means setup was
+                # never run: the /dev/sd* block fallback is root-only (the udev
+                # 0666 rule only covers scsi_generic), and even /dev/sg* is
+                # root-only until the setup rule lands.  Name the remediation
+                # instead of a bare EACCES.  (#217)
+                detail = ("this is a root-only block node (the sg kernel module "
+                          "isn't loaded) — " if self._is_block else "")
+                hint = (f"permission denied on {self._path} — {detail}run "
+                        "`trcc system setup` then reboot to load sg and grant "
+                        "0666 access without sudo (#217)")
+                log.warning("LinuxScsiTransport: %s", hint)
+                # Raised, like the bulk and HID transports: a plain False read
+                # as "not answering yet", so a panel nobody may open was retried
+                # for as long as TRCC ran, and the connect lost the hint.
+                raise PermissionError_(hint) from e
+            return False
+        if not self._claim(fd):
+            os.close(fd)
+            return False
+        self._fd = fd
+        log.info("LinuxScsiTransport: opened %s (fd=%d)", self._path, fd)
+        return True
+
+    def _claim(self, fd: int) -> bool:
+        """Take the advisory whole-device lock, or refuse the open.
+
+        SCSI generic has NO kernel-level exclusion: two processes can each
+        ``os.open`` /dev/sgN and both write frames, which interleave with no
+        error and nothing logged (measured on real hardware).  ``flock`` is
+        advisory, so only other TRCC processes are excluded -- smartctl,
+        lsblk, udisks and automounters open the node exactly as before -- and
+        the kernel releases it when the fd closes OR the process dies, so a
+        crash leaves nothing to clean up.
+
+        Block nodes are skipped: the /dev/sd* fallback is root-only and its
+        locking interacts with the kernel's mount claiming, which is not
+        verified.  A lock error that isn't "busy" degrades to today's
+        behaviour rather than failing a device we could otherwise drive.
+        """
+        log.debug("_claim: fd=%d path=%s is_block=%s",
+                  fd, self._path, self._is_block)
+        if self._is_block:
+            log.info("_claim: %s is a block node — advisory claim skipped",
+                     self._path)
+            return True
+        import fcntl  # Linux-only stdlib -- lazy so linux.py imports on Windows (#166)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                log.warning(
+                    "LinuxScsiTransport: %s is already claimed by another TRCC "
+                    "process (GUI, daemon or CLI) — refusing to open it.  Two "
+                    "owners interleave frames on this wire, so close the other "
+                    "one, or run `trcc kill` if a daemon holds it.", self._path,
+                )
+                return False
+            log.warning(
+                "LinuxScsiTransport: flock unavailable on %s (%s) — continuing "
+                "WITHOUT the single-owner guard", self._path, e,
+            )
+            return True
+        log.info("LinuxScsiTransport: claimed %s (advisory flock)", self._path)
+        return True
+
+    def close(self) -> None:
+        if self._fd is None:
+            log.debug("LinuxScsiTransport.close: %s already closed", self._path)
+            return
+        log.info("LinuxScsiTransport: closing %s (fd=%d)", self._path, self._fd)
+        try:
+            os.close(self._fd)
+        except OSError as e:
+            log.warning("LinuxScsiTransport: os.close raised %s — continuing", e)
+        self._fd = None
+        self._write_bufs.clear()
+
+    def send_cdb(self, cdb: bytes, data: bytes,
+                 timeout_ms: int = 5000) -> bool:
+        """SCSI CDB + data-out via single SG_IO ioctl.  True when it
+        completed clean; raises once the device is gone (:func:`_sg_failed`)."""
+        frame_log.debug("LinuxScsiTransport.send_cdb: cdb_len=%d data_len=%d timeout=%dms",
+                  len(cdb), len(data), timeout_ms)
+        if self._fd is None:
+            log.error("LinuxScsiTransport.send_cdb: %s not open", self._path)
+            raise TransportError(f"LinuxScsiTransport {self._path} not open")
+
+        bufs = self._write_bufs.get(len(data))
+        if bufs is None:
+            bufs = self._alloc_write_bufs(len(cdb), len(data))
+            self._write_bufs[len(data)] = bufs
+        cdb_buf, data_buf, _sense, hdr, ioctl_buf = bufs
+
+        ctypes.memmove(cdb_buf, cdb, len(cdb))
+        if data:
+            ctypes.memmove(data_buf, data, len(data))
+        hdr.timeout = timeout_ms
+        ctypes.memmove(ioctl_buf, ctypes.addressof(hdr), _SG_HDR_SIZE)
+        import fcntl  # Linux-only stdlib — lazy so linux.py imports on Windows (#166)
+        fcntl.ioctl(self._fd, _SG_IO, ioctl_buf)
+        ctypes.memmove(ctypes.addressof(hdr), ioctl_buf, _SG_HDR_SIZE)
+
+        return not _sg_failed(hdr, "send_cdb", self._path)
+
+    def read_cdb(self, cdb: bytes, length: int,
+                 timeout_ms: int = 5000) -> bytes:
+        """SCSI CDB + data-in via single SG_IO ioctl.  Empty bytes on error.
+
+        Not cached — reads happen only at handshake/poll, not per frame.
+        """
+        log.debug("LinuxScsiTransport.read_cdb: cdb_len=%d length=%d timeout=%dms",
+                  len(cdb), length, timeout_ms)
+        if self._fd is None:
+            log.error("LinuxScsiTransport.read_cdb: %s not open", self._path)
+            raise TransportError(f"LinuxScsiTransport {self._path} not open")
+
+        cdb_buf = (ctypes.c_ubyte * len(cdb)).from_buffer_copy(cdb)
+        data_buf = (ctypes.c_ubyte * length)()
+        sense_buf = (ctypes.c_ubyte * _SENSE_BUF_LEN)()
+
+        hdr = _SgIoHdr()
+        hdr.interface_id = ord('S')
+        hdr.dxfer_direction = _SG_DXFER_FROM_DEV
+        hdr.cmd_len = len(cdb)
+        hdr.mx_sb_len = _SENSE_BUF_LEN
+        hdr.dxfer_len = length
+        hdr.dxferp = ctypes.addressof(data_buf)
+        hdr.cmdp = ctypes.addressof(cdb_buf)
+        hdr.sbp = ctypes.addressof(sense_buf)
+        hdr.timeout = timeout_ms
+
+        ioctl_buf = ctypes.create_string_buffer(_SG_HDR_SIZE)
+        ctypes.memmove(ioctl_buf, ctypes.addressof(hdr), _SG_HDR_SIZE)
+        import fcntl  # Linux-only stdlib — lazy so linux.py imports on Windows (#166)
+        fcntl.ioctl(self._fd, _SG_IO, ioctl_buf)
+        ctypes.memmove(ctypes.addressof(hdr), ioctl_buf, _SG_HDR_SIZE)
+
+        actual = length - hdr.resid
+        # SCSI status GOOD with a host error is how the panel answers its
+        # handshake poll: host=7 (DID_ERROR) every time, with the reply
+        # delivered.  Dropping it read every 0402:3922 panel as FBL 100,
+        # "Frozen Warframe Pro" (#301, since #254's 3e3909e2).  It is the
+        # panel's NORMAL answer, so INFO: as a warning it printed two lines on
+        # every connect.  DID_NO_CONNECT still goes to ``_sg_failed`` (gone).
+        if (hdr.info & _SG_INFO_OK_MASK and hdr.status == 0
+                and hdr.host_status != _DID_NO_CONNECT
+                and 0 < actual <= length):
+            log.info("read_cdb on %s: %d byte(s) with SCSI status GOOD and "
+                     "host=%d — the panel's usual poll answer, kept",
+                     self._path, actual, hdr.host_status)
+            return bytes(data_buf[:actual])
+        if _sg_failed(hdr, "read_cdb", self._path):
+            return b""
+        return bytes(data_buf[:actual])
+
+    def _alloc_write_bufs(self, cdb_len: int, data_len: int) -> tuple:
+        """Build a (cdb, data, sense, hdr, ioctl) buffer set for one size class."""
+        log.debug("_alloc_write_bufs: cdb_len=%s data_len=%s", cdb_len, data_len)
+        cdb_buf = (ctypes.c_ubyte * cdb_len)()
+        data_buf = (ctypes.c_ubyte * data_len)()
+        sense_buf = (ctypes.c_ubyte * _SENSE_BUF_LEN)()
+        hdr = _SgIoHdr()
+        hdr.interface_id = ord('S')
+        hdr.dxfer_direction = _SG_DXFER_TO_DEV
+        hdr.cmd_len = cdb_len
+        hdr.mx_sb_len = _SENSE_BUF_LEN
+        hdr.dxfer_len = data_len
+        hdr.dxferp = ctypes.addressof(data_buf)
+        hdr.cmdp = ctypes.addressof(cdb_buf)
+        hdr.sbp = ctypes.addressof(sense_buf)
+        ioctl_buf = ctypes.create_string_buffer(_SG_HDR_SIZE)
+        return (cdb_buf, data_buf, sense_buf, hdr, ioctl_buf)
+
+
+# =========================================================================
+# LinuxOS
+# =========================================================================
+
+# logical tool → distro package name (consumed by software_install_hint).
+_LINUX_INSTALL_PKGS: dict[str, str] = {
+    "ffmpeg": "ffmpeg",
+    "7z": "p7zip",
+    "python": "python3",
+    "pynvml": "python3-pynvml",
+}
+
+@dataclass(frozen=True)
+class LinuxFamily:
+    """One Linux package-manager family: a record, not a subclass.
+
+    These were eight classes -- AptLinux, DnfLinux, PacmanLinux and so on --
+    each subclassing LinuxOS.  Measured before the change: **all eight defined
+    zero methods.**  Every attribute was a package-manager fact.  A child whose
+    entire content is data is not a subclass; it is a record that has not been
+    given a type yet, and reading "DATA over the parent's methods" as a design
+    rather than an alarm is how eight of them accumulated.
+
+    A package manager is also not an operating system.  Windows and macOS never
+    grew this because they have exactly one manager each, so there was nothing
+    to subclass along -- which is the diagnosis: the axis was never an OS axis.
+
+    ``pacman`` is a package manager.  ``LinuxOS`` is one class that *has* one.
+    """
+
+    #: Human label for logs and hints ("Fedora-family").
+    name: str
+    #: The binary probed to detect this family — and the detection order in
+    #: :data:`_FAMILIES` is load-bearing, first hit wins.
+    manager: str
+    #: Install one-liner with a ``{pkg}`` slot.
+    install_cmd: str
+    #: The command that installs the release's own package for this family,
+    #: or "" where we ship none (the hint then points at the release page).
+    package_upgrade: str = ""
+    #: tool -> this family's package name, where it differs from
+    #: :data:`_LINUX_INSTALL_PKGS`.  A missing row means "unconfirmed", not
+    #: "same as Debian" — guessing is what #207 was.
+    packages: Mapping[str, str] = field(default_factory=dict)
+
+
+#: Probe order, first match wins.  Preserved exactly from the class tuple it
+#: replaced: it is NOT definition order, and a machine with two managers gets
+#: the first listed.
+_FAMILIES: tuple[LinuxFamily, ...] = (
+    LinuxFamily(
+        name="Fedora-family", manager="dnf",
+        install_cmd="sudo dnf install {pkg}",
+        package_upgrade=f"sudo dnf install {RELEASES_URL}/download/trcc-linux-latest.noarch.rpm",
+        # Advised by BINARY PATH, not package name.  Both shared names are
+        # wrong here and both fail in a way that looks like success:
+        #   p7zip  -> 7zip-standalone, ships ['7za'] and NO 7z
+        #   ffmpeg -> not in stock Fedora at all (that is RPM Fusion)
+        # A corrected NAME only trades one wrong answer for another, because
+        # which package owns the binary depends on the user's repos:
+        #   /usr/bin/ffmpeg  stock -> ffmpeg-free  ·  +RPM Fusion -> ffmpeg
+        # On RHEL/Rocky/Alma both are EPEL-only (el9/el10_2/el10_3).
+        packages={"pynvml": "python3-pynvml",
+                  "7z": "/usr/bin/7z",
+                  "ffmpeg": "/usr/bin/ffmpeg"},
+    ),
+    LinuxFamily(
+        name="Debian-family", manager="apt",
+        install_cmd="sudo apt install {pkg}",
+        package_upgrade=download_and_install("trcc-linux-latest_all.deb",
+                                             "sudo apt install"),
+        packages={"pynvml": "python3-pynvml"},
+    ),
+    LinuxFamily(
+        name="Arch-family", manager="pacman",
+        install_cmd="sudo pacman -S {pkg}",
+        package_upgrade=download_and_install("trcc-linux-latest-any.pkg.tar.zst",
+                                             "sudo pacman -U"),
+        # Arch names it differently, and advising Debian's name here is #207.
+        packages={"pynvml": "python-nvidia-ml-py"},
+    ),
+    LinuxFamily(
+        name="SUSE-family", manager="zypper",
+        install_cmd="sudo zypper install {pkg}",
+        packages={"pynvml": "python3-pynvml"},
+    ),
+    LinuxFamily(
+        name="Void", manager="xbps-install",
+        install_cmd="sudo xbps-install {pkg}",
+    ),
+    LinuxFamily(
+        name="Alpine", manager="apk",
+        install_cmd="sudo apk add {pkg}",
+    ),
+    LinuxFamily(
+        name="NixOS", manager="nix-env",
+        install_cmd="nix-env -iA nixpkgs.{pkg}",
+    ),
+)
+
+#: RHEL / CentOS Stream / Rocky / AlmaLinux.  Same manager as Fedora, which is
+#: why it cannot be told apart by the probe and needs /etc/os-release.
+#:
+#: Measured 2026-08-21 against AlmaLinux 9 + EPEL 9 metadata: BOTH binaries the
+#: app looks for are EPEL-only there.  Neither /usr/bin/7z nor /usr/bin/ffmpeg
+#: is in BaseOS or AppStream, so a hint that verifies clean against Fedora
+#: finds nothing on a Rocky box that has not enabled EPEL.
+_EL_FAMILY = LinuxFamily(
+    name="EL-family", manager="dnf",
+    install_cmd="sudo dnf install {pkg}",
+    packages={"pynvml": "python3-pynvml",
+              "7z": "/usr/bin/7z",
+              "ffmpeg": "/usr/bin/ffmpeg"},
+)
+
+#: ``ID=`` values that mean Enterprise Linux, and the ``ID_LIKE`` token that
+#: covers the rebuilds this list does not name.
+_EL_IDS = frozenset({"rhel", "rocky", "almalinux", "centos", "ol", "oracle"})
+
+#: The package whose presence decides whether the EL hints work as written.
+_EPEL = "epel-release"
+
+
+#: No recognised manager.  Empty rather than borrowed: an unresolved Linux must
+#: say so, not answer as somebody else's distro.
+_GENERIC_FAMILY = LinuxFamily(name="Linux", manager="", install_cmd="")
+
+
+#: Tools whose distro package name is confirmed to differ per family, and the
+#: honest answer when a family has not confirmed one.  Without this an
+#: unconfirmed family silently inherits Debian's name — a command that looks
+#: right and fails (#207).
+_UNCONFIRMED_FALLBACK: dict[str, str] = {
+    "pynvml": "pip install nvidia-ml-py",
+}
+
+# Tools whose package name DIFFERS per distro.  One name for all of Linux is a
+# lie: advising "python3-pynvml" on Arch names a package that does not exist,
+# so the NVIDIA user is told to run a command that fails (#207).
+#
+# This is also why the reader is an optdepend/Recommends and must stay one:
+# Arch's python-nvidia-ml-py depends on nvidia-utils (~938 MB) and Debian's
+# python3-pynvml pulls libnvidia-ml1 from *contrib* — hard-depending inflicts
+# the NVIDIA driver stack on every AMD/Intel owner (#216) and breaks installs
+# where contrib is not enabled.  The reader is optional; the ADVICE is what
+# has to be right.
+#
+# These now live on the family classes at the bottom of this file — one class
+# per package manager, each owning its own command and names.  They used to be
+# four parallel tables in three files, and one had already drifted short by two.
+
+def _is_enterprise_linux(text: str | None = None) -> bool:
+    """Does /etc/os-release describe RHEL or a rebuild of it?
+
+    Fedora and EL both answer ``dnf``, so the binary probe cannot separate
+    them -- and the difference matters, because the packages our hints name are
+    EPEL-only on EL.  ``ID`` names the distro and ``ID_LIKE`` covers rebuilds
+    this does not list by name.
+
+    *text* is injectable because there is no EL box here to test on; the tests
+    feed real os-release contents rather than mocking the outcome.
+    """
+    if text is None:
+        try:
+            text = Path("/etc/os-release").read_text(encoding="utf-8")
+        except OSError:
+            return False
+    ident, like = "", ""
+    for line in text.splitlines():
+        if line.startswith("ID="):
+            ident = line[3:].strip().strip('"')
+        elif line.startswith("ID_LIKE="):
+            like = line[8:].strip().strip('"')
+    hit = ident in _EL_IDS or "rhel" in like.split()
+    log.debug("_is_enterprise_linux: ID=%r ID_LIKE=%r -> %s", ident, like, hit)
+    return hit
+
+
+class LinuxOS(BaseOS, key="linux"):
+    """Linux implementation — same OS contract; only internals below differ.
+
+    USB access via pyusb (libusb).  Udev rules installed by setup() give
+    non-root users access to the devices listed in the product registry.
+    """
+
+    #: Find spots RGB controllers from sysfs -- no device is opened.
+    RGB_HARDWARE = SysfsRgbHardware
+    #: Audio visuals: what is playing (the PulseAudio/PipeWire monitor),
+    #: drawn off-screen on EGL -- no display needed.
+    SOUND_INPUT = MonitorSoundInput
+    VISUALS = drawn_on(EglSurface)
+
+    # ── Per-OS internals (the add-a-new-OS interface) ────────────────────
+
+    def _make_paths(self) -> Paths:
+        log.debug("_make_paths")
+        return LinuxPaths()
+
+    def _build_sensors(self) -> SensorEnumerator:
+        log.debug("_build_sensors")
+        return build_linux_sensors()
+
+    def _build_autostart(self) -> AutostartManager:
+        # XDG .desktop — ~/.config/autostart/trcc.desktop.
+        log.debug("_build_autostart")
+        from ._autostart import XdgDesktopAutostart
+        return XdgDesktopAutostart()
+
+    def _build_hotplug(self) -> HotplugMonitor:
+        log.debug("_build_hotplug")
+        from ._hotplug import LinuxHotplugMonitor
+        return LinuxHotplugMonitor()
+
+    # ── Transport factories ──────────────────────────────────────────
+
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                  unit: str = "") -> ScsiTransport:
+        """Return an unopened SG_IO-backed SCSI transport.
+
+        Resolves vid:pid → /dev/sgN via sysfs before building the
+        transport.  Raises TransportError if the device isn't present
+        as a SCSI generic or sd block device.
+        """
+        log.info("LinuxOS.open_scsi: %04x:%04x serial=%r unit=%s",
+                 vid, pid, serial, unit or "(only)")
+        path = _resolve_scsi_path(vid, pid, unit)
+        if path is None:
+            log.error("LinuxOS.open_scsi: no /dev/sg* node for %04x:%04x",
+                      vid, pid)
+            raise TransportError(
+                f"No SCSI device node found for {vid:04x}:{pid:04x} — "
+                "check that the device is attached and the scsi_generic "
+                "kernel module is loaded"
+            )
+        log.info("LinuxOS.open_scsi: %04x:%04x → %s", vid, pid, path)
+        return LinuxScsiTransport(path)
+
+    # ── Setup / permissions ──────────────────────────────────────────
+
+    def setup(self, dry_run: bool = False) -> int:
+        """Run one-time Linux setup.
+
+        Six things happen here and none can silently no-op:
+          1. udev rules — write /etc/udev/rules.d/99-trcc-lcd.rules for
+             every device in the registry + modprobe quirks + sg autoload.
+             Requires root; re-execs via sudo when not already root.
+          2. GPU Python extras — detect GPU vendors via PCI sysfs and
+             pip install matching libs (e.g., nvidia-ml-py for NVIDIA).
+          3. SELinux policy — on enforcing systems, build + load the
+             ``trcc_usb`` module so the bulk/SCSI USB ioctls aren't blocked.
+             No-op off SELinux.  (RPM installs already load it in %post.)
+          4. Desktop entry — register the app in the applications menu.
+             Our packages do this; a pip/pipx install does not, so without
+             it the app installs, autostarts, and cannot be launched from
+             the menu (#231).  Per-user, no root, skipped when a package
+             already provides it.
+          5. Old polkit grants — remove the rule and policy older releases
+             wrote, which let any program run dmidecode/smartctl as root.
+             Root (re-execs via sudo); only files that name our actions.
+          6. TRCC's polkit policy + RAM-lighting helpers — what the packages
+             install, so a pip/source install gets TRCC's own short password
+             prompt and a password-free turn-off.  Never over a package's.
+
+        ``dry_run=True`` prints what would be done and returns 0
+        without touching the system.
+        """
+        log.info("LinuxOS.setup: dry_run=%s", dry_run)
+        if dry_run:
+            log.info("=== dry run (pass dry_run=False to apply) ===")
+            install_udev_rules(dry_run=True)
+            vendors = detect_gpu_vendors()
+            log.info("Detected GPU vendors: %s", sorted(vendors) or "none")
+            install_matching_gpu_extras(vendors, dry_run=True)
+            install_selinux_policy(dry_run=True)
+            log.info("would install the desktop entry: %s",
+                     XdgDesktopEntry().path)
+            retire_legacy_polkit(dry_run=True)
+            install_polkit_files(dry_run=True, owns=self.packages().owns)
+            return 0
+
+        rc_udev = install_udev_rules(dry_run=False)
+        vendors = detect_gpu_vendors()
+        log.info("Detected GPU vendors: %s", sorted(vendors) or "none")
+        # GPU sensor extras are a BONUS — device access (udev) is the real job.
+        # A pip hiccup here (e.g. an offline box) must NOT make setup report
+        # total failure, which scared users into thinking nothing worked (#161).
+        rc_gpu = install_matching_gpu_extras(vendors, dry_run=False)
+        if rc_gpu:
+            log.warning("GPU sensor extras install returned %d — device setup "
+                        "is unaffected; GPU readings stay unavailable until the "
+                        "reader installs", rc_gpu)
+        rc_selinux = install_selinux_policy(dry_run=False)
+        # Desktop integration is a convenience, never a reason to report
+        # failure — the device still works from the CLI without a menu icon.
+        XdgDesktopEntry().install()
+        rc_polkit = retire_legacy_polkit(dry_run=False)
+        # After the retirement above, which keeps a policy naming only our
+        # /usr/bin/trcc-* helpers -- exactly the one this installs.
+        rc_helpers = install_polkit_files(dry_run=False,
+                                          owns=self.packages().owns)
+        return rc_udev or rc_selinux or rc_polkit or rc_helpers
+
+    def check_permissions(self) -> list[str]:
+        """Return user-facing warnings if udev rules are missing, etc."""
+        log.info("LinuxOS.check_permissions: probing")
+        from ._udev import rules_state
+        warnings: list[str] = []
+        state = rules_state()
+        if state.path is None:
+            warnings.append(
+                "udev rules not installed — device access may require root. "
+                "Run `trcc system setup` to install them."
+            )
+        elif state.current is False:
+            warnings.append(
+                f"the udev rules in {state.path} are from an older TRCC — run "
+                "`trcc doctor` for how to bring them up to date"
+            )
+        log.info("LinuxOS.check_permissions: %d warning(s)", len(warnings))
+        return warnings
+
+    # ── OS identity ───────────────────────────────────────────────────
+
+    def distro_name(self) -> str:
+        """Parse /etc/os-release for the pretty name."""
+        path = Path("/etc/os-release")
+        if not path.exists():
+            log.info("LinuxOS.distro_name: /etc/os-release missing, "
+                     "defaulting to 'Linux'")
+            return "Linux"
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("PRETTY_NAME="):
+                    name = line.split("=", 1)[1].strip().strip('"')
+                    log.info("LinuxOS.distro_name → %s", name)
+                    return name
+        except Exception as e:
+            log.warning("LinuxOS.distro_name: parse failed (%s) — "
+                        "defaulting to 'Linux'", e)
+        return "Linux"
+
+    #: A sysfs USB device directory is named by its PORT CHAIN (``1-13``,
+    #: ``1-2.3``) — the exact form ``usb_path`` gives a unit, measured 7/7 on
+    #: the dev box incl. two identical hubs.  A unit becomes part of a PATH
+    #: here and can arrive from a user-typed key, so anything else — ``../``,
+    #: or the ``bus@address`` fallback sysfs does not name — is refused.
+    _SYSFS_PORT = re.compile(r"\d+-\d+(?:\.\d+)*")
+
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> UsbPowerState | None:
+        """Read the kernel's runtime-PM view of this device from sysfs.
+
+        ``unit`` reads THAT cooler's own directory; unit-less, the first of
+        the model — which, with two identical coolers, was the wrong one half
+        the time (#287).
+
+        Read-only.  Setting the policy is the udev rules' job (``_udev.py``);
+        this reports what the kernel currently thinks so a timed-out handshake
+        can be told apart from a SUSPENDED panel (#150).
+
+        ``supports_remote_wakeup`` comes from the config descriptor's
+        ``bmAttributes`` bit 5.  It is the discriminator that explains why two
+        panels behave differently: a device that cannot wake the host is never
+        autosuspended, whatever ``power/control`` says — measured on the dev
+        panel (0402:3922, bmAttributes 0x80 → bit 5 clear → never suspends
+        even at control=auto).
+        """
+        log.debug("usb_power_state: %04x:%04x unit=%r", vid, pid, unit)
+        base = Path("/sys/bus/usb/devices")
+        if not base.is_dir():
+            return None
+        if unit and not self._SYSFS_PORT.fullmatch(unit):
+            log.debug("usb_power_state: unit %r is not a sysfs port — "
+                      "unknowable", unit)
+            return None
+        for dev in [base / unit] if unit else base.iterdir():
+            try:
+                if (int((dev / "idVendor").read_text().strip(), 16) != vid
+                        or int((dev / "idProduct").read_text().strip(), 16) != pid):
+                    continue
+            except (OSError, ValueError):
+                continue
+
+            def _read(node: Path, name: str, default: str = "") -> str:
+                log.debug("_read: node=%s name=%s", node, name)
+                try:
+                    return (node / name).read_text().strip()
+                except OSError:
+                    return default
+
+            def _int(node: Path, name: str) -> int:
+                log.debug("_int: node=%s name=%s", node, name)
+                raw = _read(node, name)
+                return int(raw) if raw.isdigit() else 0
+
+            # bmAttributes is per-configuration; bit 5 = remote wakeup.
+            wakeup = False
+            raw_attrs = _read(dev, "bmAttributes")
+            try:
+                wakeup = bool(int(raw_attrs, 16) & 0x20) if raw_attrs else False
+            except ValueError:
+                wakeup = False
+
+            state = UsbPowerState(
+                control=_read(dev, "power/control"),
+                runtime_status=_read(dev, "power/runtime_status"),
+                autosuspend_delay_ms=_int(dev, "power/autosuspend_delay_ms"),
+                suspended_time_ms=_int(dev, "power/runtime_suspended_time"),
+                supports_remote_wakeup=wakeup,
+            )
+            log.info("usb_power_state %04x:%04x → control=%s status=%s "
+                     "remote_wakeup=%s delay=%dms",
+                     vid, pid, state.control, state.runtime_status,
+                     state.supports_remote_wakeup, state.autosuspend_delay_ms)
+            return state
+        log.debug("usb_power_state: %04x:%04x not present on the bus", vid, pid)
+        return None
+
+    # ── Per-OS diagnostic hints (distro package manager) ──────────────
+
+    def __init__(self, family: LinuxFamily | None = None) -> None:
+        """Detect the package-manager family once, or accept one.
+
+        ``family`` is for tests and ``dev/tools/check_program_deps.py``, which
+        must be able to ask what a Debian box would be told while running on
+        Fedora.  Production passes nothing: ``current_platform()`` builds this
+        with ``cls()`` and the probe runs.
+        """
+        super().__init__()
+        self._family = family if family is not None else self._detect_family()
+        log.info("LinuxOS: family=%s manager=%s",
+                 self._family.name, self._family.manager or "(none)")
+
+    @staticmethod
+    def _detect_family() -> LinuxFamily:
+        """First installed manager wins — the order in :data:`_FAMILIES`.
+
+        ``sys.platform`` is "linux" on every distro, so the manager is the only
+        thing that distinguishes them.  Hundreds of distros, a handful of
+        managers.
+        """
+        for candidate in _FAMILIES:
+            if shutil.which(candidate.manager):
+                log.debug("LinuxOS._detect_family: found %s",
+                          candidate.manager)
+                if candidate.manager == "dnf" and _is_enterprise_linux():
+                    log.info("LinuxOS._detect_family: dnf, but os-release says "
+                             "Enterprise Linux — EL family")
+                    return _EL_FAMILY
+                return candidate
+        log.warning("LinuxOS._detect_family: no known package manager (%s) — "
+                    "install advice will be generic",
+                    ", ".join(f.manager for f in _FAMILIES))
+        return _GENERIC_FAMILY
+
+    @property
+    def family(self) -> LinuxFamily:
+        """This machine's package-manager family."""
+        log.debug("LinuxOS.family: %s", self._family.name)
+        return self._family
+
+    def package_command(self, pkg: str) -> str:
+        """This family's install line for *pkg*, or an honest generic."""
+        if not self._family.install_cmd:
+            log.info("package_command: no manager on this host — generic advice")
+            return f"Install {pkg} via your package manager"
+        return self._family.install_cmd.format(pkg=pkg)
+
+    def _build_packages(self) -> PackageManager:
+        """Only the rpm families can be asked so far.
+
+        Verified against dnf5 + rpm on Fedora 44.  apt/pacman/zypper/apk/xbps
+        are absent rather than guessed: writing them from documentation is what
+        put four wrong package names in the tables this replaces.
+        """
+        from ._packages import NoPackageManager, Rpm
+        if self._family.manager == "dnf":
+            log.info("%s._build_packages: rpm", type(self).__name__)
+            return Rpm()
+        log.info("%s._build_packages: %s not implemented yet — cannot be asked",
+                 type(self).__name__, self._family.manager or "(none)")
+        return NoPackageManager()
+
+    def package_manager(self) -> str:
+        """This family's manager — "" on a Linux we did not recognise."""
+        log.debug("package_manager: %s", self._family.manager or "(none)")
+        return self._family.manager
+
+    def upgrade_hint(self) -> str:
+        """A package install upgrades by installing the release's package."""
+        if self.install_method() == "package" and self._family.package_upgrade:
+            log.info("upgrade_hint: %s package -> %s", self._family.name,
+                     self._family.package_upgrade)
+            return self._family.package_upgrade
+        return super().upgrade_hint()
+
+    def software_install_hint(self, tool: str) -> str:
+        """Install line for a logical tool, in this family's package manager.
+
+        A tool whose name is known to differ per family, and which THIS family
+        has not confirmed, gets the fallback rather than another family's name.
+        Advising Debian's ``python3-pynvml`` on Arch is #207.
+        """
+        log.debug("software_install_hint: tool=%s manager=%s",
+                  tool, self._family.manager or "(none)")
+        pkg = self._family.packages.get(tool)
+        if pkg is None and tool in _UNCONFIRMED_FALLBACK:
+            log.info("software_install_hint: no confirmed %s package for %s",
+                     tool, self._family.name)
+            return _UNCONFIRMED_FALLBACK[tool]
+        command = self.package_command(pkg or _LINUX_INSTALL_PKGS.get(tool, tool))
+        return self._with_epel(command)
+
+    def _with_epel(self, command: str) -> str:
+        """Prepend enabling EPEL on an EL box that has not.
+
+        Both binaries the app probes for are EPEL-only on RHEL/Rocky/Alma, so
+        the command is correct there ONLY once EPEL is enabled.  Whether it is
+        is a local question -- ``rpm -q epel-release`` -- so this adapts rather
+        than warning: a user who already has EPEL sees the plain command, and a
+        user who does not gets one line that works.
+
+        One line, deliberately.  Every consumer renders fix_hint under a
+        `hint: ` label on a single line, and an embedded newline breaks out of
+        both the label and the indent (see tests/test_install_hint_shape.py).
+        """
+        if self._family is not _EL_FAMILY:
+            return command
+        try:
+            if self.packages().installed(_EPEL):
+                log.debug("_with_epel: EPEL already enabled")
+                return command
+        except Exception as e:                 # a hint must never raise
+            log.warning("_with_epel: could not check %s (%s)", _EPEL, e)
+            return command
+        log.info("_with_epel: EL without EPEL — prefixing enablement")
+        return f"sudo dnf install {_EPEL} && {command}"
+
+    def permission_denied_hint(self) -> str:
+        """Why an open was refused — told by whether OUR udev rules exist.
+
+        Only blames udev when the rules are actually missing: #267's report
+        read ``[OK] udev-rules installed`` while being told to install them,
+        which sends a user to fix something that is not broken.  (This lived
+        in the transport, on every OS, until #173.)
+        """
+        from ._udev import rules_state
+        installed = rules_state().path is not None
+        log.debug("LinuxOS.permission_denied_hint: rules installed=%s",
+                  installed)
+        if not installed:
+            return "run 'trcc system setup' to install udev rules"
+        return ("udev rules are installed, so this is not permissions — the "
+                "panel may be re-enumerating or held by another TRCC process "
+                "(a running trccd, or another TRCC window)")
+
+    def no_devices_hint(self) -> str:
+        log.debug("LinuxOS.no_devices_hint: called")
+        from ._udev import RULES_PATH
+        return (
+            f"Run `trcc system setup` to install the udev rules "
+            f"({RULES_PATH}), then replug the device."
+        )
+
+    # ── Hardware probes (LED memory + disk widgets) ───────────────────
+
+    def memory_info(self) -> list[dict[str, str]]:
+        """DRAM slot probe via dmidecode; psutil fallback for totals only."""
+        log.info("LinuxOS.memory_info: probing")
+        slots = _linux_memory_info()
+        log.info("LinuxOS.memory_info: %d slot(s)", len(slots))
+        return slots
+
+    def disk_info(self) -> list[dict[str, str]]:
+        """Disk probe via lsblk + smartctl health."""
+        log.info("LinuxOS.disk_info: probing")
+        disks = _linux_disk_info()
+        log.info("LinuxOS.disk_info: %d disk(s)", len(disks))
+        return disks
+
+    def ram_access(self) -> RamAccess:
+        """The opt-in grant to reach RGB memory's bus (``trcc-ram-access``)."""
+        log.debug("LinuxOS.ram_access")
+        return LinuxRamAccess(_pkexec_helper)
+
+    def smbuses(self) -> tuple[SmBus, ...]:
+        """Every chipset SMBus, through i2c-dev; all or none."""
+        numbers = find_smbus()
+        log.info("LinuxOS.smbuses: %s", numbers or "none")
+        if not numbers:
+            raise OSError("no SMBus controller found -- is the i2c-dev "
+                          "module loaded?")
+        # A stuck SPD hub on a bus is no place to add traffic.
+        stuck = [s for s in silent_memory_sensors()
+                 if s.partition("-")[0].isdigit()
+                 and int(s.partition("-")[0]) in numbers]
+        if stuck:
+            raise OSError(f"the memory's SPD hub(s) {', '.join(stuck)} are not "
+                          "answering -- TRCC will not use that bus until a "
+                          "full power-off (shut down, switch the power supply "
+                          "off for 30 s) clears them")
+        opened: list[SmBus] = []
+        try:
+            for number in numbers:
+                opened.append(LinuxSmBus(number))
+        except OSError:
+            for bus in opened:
+                bus.close()
+            raise
+        return tuple(opened)
+
+
+# =========================================================================
+# Linux families — one class per package manager, not per distro
+# =========================================================================
+#
+# Hundreds of distros, a handful of managers.  Ubuntu/Mint/Pop/Kali all answer
+# "apt", so the manager is the axis; a class per distro would be hundreds of
+# subclasses differing by one string.  These replace four parallel tables that
+# lived in three files, one of which had already drifted short by two entries.
+
+
+# The eight LinuxOS subclasses that used to live here -- AptLinux, DnfLinux,
+# PacmanLinux, ZypperLinux, XbpsLinux, ApkLinux, NixLinux, GenericLinux -- are
+# now rows in :data:`_FAMILIES` above.  Measured before removing them: all
+# eight defined ZERO methods.  See :class:`LinuxFamily` for why that is the
+# defect and not the design.
+
+
+
+# =========================================================================
+# Linux hardware-probe helpers — used by LinuxOS.memory_info/disk_info
+# =========================================================================
+
+_DMI_MEMORY_FIELDS: frozenset[str] = frozenset({
+    'manufacturer', 'part_number', 'type', 'speed',
+    'configured_memory_speed', 'size', 'locator', 'form_factor',
+    'rank', 'data_width', 'total_width', 'configured_voltage',
+    'minimum_voltage', 'maximum_voltage', 'memory_technology',
+})
+
+_POLKIT_POLICY = str(POLKIT_POLICY)
+# Written by ``setup-polkit`` from v5.3.3 to v9.6.5: polkit.Result.YES for
+# dmidecode/smartctl in ANY session, SSH included.  Nothing owns it.
+_LEGACY_POLKIT_RULE = '/etc/polkit-1/rules.d/50-trcc.rules'
+_POLKIT_ACTION_PREFIX = 'com.github.lexonight1.trcc.'
+
+# The privileged helpers the distro packages install, each argv-locked: the
+# policy names these and nothing else.  Intel family-6 Alder Lake (0x97/0x9A)
+# + Raptor Lake (0xB7/0xBA/0xBF) share the MCHBAR register map.
+_IMC_HELPER = '/usr/bin/trcc-imc'
+_DMI_HELPER = '/usr/bin/trcc-dmi'
+_ADL_RPL_MODELS = frozenset({0x97, 0x9A, 0xB7, 0xBA, 0xBF})
+
+
+def _pkexec_helper(helper: str) -> list[str] | None:
+    """``pkexec <helper>`` when a packaged helper + policy can run it, else None.
+
+    Only ever one of our argv-locked helpers, never a general-purpose program:
+    pkexec passes arguments through unchecked, so the policy grants a program,
+    not a command line.  None means no silent privilege path exists here (a
+    pip install has no helper), so nothing is spawned and nothing prompts.
+    """
+    import shutil
+    if not Path(helper).is_file():
+        log.debug("_pkexec_helper: %s not installed", helper)
+        return None
+    if not (Path(_POLKIT_POLICY).is_file() and shutil.which('pkexec')):
+        log.info("_pkexec_helper: %s present but no polkit policy/pkexec", helper)
+        return None
+    log.debug("_pkexec_helper: pkexec %s", helper)
+    return ['pkexec', helper]
+
+
+def _legacy_polkit_grants() -> list[Path]:
+    """The grants an older TRCC left on this host, by content, never by name.
+
+    The old rule only if it names our actions (the file name alone could be an
+    admin's own); the policy only if it hands pkexec a program that is not one
+    of our ``/usr/bin/trcc-*`` helpers.  Raises ``PermissionError`` when the
+    rules directory is unreadable (root-only on Fedora), so the caller can ask.
+    """
+    import xml.etree.ElementTree as ET
+    stale: list[Path] = []
+    rule = Path(_LEGACY_POLKIT_RULE)
+    try:
+        if _POLKIT_ACTION_PREFIX in rule.read_text(encoding='utf-8'):
+            stale.append(rule)
+    except FileNotFoundError:
+        pass
+    policy = Path(_POLKIT_POLICY)
+    try:
+        programs = {a.text or '' for a in ET.parse(policy).getroot().iter('annotate')
+                    if a.get('key') == 'org.freedesktop.policykit.exec.path'}
+    except FileNotFoundError:
+        programs = set()
+    except ET.ParseError as e:
+        log.warning("_legacy_polkit_grants: %s is not valid XML (%s) — left "
+                    "alone", policy, e)
+        programs = set()
+    if any(not p.startswith('/usr/bin/trcc-') for p in programs):
+        stale.append(policy)
+    log.info("_legacy_polkit_grants: %s", [str(p) for p in stale] or "none")
+    return stale
+
+
+def retire_legacy_polkit(dry_run: bool = False) -> int:
+    """Remove the polkit grants older releases left, which outlive an upgrade.
+
+    v5.3.3-v9.6.5 ``setup-polkit`` wrote a rule that answered YES for
+    dmidecode/smartctl in any session, SSH included, and a policy naming those
+    programs; on a pip install nothing ever replaced either.  Packages replace
+    the policy themselves and remove the rule in their install scripts.
+    Returns 0 on success or nothing to do; re-execs via sudo when it needs root.
+    """
+    log.info("retire_legacy_polkit: dry_run=%s", dry_run)
+    root = hasattr(os, 'geteuid') and os.geteuid() == 0
+    try:
+        stale = _legacy_polkit_grants()
+    except PermissionError:
+        if dry_run or root:
+            log.info("retire_legacy_polkit: %s unreadable — would check it as "
+                     "root", _LEGACY_POLKIT_RULE)
+            return 0 if dry_run else 1
+        return _retire_as_root()
+    if not stale:
+        log.info("retire_legacy_polkit: no old grant on this host")
+        return 0
+    if dry_run:
+        log.info("retire_legacy_polkit: would remove %s",
+                 ", ".join(map(str, stale)))
+        return 0
+    if not root:
+        return _retire_as_root()
+    for path in stale:
+        path.unlink()
+        log.warning("retire_legacy_polkit: removed %s — it let any program in "
+                    "the session run dmidecode/smartctl as root", path)
+    return 0
+
+
+def _retire_as_root() -> int:
+    """Run :func:`retire_legacy_polkit` again under sudo."""
+    log.info("_retire_as_root: the polkit files need root")
+    from ._elevate import reexec_as_root
+    return reexec_as_root("from trcc.adapters.system.linux import "
+                          "retire_legacy_polkit; sys.exit(retire_legacy_polkit())")
+
+
+def _enrich_with_spd_timings(slots: list[dict[str, str]]) -> None:
+    """Add DDR5 SPD timings (tcas..trfc) to every slot, in place.
+
+    dmidecode does not expose CAS timings; the DDR5 SPD EEPROM does.  Matched
+    DIMMs share timings, so one rootless SPD read covers the whole channel.
+    Failure (non-DDR5, no spd5118, permissions) leaves slots untouched → "NC".
+    """
+    if not slots:
+        return
+    from .spd import read_spd_timings
+    t = read_spd_timings()
+    if t is None:
+        log.info("_enrich_with_spd_timings: no DDR5 SPD timings available")
+        return
+    fields = {'tcas': t.tcas, 'trcd': t.trcd, 'trp': t.trp,
+              'tras': t.tras, 'trc': t.trc, 'trfc': t.trfc}
+    log.info("_enrich_with_spd_timings: %s", fields)
+    for slot in slots:
+        for key, val in fields.items():
+            slot[key] = str(val)
+
+
+# Sentinel so a failed/unsupported live read is cached too (timings are static
+# per boot; current_platform() builds a fresh LinuxOS each call, so the cache
+# lives at module scope, not on the instance).
+_UNREAD: object = object()
+_live_imc_cache: object = _UNREAD
+
+
+def _cpu_is_adl_rpl() -> bool:
+    """Rootless: True iff /proc/cpuinfo is an Intel family-6 Alder/Raptor Lake."""
+    log.debug("_cpu_is_adl_rpl")
+    family = model = None
+    try:
+        with Path("/proc/cpuinfo").open(encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("vendor_id") and "GenuineIntel" not in line:
+                    return False
+                if line.startswith("cpu family"):
+                    family = int(line.split(":")[1])
+                elif line.startswith("model") and "name" not in line:
+                    model = int(line.split(":")[1])
+                if line == "\n":          # end of the first processor block
+                    break
+    except (OSError, ValueError):
+        return False
+    return family == 6 and model in _ADL_RPL_MODELS
+
+
+def _read_live_imc_timings() -> ImcTimings | None:
+    """Live IMC timings via the privileged ``trcc-imc`` helper, cached for life.
+
+    Silent by design: only spawns the helper when the polkit policy + helper are
+    installed (packaged installs) so it never prompts for a password.  Any
+    failure (unsupported CPU, no policy, bad output) caches ``None`` so we never
+    re-spawn on the next ``memory_info()`` call.
+    """
+    global _live_imc_cache
+    if _live_imc_cache is not _UNREAD:
+        return _live_imc_cache  # type: ignore[return-value]
+    _live_imc_cache = None      # cache the negative result up front
+
+    if os.environ.get("TRCC_DISABLE_LIVE_IMC"):
+        return None
+    if not _cpu_is_adl_rpl() or not Path(_IMC_HELPER).is_file():
+        return None
+
+    import subprocess
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        cmd = [_IMC_HELPER]
+    elif (pkexec := _pkexec_helper(_IMC_HELPER)) is not None:
+        cmd = pkexec
+    else:
+        return None             # no silent privilege path available
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("_read_live_imc_timings: helper failed: %s", type(e).__name__)
+        return None
+    if result.returncode != 0:
+        log.info("_read_live_imc_timings: helper exit=%d", result.returncode)
+        return None
+
+    regs: dict[str, int] = {}
+    for token in result.stdout.split():
+        key, _, val = token.partition("=")
+        if key in ("tc_pre", "odt", "refresh", "bios_ddr"):
+            try:
+                regs[key] = int(val, 16)
+            except ValueError:
+                log.warning("_read_live_imc_timings: bad token %r", token)
+                return None
+    if len(regs) != 4:
+        log.warning("_read_live_imc_timings: incomplete helper output")
+        return None
+
+    from ._imc_timings import decode_adl
+    timings = decode_adl(regs["tc_pre"], regs["odt"],
+                         regs["refresh"], regs["bios_ddr"])
+    _live_imc_cache = timings
+    return timings
+
+
+def _enrich_with_live_imc_timings(slots: list[dict[str, str]]) -> None:
+    """Override the SPD timings with the live IMC values, in place.
+
+    Overrides tcas/trcd/trp/tras/trc; the SPD ``trfc`` (tRFC1) is kept — the live
+    register is tRFC2 (2x refresh), a different parameter, so overwriting it
+    would silently mislabel the panel.  No live read → SPD values stand.
+    """
+    if not slots:
+        return
+    t = _read_live_imc_timings()
+    if t is None:
+        return
+    fields = {'tcas': t.tcas, 'trcd': t.trcd, 'trp': t.trp,
+              'tras': t.tras, 'trc': t.trc}
+    log.info("_enrich_with_live_imc_timings: %s", fields)
+    for slot in slots:
+        for key, val in fields.items():
+            slot[key] = str(val)
+
+
+#: What ``dmidecode`` reports for a socket with no stick in it.
+_DMI_EMPTY_SLOT = 'No Module Installed'
+
+
+def _is_populated(slot: dict[str, str]) -> bool:
+    """Does this ``Memory Device`` block describe an actual stick?
+
+    ``dmidecode`` emits one block per SOCKET, and an empty socket still gets a
+    full block reporting ``Size: No Module Installed``.  Counting those tells a
+    user with two sticks in four slots that they have four.
+    """
+    populated = bool(slot.get('size')) and slot['size'] != _DMI_EMPTY_SLOT
+    if slot:
+        log.debug("_is_populated: %s size=%r -> %s",
+                  slot.get('locator', '?'), slot.get('size'), populated)
+    return populated
+
+
+def _parse_dmi_memory(output: str) -> list[dict[str, str]]:
+    """``dmidecode -t memory`` → one dict per POPULATED slot.
+
+    A ``Memory Device`` line opens a record and the next one closes it; only
+    the keys in ``_DMI_MEMORY_FIELDS`` are kept, so ``Array Handle`` and the
+    rest of the block are dropped.  Pure text in, records out — no subprocess,
+    which is what makes it testable without a root shell.
+    """
+    slots: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith('Memory Device'):
+            if _is_populated(current):
+                slots.append(current)
+            current = {}
+            continue
+        key, sep, val = line.partition(':')
+        if not sep:
+            continue
+        key = key.strip().lower().replace(' ', '_')
+        if key in _DMI_MEMORY_FIELDS:
+            current[key] = val.strip()
+    if _is_populated(current):
+        slots.append(current)
+    log.debug("_parse_dmi_memory: %d populated slot(s)", len(slots))
+    return slots
+
+
+def _prefer_configured_speed(slots: list[dict[str, str]]) -> None:
+    """Report the speed the controller RUNS, not the stick's nameplate.
+
+    ``dmidecode`` Type 17 carries two different numbers and we kept both while
+    displaying the wrong one:
+
+        Speed:                     the SPD/JEDEC nameplate  (DDR5: 4800 MT/s)
+        Configured Memory Speed:   what the IMC actually runs (XMP/EXPO)
+
+    A reporter with 8000 MT/s DDR5, verified by their own ``dmidecode -t17``,
+    saw 4800 on the panel (#279).  Both numbers were already in
+    ``_DMI_MEMORY_FIELDS``; ``configured_memory_speed`` was parsed and then
+    consumed by nothing.
+
+    This is what the Windows adapter has always done -- ``ConfiguredClockSpeed
+    or Speed`` (``windows.py``) -- so Linux now matches rather than inventing a
+    second rule.  Falls back to the nameplate whenever the configured value is
+    absent or unknown, which is what a JEDEC-speed machine reports anyway.
+
+    No new privilege: this reads a field the same ``dmidecode`` call already
+    returned.
+    """
+    for slot in slots:
+        configured = slot.get("configured_memory_speed", "").strip()
+        if not configured or configured.lower().startswith("unknown"):
+            continue
+        nameplate = slot.get("speed", "").strip()
+        if configured != nameplate:
+            log.info("_prefer_configured_speed: %s runs at %s (nameplate %s)",
+                     slot.get("locator", "?"), configured, nameplate or "NC")
+        slot["speed"] = configured
+
+
+def _dmi_memory_slots() -> list[dict[str, str]]:
+    """DRAM slots from ``dmidecode -t memory``, speed = what the IMC RUNS.
+
+    Only the dmidecode half of :func:`_linux_memory_info` — no SPD or
+    ``trcc-imc`` enrichment — so the memory clock sensor can read the
+    configured speed without a second privileged helper (#279).  Empty when
+    dmidecode is missing, refused or fails.
+
+    Root reads ``dmidecode`` itself.  Anyone else goes through the argv-locked
+    ``trcc-dmi`` helper, or reads nothing: handing pkexec ``dmidecode`` made
+    every program in the session able to run it as root with any arguments.
+    """
+    log.debug("_dmi_memory_slots: called")
+    import subprocess
+    if hasattr(os, 'geteuid') and os.geteuid() == 0:
+        cmd = ['dmidecode', '-t', '17']
+    elif (pkexec := _pkexec_helper(_DMI_HELPER)) is not None:
+        cmd = pkexec
+    else:
+        log.info("_dmi_memory_slots: no root and no %s — the configured "
+                 "memory speed is unavailable, the SPD nameplate is used",
+                 _DMI_HELPER)
+        return []
+    slots: list[dict[str, str]] = []
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=10, check=False)
+        if result.returncode == 0:
+            slots = _parse_dmi_memory(result.stdout)
+        else:
+            # trcc-dmi: 3 = no dmidecode installed; pkexec: 126/127 = refused
+            # (e.g. not the active local session).
+            log.info("_dmi_memory_slots: %s exited %d — falling back to the "
+                     "SPD nameplate", cmd[-1], result.returncode)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.info("_dmi_memory_slots: %s failed: %s", cmd[0], type(e).__name__)
+    _prefer_configured_speed(slots)
+    return slots
+
+
+def configured_memory_mts() -> int | None:
+    """The memory speed the controller RUNS, in MT/s — or ``None`` if unknown.
+
+    The highest configured speed across populated slots (they run together).
+    ``None`` when dmidecode cannot be read, which is every host without our
+    polkit rule or root: the caller falls back to the SPD nameplate.
+    """
+    speeds = [int(n) for slot in _dmi_memory_slots()
+              if (n := slot.get("speed", "").split(" ")[0]).isdigit()]
+    mts = max(speeds, default=None)
+    log.info("configured_memory_mts: %s MT/s (from %d slot(s))", mts, len(speeds))
+    return mts
+
+
+def _linux_memory_info() -> list[dict[str, str]]:
+    """Get DRAM slot info via dmidecode; falls back to psutil for totals."""
+    log.debug("_linux_memory_info: called")
+    slots = _dmi_memory_slots()
+    _enrich_with_spd_timings(slots)
+    _enrich_with_live_imc_timings(slots)
+
+    if not slots:
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            total_gb = f"{mem.total / (1024**3):.1f} GB"
+            slots.append({'size': total_gb, 'type': 'Unknown',
+                          'speed': 'Unknown', 'manufacturer': 'Unknown'})
+        except (OSError, ImportError, AttributeError) as e:
+            log.debug("psutil.virtual_memory failed: %s", type(e).__name__)
+    return slots
+
+
+def _linux_disk_info() -> list[dict[str, str]]:
+    """Get disk info via lsblk -J + smartctl -H per disk."""
+    log.debug("_linux_disk_info: called")
+    import json
+    import subprocess
+    disks: list[dict[str, str]] = []
+    try:
+        result = subprocess.run(
+            ['lsblk', '-J', '-o', 'NAME,MODEL,SIZE,TYPE,ROTA'],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            for dev in data.get('blockdevices', []):
+                if dev.get('type') != 'disk' or not dev.get('model'):
+                    continue
+                disk_type = 'HDD' if dev.get('rota') else 'SSD'
+                disk = {
+                    'name': dev.get('name', ''),
+                    'model': dev.get('model', 'Unknown').strip(),
+                    'size': dev.get('size', 'Unknown'),
+                    'type': disk_type,
+                }
+                if (health := _smart_health(dev['name'])):
+                    disk['health'] = health
+                disks.append(disk)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+        log.debug("lsblk -J failed: %s", type(e).__name__)
+    return disks
+
+
+def _smart_health(dev_name: str) -> str | None:
+    """SMART overall-health status via smartctl -H.
+
+    Never elevated: no feature reads disk health today (``disk_info`` has no
+    caller), and a pkexec grant for smartctl was a grant of every smartctl
+    option, including the ones that change drive state.  As root it works;
+    otherwise smartctl refuses and the health is simply unknown.
+    """
+    log.debug("_smart_health: dev=%s", dev_name)
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['smartctl', '-H', f'/dev/{dev_name}'],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        for line in result.stdout.splitlines():
+            if 'overall-health' in line.lower() or 'health status' in line.lower():
+                if 'PASSED' in line:
+                    return 'PASSED'
+                if 'FAILED' in line:
+                    return 'FAILED'
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("smartctl -H /dev/%s failed: %s", dev_name, type(e).__name__)
+    return None

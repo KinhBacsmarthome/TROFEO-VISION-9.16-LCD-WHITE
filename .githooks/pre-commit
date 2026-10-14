@@ -1,0 +1,106 @@
+#!/bin/sh
+# TRCC pre-commit — keep code-derived artifacts in sync with the source tree.
+#
+# The problem this solves: generated files that are committed (not build
+# output) silently drift when the code they derive from changes and nobody
+# remembers to regenerate them.  CI catches it as a red test AFTER the push;
+# this catches it BEFORE the commit and folds the regenerated files into the
+# same commit, so a clean tree is the default, not a discipline.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+# (dev/README.md documents this; the release/setup path can run it too.)
+#
+# To add a future generator: give it its own block below — the trigger grep
+# names the source paths it derives from, then it regenerates + `git add`s.
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+# ── man pages ──────────────────────────────────────────────────────────
+# man/man1/*.1 are generated from the live Typer CLI (dev/gen_manpages.py),
+# whose output depends on the command tree (src/trcc/ui/cli/) and the version
+# string (src/trcc/__version__.py).  Regenerate when either is staged.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/ui/cli/|^src/trcc/__version__\.py$'; then
+    echo "pre-commit: CLI/version changed — regenerating man pages"
+    if ! PYTHONPATH=src python3 dev/gen_manpages.py >/dev/null; then
+        echo "pre-commit: man page generation FAILED (dev/gen_manpages.py)" >&2
+        exit 1
+    fi
+    git add man/man1/*.1
+fi
+
+# ── CLI reference ──────────────────────────────────────────────────────
+# doc/REFERENCE_CLI.md is generated from the same Typer tree
+# (dev/gen_cli_reference.py).  Hand-written, it drifted a whole cutover
+# behind the code — documenting `trcc send` / `trcc led-color` and two
+# commands that had been deleted — so it is derived now, not maintained.
+# Unlike the man pages it carries no version string, so the CLI tree is
+# its only trigger.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/ui/cli/'; then
+    echo "pre-commit: CLI changed — regenerating doc/REFERENCE_CLI.md"
+    if ! PYTHONPATH=src python3 dev/gen_cli_reference.py >/dev/null; then
+        echo "pre-commit: CLI reference generation FAILED (dev/gen_cli_reference.py)" >&2
+        exit 1
+    fi
+    git add doc/REFERENCE_CLI.md
+fi
+
+# ── Port reference ─────────────────────────────────────────────────────
+# doc/REFERENCE_PORTS.md is generated from the live ABCs
+# (dev/gen_ports_reference.py).  The hand-written table in CLAUDE.md listed
+# FOUR ports when the tree had 28, and two of those four pointed at files
+# that no longer contained them — so this is derived, not maintained.
+# Any ABC or implementation can move, so the trigger is the whole tree.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/'; then
+    echo "pre-commit: src changed — regenerating doc/REFERENCE_PORTS.md"
+    if ! PYTHONPATH=src python3 dev/gen_ports_reference.py >/dev/null; then
+        echo "pre-commit: port reference generation FAILED (dev/gen_ports_reference.py)" >&2
+        exit 1
+    fi
+    git add doc/REFERENCE_PORTS.md
+fi
+
+# ── Packaged setup files ───────────────────────────────────────────────
+# packaging/udev + packaging/modprobe are what the deb/rpm/Arch/Nix packages
+# install, generated from _udev.host_files() (dev/gen_packaging_setup.py).
+# Hand-kept, they drifted: 0416:5406 stayed SCSI in the packages for a month
+# after the code made it HID.  A new device or wire changes them, so the
+# trigger is the whole tree, like the port reference above.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/'; then
+    echo "pre-commit: src changed — regenerating packaged setup files"
+    if ! PYTHONPATH=src python3 dev/gen_packaging_setup.py >/dev/null; then
+        echo "pre-commit: packaged setup generation FAILED (dev/gen_packaging_setup.py)" >&2
+        exit 1
+    fi
+    git add packaging/udev packaging/modprobe
+fi
+
+# ── Command reference ──────────────────────────────────────────────────
+# doc/REFERENCE_COMMANDS.md is generated from the live Command classes
+# (dev/gen_commands_reference.py).  It is the contract a third party builds
+# a UI against, and it had no page at all while doc/TRCC_CONTRACT.md -- the
+# file whose name promises exactly that -- described a facade deleted in the
+# cutover.  Derived, so it cannot drift the same way.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/'; then
+    echo "pre-commit: src changed — regenerating doc/REFERENCE_COMMANDS.md"
+    if ! PYTHONPATH=src python3 dev/gen_commands_reference.py >/dev/null; then
+        echo "pre-commit: command reference generation FAILED (dev/gen_commands_reference.py)" >&2
+        exit 1
+    fi
+    git add doc/REFERENCE_COMMANDS.md
+fi
+
+# ── API reference ──────────────────────────────────────────────────────
+# doc/REFERENCE_API.md is generated from the live FastAPI app
+# (dev/gen_api_reference.py).  Hand-written it claimed 59 routes of which 55
+# did not exist, and documented 4 of the 133 actually served.
+if printf '%s\n' "$staged" | grep -qE '^src/trcc/'; then
+    echo "pre-commit: src changed — regenerating doc/REFERENCE_API.md"
+    if ! PYTHONPATH=src python3 dev/gen_api_reference.py >/dev/null; then
+        echo "pre-commit: API reference generation FAILED (dev/gen_api_reference.py)" >&2
+        exit 1
+    fi
+    git add doc/REFERENCE_API.md
+fi
+
+exit 0

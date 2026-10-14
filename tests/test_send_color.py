@@ -1,0 +1,971 @@
+"""SendColor Command + DisplayService.build_solid_color_frame tests.
+
+End-to-end coverage of the smallest device-touching path: a solid-color
+frame from a hex code on the wire. Verifies:
+
+  1. ``DisplayService.build_solid_color_frame`` honors profile rotation
+     and encoding.
+  2. ``SendColor`` Command validates RGB range, looks up the device,
+     refuses pre-handshake, dispatches into the display + transport,
+     publishes ``FrameSent`` on success.
+  3. CLI hex parsing accepts ``ff0000`` and ``#ff0000`` and rejects
+     malformed input.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from trcc.adapters.theme.filesystem import FileContentStore
+from trcc.app import App
+from trcc.core.commands import ConnectDevice, DisconnectDevice, SendColor
+from trcc.core.events import FrameSent
+from trcc.core.models import Kind, ProductInfo, RawFrame, Wire
+from trcc.core.ports import Renderer
+from trcc.core.protocol import get_profile
+from trcc.services.background import BackgroundSlot
+from trcc.services.display import DisplayService
+from trcc.services.media import MediaService
+from trcc.services.overlay import OverlayService
+from trcc.services.settings import Settings
+from trcc.ui.cli.display import _parse_hex_color
+
+from .conftest import FakePaths, FakePlatform
+
+# ── Recording renderer (same shape as test_display_rotation) ──────────
+
+
+class _Surface:
+    def __init__(self, w: int, h: int) -> None:
+        self.w = w
+        self.h = h
+
+
+class RecordingRenderer(Renderer):
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def _record(self, name: str, *args: Any) -> None:
+        self.calls.append((name, args))
+
+    def create_surface(self, width: int, height: int,
+                       color: tuple[int, ...] | None = None) -> Any:
+        self._record("create_surface", width, height, color)
+        return _Surface(width, height)
+
+    def open_image(self, path: Path) -> Any:
+        return _Surface(100, 100)
+
+    def surface_size(self, surface: Any) -> tuple[int, int]:
+        return (surface.w, surface.h)
+
+    def surface_nbytes(self, surface: Any) -> int:
+        return surface.w * surface.h * 4
+
+    def composite(self, base: Any, overlay: Any,
+                  position: tuple[int, int],
+                  mask: Any | None = None) -> Any:
+        return base
+
+    def resize(self, surface: Any, width: int, height: int) -> Any:
+        return _Surface(width, height)
+
+    def rotate(self, surface: Any, degrees: int) -> Any:
+        self._record("rotate", surface, degrees)
+        if degrees % 180 == 90:
+            return _Surface(surface.h, surface.w)
+        return _Surface(surface.w, surface.h)
+
+    def apply_brightness(self, surface: Any, percent: int) -> Any:
+        self._record("apply_brightness", surface, percent)
+        return surface
+
+    def draw_text(self, surface: Any, x: int, y: int, text: str,
+                  color: str, size: int, bold: bool = False,
+                  italic: bool = False, family: str = "") -> None:
+        pass
+
+    def encode_rgb565(self, surface: Any, byte_order: str = ">") -> bytes:
+        self._record("encode_rgb565", surface)
+        return b"\x00" * (surface.w * surface.h * 2)
+
+    def encode_jpeg(self, surface: Any, quality: int = 95,
+                    max_size: int = 0) -> bytes:
+        self._record("encode_jpeg", surface, quality)
+        return b"\xff\xd8" + b"\x00" * 100
+
+    def from_raw_rgb24(self, frame: Any) -> Any:
+        return _Surface(frame.width, frame.height)
+
+    def decode_image(self, data: bytes) -> Any:
+        return _Surface(100, 100)
+
+
+class _StubOverlay(OverlayService):
+    def render(self, canvas: Any, config: Any, sensors: dict[str, float],
+               clock: dict[str, str] | None = None,
+               user_elements: list[dict[str, Any]] | None = None,
+               *, temp_unit: str = "C") -> Any:
+        del config, sensors, clock, user_elements, temp_unit
+        return canvas
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def renderer() -> RecordingRenderer:
+    return RecordingRenderer()
+
+
+@pytest.fixture
+def display(renderer: RecordingRenderer, tmp_home: Path) -> DisplayService:
+    return DisplayService(
+        renderer=renderer,
+        themes=FileContentStore(),
+        overlay=_StubOverlay(renderer),
+        settings=Settings(FakePaths(tmp_home)),
+        media=MediaService(), backgrounds=BackgroundSlot(),
+        paths=FakePaths(tmp_home),
+    )
+
+
+def _scsi_info() -> ProductInfo:
+    return ProductInfo(
+        vid=0x0402, pid=0x3922,
+        vendor="ALi Corp", product="Frozen Warframe LCD 320x320",
+        wire=Wire.SCSI, kind=Kind.LCD,
+        device_type=1, fbl=100, native_resolution=(320, 320),
+        orientations=(0, 90, 180, 270),
+    )
+
+
+def _hid2_info(native: tuple[int, int] = (240, 320)) -> ProductInfo:
+    return ProductInfo(
+        vid=0x0416, pid=0x5302,
+        vendor="Winbond", product="USB Display (HID Type 2)",
+        wire=Wire.HID, kind=Kind.LCD,
+        device_type=2, native_resolution=native,
+        orientations=(0, 90, 180, 270),
+    )
+
+
+# ── DisplayService.build_solid_color_frame ────────────────────────────
+
+
+def test_build_solid_color_frame_uses_profile_resolution(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """Canvas is created at profile.resolution, not info.native_resolution."""
+    info = _hid2_info(native=(240, 320))     # registry: portrait
+    profile = get_profile(58)                 # PM=58 → (320, 240) landscape
+
+    frame = display.build_solid_color_frame(
+        info=info, color=(255, 0, 0), profile=profile,
+    )
+
+    create_calls = [c for c in renderer.calls if c[0] == "create_surface"]
+    _, args = create_calls[0]
+    assert (args[0], args[1]) == (320, 240), \
+        "Canvas dims come from profile.resolution"
+    # Color passed to create_surface should include the RGB + alpha=255
+    assert args[2] == (255, 0, 0, 255)
+    # Encoder result has rotated dims (240, 320) → 153,600 bytes
+    assert len(frame) == 240 * 320 * 2
+
+
+def test_build_solid_color_frame_applies_device_rotation(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """profile.rotate=True triggers the 90° rotation before encode."""
+    info = _hid2_info()
+    profile = get_profile(58)
+    assert profile.rotate is True
+
+    display.build_solid_color_frame(
+        info=info, color=(0, 255, 0), profile=profile,
+    )
+
+    rotates = [c for c in renderer.calls if c[0] == "rotate"]
+    angles = [c[1][1] for c in rotates]
+    assert 90 in angles, f"Expected device rotation 90°, got {angles}"
+
+
+def test_build_solid_color_frame_no_rotation_when_profile_says_so(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """A rotate=False profile (e.g. SCSI 320×320) produces no rotation call."""
+    info = _scsi_info()
+    profile = get_profile(100)
+    assert profile.rotate is False
+
+    display.build_solid_color_frame(
+        info=info, color=(0, 0, 255), profile=profile,
+    )
+
+    rotates_90 = [c for c in renderer.calls
+                  if c[0] == "rotate" and c[1][1] == 90]
+    assert rotates_90 == []
+
+
+def test_build_solid_color_frame_applies_brightness(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """A per-device brightness < 100 reaches the renderer."""
+    info = _scsi_info()
+    display._settings.for_device(info.key).brightness = 50
+
+    display.build_solid_color_frame(
+        info=info, color=(128, 128, 128), profile=get_profile(100),
+    )
+
+    brightness_calls = [c for c in renderer.calls if c[0] == "apply_brightness"]
+    assert brightness_calls, "brightness != 100 should trigger apply_brightness"
+    assert brightness_calls[0][1][1] == 50
+
+
+def test_build_solid_color_frame_no_brightness_call_at_100(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """At brightness=100 (default) the renderer is not called for dim."""
+    info = _scsi_info()
+    # leave default (100)
+    display.build_solid_color_frame(
+        info=info, color=(0, 0, 0), profile=get_profile(100),
+    )
+    brightness_calls = [c for c in renderer.calls if c[0] == "apply_brightness"]
+    assert brightness_calls == []
+
+
+def test_build_solid_color_frame_profile_jpeg_dispatches_to_jpeg_encoder(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """profile.jpeg=True → encode_jpeg; else encode_rgb565."""
+    info = _scsi_info()
+    # FBL 54 = 360×360 JPEG square panel — not a real SCSI device but the
+    # mapping exercises the encoder dispatch.
+    jpeg_profile = get_profile(54)
+    assert jpeg_profile.jpeg is True
+
+    display.build_solid_color_frame(
+        info=info, color=(0, 0, 0), profile=jpeg_profile,
+    )
+
+    encoders = [c[0] for c in renderer.calls if c[0].startswith("encode_")]
+    assert encoders == ["encode_jpeg"]
+
+
+def test_build_solid_color_frame_fallback_when_profile_none(
+    display: DisplayService, renderer: RecordingRenderer,
+) -> None:
+    """profile=None falls back to info.native_resolution + RGB565, no rotation."""
+    info = _hid2_info(native=(240, 320))
+
+    display.build_solid_color_frame(
+        info=info, color=(255, 255, 255), profile=None,
+    )
+
+    create_calls = [c for c in renderer.calls if c[0] == "create_surface"]
+    _, args = create_calls[0]
+    assert (args[0], args[1]) == (240, 320)
+    rotates_90 = [c for c in renderer.calls
+                  if c[0] == "rotate" and c[1][1] == 90]
+    assert rotates_90 == []
+
+
+# ── SendColor Command dispatch ────────────────────────────────────────
+
+
+def test_send_color_command_drives_real_app_dispatch(
+    tmp_home: Path,
+) -> None:
+    """End-to-end via App.dispatch with a fake platform + recording renderer.
+
+    Connects a real ScsiLcd over a FakeScsiTransport, then dispatches
+    SendColor — verifies the byte stream reaches the transport.
+    """
+    # Build a Fake platform that yields a single SCSI device for scan_devices
+    # and returns a scripted handshake response.
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+
+    renderer = RecordingRenderer()
+    app = App(platform=platform, renderer=renderer)
+
+    # Inject the device into the registry so ConnectDevice can find it.
+    # Real platform.scan_devices() is empty here; we rely on attach() via
+    # ConnectDevice, which calls find_product(vid, pid) — that works because
+    # 0402:3922 is in the canonical ALL_DEVICES registry.
+    connect_result = app.dispatch(ConnectDevice(key="0402:3922"))
+    assert connect_result.ok, f"ConnectDevice failed: {connect_result.message}"
+
+    # Subscribe to FrameSent so we can assert it fires
+    frame_sent_events: list[FrameSent] = []
+    app.events.subscribe(
+        FrameSent, lambda e: frame_sent_events.append(e),   # type: ignore[arg-type, return-value]
+    )
+
+    result = app.dispatch(SendColor(key="0402:3922", r=255, g=0, b=0))
+
+    assert result.ok, f"SendColor failed: {result.message}"
+    assert result.bytes_sent > 0
+    assert result.key == "0402:3922"
+    assert "#ff0000" in result.message
+    # FrameSent event published
+    assert len(frame_sent_events) == 1
+    assert frame_sent_events[0].key == "0402:3922"
+    # SendColor holds the panel (#306), so there is no theme left to
+    # re-render for the preview: the event carries the colour's own surface.
+    assert frame_sent_events[0].surface is not None
+
+
+def test_sleep_device_blanks_lcd_with_black_frame(tmp_home: Path) -> None:
+    """SleepDevice pushes a solid-black frame to a connected LCD (#143)."""
+    from trcc.core.commands import SleepDevice
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+
+    result = app.dispatch(SleepDevice(key="0402:3922"))
+
+    assert result.ok, f"SleepDevice failed: {result.message}"
+    assert result.bytes_sent > 0
+    assert "#000000" in result.message   # composed SendColor(0,0,0)
+
+
+def test_disconnect_blanks_the_panel_before_dropping_it(
+    tmp_path: Path,
+) -> None:
+    """A user-initiated disconnect darkens the panel, like shutdown does (#143).
+
+    ``App.close`` has blanked on the way out since #143, but
+    ``DisconnectDevice`` — what ``trcc device disconnect``, ``DELETE
+    /devices/{key}`` and the qtgui Disconnect button all dispatch — dropped the
+    handle with the last frame still lit.
+
+    Driven on ``MockPlatform`` + a REAL ``QtRenderer`` rather than this module's
+    ``FakePlatform``/``RecordingRenderer``, because that renderer returns an
+    empty surface: a *red* frame encodes to 204,800 zero bytes under it, so an
+    all-black assertion there passes no matter what colour is sent.  Confirmed
+    by mutation — blanking with white had to fail this test, and on the stub
+    renderer it did not.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+
+    from .mock_platform import MockPlatform
+
+    # A RAW RGB565 panel on purpose: black is then literally all-zero bytes.
+    # The 854x480 panel JPEG-encodes, and a black JPEG carries headers and
+    # entropy-coded data (11,862 bytes, 177 distinct values), so the assertion
+    # below would be untestable there.
+    key = "0402:3922"
+    app = App(
+        MockPlatform(
+            [{"type": "lcd", "vid": "0402", "pid": "3922",
+              "resolution": "320x320", "pm": 11, "sub": 5}],
+            tmp_path,
+        ),
+        renderer=QtRenderer(),
+    )
+    app.attach(0x0402, 0x3922)
+    assert app.dispatch(ConnectDevice(key=key)).ok
+
+    sent: list[bytes] = []
+    device = app.devices[key]
+    real_send = device.send
+    device.send = lambda frame, *a, **k: (          # type: ignore[method-assign]
+        sent.append(bytes(frame)), real_send(frame, *a, **k)
+    )[1]
+
+    # A non-black frame first, so "all zero" cannot be the device's resting
+    # state — the disconnect has to actively overwrite it.
+    assert app.dispatch(SendColor(key=key, r=255, g=0, b=0)).ok
+    assert set(sent[-1]) != {0}, "harness is not rendering colour"
+
+    result = app.dispatch(DisconnectDevice(key=key))
+
+    assert result.ok, result.message
+    assert len(sent) >= 2, "disconnect dropped the device without blanking it"
+    assert set(sent[-1]) == {0}, (
+        "the farewell frame is not all-zero — SleepDevice composes "
+        "SendColor(0, 0, 0), so every byte on the wire should be null"
+    )
+    assert key not in app.devices, "device was not detached"
+
+
+def test_sleep_device_without_a_renderer_answers_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """SleepDevice's best-effort promise, kept for the renderer-less App.
+
+    ``App.display`` RAISES when no Renderer is attached, and blanking needs a
+    rendered frame — so this used to escape as a ``RuntimeError`` despite the
+    docstring promising ok=False.  ``App.close`` carried an ``except
+    Exception`` for exactly that, and the log line it emitted
+    (``close: SleepDevice raised for …``) was the evidence.  A connected device
+    on an App built for non-rendering work is a legitimate construction, so
+    "cannot blank" is an ANSWER.
+    """
+    from trcc.core.commands import SleepDevice
+
+    from .mock_platform import MockPlatform
+
+    key = "0402:3922"
+    app = App(MockPlatform(
+        [{"type": "lcd", "vid": "0402", "pid": "3922", "fbl": 100}], tmp_path,
+    ))                                     # no renderer= on purpose
+    app.attach(0x0402, 0x3922)
+    assert app.dispatch(ConnectDevice(key=key)).ok
+
+    result = app.dispatch(SleepDevice(key=key))
+
+    assert not result.ok
+    assert "cannot blank" in result.message
+    assert result.connected, (
+        "the device IS connected — only the blank was impossible, and a "
+        "caller must be able to tell those apart"
+    )
+
+
+def test_disconnect_of_an_unattached_device_still_reports_cleanly(
+    tmp_home: Path,
+) -> None:
+    """The blank must never turn a no-op disconnect into a failure."""
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    result = app.dispatch(DisconnectDevice(key="dead:beef"))
+    assert not result.ok
+    assert "Not attached" in result.message
+
+
+def test_sleep_device_not_connected_returns_false(tmp_home: Path) -> None:
+    """SleepDevice never raises for a missing/disconnected device — it is
+    dispatched from App.close() mid-shutdown and must degrade gracefully."""
+    from trcc.core.commands import SleepDevice
+
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    result = app.dispatch(SleepDevice(key="dead:beef"))
+
+    assert not result.ok
+    assert "not connected" in result.message
+
+
+def test_app_close_blanks_the_panel_before_release(tmp_home: Path) -> None:
+    """App.close() sends a black frame to every device before detaching, so
+    the panel darkens on shutdown instead of holding its last image (#143)."""
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+
+    sent: list[FrameSent] = []
+    app.events.subscribe(
+        FrameSent, lambda e: sent.append(e),   # type: ignore[arg-type, return-value]
+    )
+    app.close()
+
+    # A blank frame went out (the last FrameSent) and the device is released.
+    assert sent, "close() sent no frame — panel would stay lit"
+    assert "0402:3922" not in app.devices
+
+
+def test_render_and_send_frame_sent_carries_surface(tmp_home: Path) -> None:
+    """RenderAndSend ships the rendered surface in ``FrameSent`` so the GUI
+    preview shows THAT frame directly — legacy's publish-the-frame shape,
+    not a second render.  The carried surface is exactly what
+    ``rendered_surface`` exposes (the preview reuses one source).
+    """
+    from trcc.core.commands import RenderAndSend
+    from trcc.core.models import Theme
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+
+    # RenderAndSend needs an active theme to render.
+    app.active_themes["0402:3922"] = Theme(
+        path=tmp_home / "t", name="t",
+        resolution=(320, 320), config={"elements": []},
+    )
+
+    events: list[FrameSent] = []
+    app.events.subscribe(
+        FrameSent, lambda e: events.append(e),   # type: ignore[arg-type, return-value]
+    )
+
+    result = app.dispatch(RenderAndSend(key="0402:3922"))
+    assert result.ok, result.message
+    assert len(events) == 1
+    # The surface is carried — and it's the very surface the preview reuses.
+    assert events[0].surface is not None
+    assert events[0].surface is app.display.rendered_surface("0402:3922")
+
+
+def test_send_color_validates_channel_range(tmp_home: Path) -> None:
+    """RGB channels out of 0-255 produce an ok=False result, no dispatch."""
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+
+    app.dispatch(ConnectDevice(key="0402:3922"))
+
+    bad = app.dispatch(SendColor(key="0402:3922", r=256, g=0, b=0))
+    assert bad.ok is False
+    assert "out of range" in bad.message
+    assert bad.bytes_sent == 0
+
+
+def test_send_color_unknown_device_returns_failure(tmp_home: Path) -> None:
+    """SendColor on an unattached key produces ok=False, no exception."""
+    platform = FakePlatform(tmp_home)
+    app = App(platform=platform, renderer=RecordingRenderer())
+
+    result = app.dispatch(SendColor(key="dead:beef", r=128, g=128, b=128))
+
+    assert result.ok is False
+    assert "dead:beef" in result.message
+    assert result.bytes_sent == 0
+
+
+# ── EnsureConnected — idempotent connect-first for wire commands ──────
+
+
+def test_ensure_connected_attaches_a_fresh_device(tmp_home: Path) -> None:
+    """A stateless (fresh) App holds no devices; EnsureConnected brings the
+    device up so a following wire command works — the #150/#171 fix."""
+    from trcc.core.commands import EnsureConnected
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+    key = "0402:3922"
+    assert key not in app.devices                      # nothing attached yet
+
+    assert app.dispatch(EnsureConnected(key=key)).ok
+    assert app.devices[key].is_connected               # now ready for wire I/O
+
+
+def test_ensure_connected_is_idempotent_no_rehandshake(tmp_home: Path) -> None:
+    """A second EnsureConnected on a live device is a pure no-op — it must NOT
+    rebuild the transport or re-handshake (safe before every tick / in daemon
+    mode).  ConnectDevice, by contrast, DOES re-handshake (dev-console inject-
+    reply contract) — asserted here so the two stay distinct."""
+    from trcc.core.commands import ConnectDevice, EnsureConnected
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.extend(_scsi_poll_response(100) for _ in range(3))
+    app = App(platform=platform, renderer=RecordingRenderer())
+    key = "0402:3922"
+
+    assert app.dispatch(EnsureConnected(key=key)).ok
+    first = app.devices[key]
+
+    result = app.dispatch(EnsureConnected(key=key))     # already connected
+    assert result.ok and "already connected" in result.message
+    assert app.devices[key] is first                    # SAME instance — no rebuild
+
+    app.dispatch(ConnectDevice(key=key))                # re-handshake path
+    assert app.devices[key] is not first                # rebuilt — contract preserved
+
+
+# ── CLI hex parsing ───────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("input_str,expected", [
+    ("ff0000", (255, 0, 0)),
+    ("00ff00", (0, 255, 0)),
+    ("0000ff", (0, 0, 255)),
+    ("#ff0000", (255, 0, 0)),
+    ("FFFFFF", (255, 255, 255)),
+    ("000000", (0, 0, 0)),
+    ("808080", (128, 128, 128)),
+    ("  ff0000  ", (255, 0, 0)),   # whitespace stripped
+])
+def test_parse_hex_color_accepts(input_str: str,
+                                  expected: tuple[int, int, int]) -> None:
+    assert _parse_hex_color(input_str) == expected
+
+
+@pytest.mark.parametrize("input_str", [
+    "",
+    "f",
+    "ff",
+    "fff",
+    "ffff",
+    "fffff",
+    "fffffff",
+    "fffffffff",
+    "GGGGGG",
+    "ff00zz",
+    "0xff0000",
+])
+def test_parse_hex_color_rejects(input_str: str) -> None:
+    assert _parse_hex_color(input_str) is None
+
+
+# ── Helper: build SCSI poll response (re-used) ────────────────────────
+
+
+def _scsi_poll_response(fbl: int, *, size: int = 0xE100) -> bytes:
+    resp = bytearray(size)
+    resp[0] = fbl
+    return bytes(resp)
+
+
+# ── Hotplug bridge: DeviceAttached → ConnectDevice (#139) ─────────────
+
+
+def test_device_attached_event_connects_device(tmp_home: Path) -> None:
+    """Publishing DeviceAttached on the bus connects the device — the hotplug
+    bridge the cutover was missing (a device plugged in after launch, or
+    missed at the boot discover, never connected without it). (#139)"""
+    from trcc.core.events import DeviceAttached
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+
+    assert "0402:3922" not in app.devices
+    app.events.publish(DeviceAttached(key="0402:3922", vid=0x0402, pid=0x3922))
+    assert "0402:3922" in app.devices    # bridge fired ConnectDevice
+
+
+def test_device_attached_is_idempotent(tmp_home: Path) -> None:
+    """A DeviceAttached for an already-connected device is a no-op — coldplug
+    replays + duplicate adds must not reconnect or replace the device. (#139)"""
+    from trcc.core.events import DeviceAttached
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=RecordingRenderer())
+
+    app.events.publish(DeviceAttached(key="0402:3922", vid=0x0402, pid=0x3922))
+    device = app.devices["0402:3922"]
+    # Second event — guarded, so it neither re-handshakes (no second poll
+    # response is scripted) nor swaps the live device object.
+    app.events.publish(DeviceAttached(key="0402:3922", vid=0x0402, pid=0x3922))
+    assert app.devices["0402:3922"] is device
+
+
+# ── Post-handshake data download (#136 Phase 1) ──────────────────────
+
+
+def test_connect_installs_data_for_handshake_resolution(tmp_home: Path) -> None:
+    """ConnectDevice installs theme/cloud/mask data for the HANDSHAKE-resolved
+    resolution. Non-square bulk panels report native_resolution=(0,0) and only
+    learn their real size at handshake, so this is the only place their data
+    (both orientations, via ensure_all) gets installed. Port of legacy's
+    _ensure_data_background(device, w, h). (#136)
+
+    Since #275 it goes through ``data_install_runner`` rather than being called
+    inline, so the runner is rebuilt around the spy too -- it captured the real
+    service when the App was constructed."""
+    from trcc.adapters.infra.data_install_runner import SyncDataInstallRunner
+    from trcc.core.commands import ConnectDevice
+    from trcc.services.data_install import EnsureDataResult
+
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))   # FBL 100 → 320×320
+    app = App(platform=platform, renderer=RecordingRenderer())
+
+    installed: list[tuple[int, int]] = []
+
+    class _SpyInstall:
+        def ensure_all(self, resolution: tuple[int, int], variant: str = "",
+                       mask_variant: str = "") -> EnsureDataResult:
+            installed.append(resolution)
+            return EnsureDataResult(
+                resolution=resolution,
+                themes_ok=True, web_ok=True, masks_ok=True,
+            )
+
+    app.data_install = _SpyInstall()   # type: ignore[assignment]
+    app.data_install_runner = SyncDataInstallRunner(
+        app.data_install, app.events,
+    )
+
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+    assert installed == [(320, 320)]   # the handshake-resolved resolution
+
+
+# ── not-connected is a Result, not an exception ──────────────────────────
+#
+# ``_require_connected_device`` raised ``DeviceNotConnectedError`` and
+# ``App.dispatch`` has no try/except, so the exception escaped to the caller.
+# But ``IPCServer._dispatch_envelope`` catches EVERYTHING and turns it into
+# ``{"ok": false, "message": "DeviceNotConnectedError: ..."}``, so the same
+# Command raised in-process and returned a Result over the daemon socket.
+# One Command, two behaviours, decided by an env var — the dual code path
+# CLAUDE.md forbids.  These pin the single behaviour.
+
+
+def test_send_to_an_attached_but_unconnected_device_returns_a_result(
+    tmp_home: Path,
+) -> None:
+    """Attached, never handshaken: a Result with ``connected is False`` —
+    NOT a raised DeviceNotConnectedError.
+
+    Dispatch now tries the connect first.  Here it cannot open the device --
+    the commonest real failure, a permission -- and the message carries WHY:
+    the whole diagnosis for hardware we do not own.
+    """
+    from trcc.core.commands import DeviceConnectionIssues
+
+    platform = FakePlatform(tmp_home)
+    app = App(platform=platform, renderer=RecordingRenderer())
+    app.attach(0x0402, 0x3922)          # attached; ConnectDevice never dispatched
+
+    def refuse(*a: object, **k: object) -> None:
+        raise PermissionError("Permission denied: '/dev/sg1'")
+
+    platform.open_transport = refuse    # type: ignore[method-assign]
+
+    result = app.dispatch(SendColor(key="0402:3922", r=1, g=2, b=3))
+
+    assert result.ok is False
+    assert result.connected is False, (
+        "an unusable device must be reported by the field, not by a message "
+        "a caller would have to string-match"
+    )
+    reason = app.dispatch(DeviceConnectionIssues()).issues[0].message
+    # "Not attached", not "not connected": the connect goes through the App's
+    # one locked path (``App.connect_unit``), which releases a never-connected
+    # entry before it tries -- so after the refusal nothing is attached.
+    assert result.message == f"Not attached: 0402:3922 — {reason}"
+    assert reason == "Permission denied: '/dev/sg1'"
+
+
+def test_unknown_device_is_also_connected_false(tmp_home: Path) -> None:
+    """The other half of the same helper: not-found and not-connected are
+    both 'the device is unusable', so both answer the same field."""
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+
+    result = app.dispatch(SendColor(key="dead:beef", r=1, g=2, b=3))
+
+    assert result.ok is False
+    assert result.connected is False
+
+
+def test_a_failure_before_the_check_leaves_connected_unknown(
+    tmp_home: Path,
+) -> None:
+    """``None`` is 'never asked', and must not collapse into False.
+
+    A bad argument is rejected before the device is looked up at all, so
+    reporting ``connected=False`` there would blame the hardware for the
+    caller's mistake.
+    """
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    app.attach(0x0402, 0x3922)
+
+    result = app.dispatch(SendColor(key="0402:3922", r=999, g=0, b=0))
+
+    assert result.ok is False
+    assert result.connected is None, "a range error is not a connectivity verdict"
+    assert "out of range" in result.message
+
+
+def test_tick_display_preserves_the_connected_verdict(tmp_home: Path) -> None:
+    """``TickDisplay`` rebuilds its Result with ``dataclasses.replace`` after
+    delegating to ``RenderAndSend``.  The gui's video tick reads ``connected``
+    off that Result, so the verdict has to survive the rebuild — a replace
+    that dropped it would leave the tick unable to tell a disconnect from a
+    render failure, silently."""
+    from trcc.core.commands import TickDisplay
+
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    app.attach(0x0402, 0x3922)          # attached, never connected
+
+    result = app.dispatch(TickDisplay(key="0402:3922"))
+
+    assert result.ok is False
+    assert result.connected is False, (
+        "TickDisplay lost the connectivity verdict on its way through replace()"
+    )
+
+
+# ── CurrentFrame mirrors the panel; BuildPreview renders one ─────────────
+
+
+def test_current_frame_is_empty_before_anything_is_rendered(
+    tmp_home: Path,
+) -> None:
+    """No cached frame is ``ok=True, surface=None`` — a normal answer.
+
+    A UI mirroring the panel pre-load has nothing to show yet; that is not a
+    failure and must not be reported as one.
+    """
+    from trcc.core.commands import CurrentFrame
+
+    app = App(platform=FakePlatform(tmp_home), renderer=RecordingRenderer())
+    result = app.dispatch(CurrentFrame(key="0402:3922"))
+
+    assert result.ok is True
+    assert result.surface is None
+
+
+def test_current_frame_returns_the_frame_without_rendering_one(
+    tmp_home: Path,
+) -> None:
+    """After a send, the cached surface comes back — and asking for it does
+    NOT drive a render, which is the whole reason this is not BuildPreview."""
+    from trcc.core.commands import CurrentFrame, RenderAndSend
+    from trcc.core.models import Theme
+
+    renderer = RecordingRenderer()
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    app = App(platform=platform, renderer=renderer)
+    assert app.dispatch(ConnectDevice(key="0402:3922")).ok
+    # The scene cache is populated by the THEME render path — SendColor and
+    # friends never fill it, which is exactly why rebuild_preview keeps a
+    # build-one-off fallback behind this Query.
+    app.active_themes["0402:3922"] = Theme(
+        path=tmp_home / "t", name="t",
+        resolution=(320, 320), config={"elements": []},
+    )
+    assert app.dispatch(RenderAndSend(key="0402:3922")).ok
+
+    before = list(renderer.calls)
+    result = app.dispatch(CurrentFrame(key="0402:3922"))
+
+    assert result.ok is True
+    assert result.surface is not None, "the rendered frame was not cached"
+    assert result.surface is app.display.rendered_surface("0402:3922")
+    # ``surface_size`` is the one call it is allowed to make — it reports the
+    # dimensions of the frame it found, it does not build one.
+    new_calls = [c for c in renderer.calls[len(before):] if c[0] != "surface_size"]
+    assert new_calls == [], (
+        f"CurrentFrame drove the renderer {new_calls} — it must read the "
+        "cache, which is the only thing separating it from BuildPreview"
+    )
+
+
+# ── Screencast: the gui sends a frame, not a stack trace ─────────────────
+#
+# The capture tick hands over a renderer SURFACE; build_screencast_frame
+# speaks RawFrame and reads .data/.width/.height as ATTRIBUTES.  Passing the
+# surface through raised on every frame, was swallowed by the handler's
+# `except Exception`, and SendFrame was never dispatched — preview updated,
+# panel blank, since the cutover (4fa876be).
+
+
+def test_screencast_frame_encodes_from_a_raw_frame(tmp_home: Path) -> None:
+    """End to end: a captured frame → wire bytes.
+
+    Fails before the fix with ``AttributeError: 'QImage' object has no
+    attribute 'data'`` — which the handler swallowed, so the device got
+    nothing while the preview kept updating.
+    """
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.models import Kind
+    from trcc.core.registry import ALL_DEVICES
+
+    renderer = QtRenderer()
+    app = App(platform=FakePlatform(tmp_home), renderer=renderer)
+    lcd = next(p for p in ALL_DEVICES.values() if p.kind is Kind.LCD)
+
+    data = app.display.build_screencast_frame(
+        info=lcd, frame=RawFrame(data=bytes(64 * 48 * 3), width=64, height=48),
+    )
+
+    assert isinstance(data, bytes)
+    assert len(data) > 0, "no wire bytes produced from a captured surface"
+
+
+# ── App.dispatch connects a USES_DEVICE Command's device (2026-09-26) ────
+#
+# Each UI used to decide "connect first" itself: the CLI before 21 commands,
+# the API before 9 routes, and 6 routes not at all -- a verb that worked in the
+# CLI failed over the API with "Not attached".  Now the Command declares it.
+
+def _fresh(tmp_home: Path) -> tuple[App, FakePlatform]:
+    platform = FakePlatform(tmp_home)
+    platform.scsi.read_script.append(_scsi_poll_response(100))
+    return App(platform=platform, renderer=RecordingRenderer()), platform
+
+
+def test_a_wire_command_connects_its_own_device(tmp_home: Path) -> None:
+    app, _ = _fresh(tmp_home)
+
+    result = app.dispatch(SendColor(key="0402:3922", r=0, g=0, b=255))
+
+    assert result.ok is True
+    assert app.devices["0402:3922"].is_connected
+
+
+def test_a_command_that_does_not_use_the_device_connects_nothing(
+    tmp_home: Path,
+) -> None:
+    from trcc.core.commands import SetBrightness
+
+    app, _ = _fresh(tmp_home)
+
+    app.dispatch(SetBrightness(key="0402:3922", percent=50))
+
+    assert app.devices == {}
+
+
+def test_no_per_tick_command_connects_a_device() -> None:
+    """A per-tick Command that connected would retry a failed USB handshake at
+    frame rate while a panel is unplugged; hotplug and the loops own that."""
+    import inspect
+    import logging
+
+    import trcc.core.commands as C
+    from trcc.core.commands._base import Command
+
+    per_tick_that_connect = sorted(
+        name for name, cls in vars(C).items()
+        if inspect.isclass(cls) and issubclass(cls, Command)
+        and cls.LOG_LEVEL <= logging.DEBUG and cls.USES_DEVICE)
+    assert per_tick_that_connect == []
+
+
+def test_closing_does_not_try_to_connect_an_unconnected_panel(
+    tmp_home: Path,
+) -> None:
+    """SleepDevice uses its device, so sleeping a panel whose connect failed
+    would retry the connect -- handshake retries and all -- on the way out."""
+    from trcc.core.commands import EnsureConnected
+
+    app, platform = _fresh(tmp_home)
+    app.attach(0x0402, 0x3922)
+    tried: list[str] = []
+    real = app.dispatch
+
+    def spy(cmd: Any) -> Any:
+        tried.append(type(cmd).__name__)
+        return real(cmd)
+
+    app.dispatch = spy                      # type: ignore[method-assign]
+    app.close()
+
+    assert EnsureConnected.__name__ not in tried
+    assert "SleepDevice" not in tried
+
+
+def test_a_tolerant_command_still_saves_when_the_device_will_not_open(
+    tmp_home: Path,
+) -> None:
+    """The connect is an ATTEMPT, never a gate: LoadImage keeps the choice
+    when the panel refuses to open, exactly as it did with no device."""
+    from trcc.core.commands import LoadImage
+
+    app, platform = _fresh(tmp_home)
+    png = tmp_home / "pick.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    def refuse(*a: object, **k: object) -> None:
+        raise PermissionError("Permission denied: '/dev/sg1'")
+
+    platform.open_transport = refuse        # type: ignore[method-assign]
+
+    result = app.dispatch(LoadImage(key="0402:3922", path=png))
+
+    assert result.ok is True
+    assert app.settings.for_device("0402:3922").current_theme

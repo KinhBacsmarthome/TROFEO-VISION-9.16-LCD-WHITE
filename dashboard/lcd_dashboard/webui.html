@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cấu hình màn hình Trofeo</title>
+<style>
+  :root {
+    --bg: #04080f; --panel: #0a1324; --panel-2: #0e1a31; --line: #1f3558;
+    --text: #e8f0ff; --muted: #8fa6c8; --accent: #2b8cff; --accent-2: #00d0ff;
+    --ok: #3ddc84; --warn: #ffb020; --err: #ff5a52; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, "Segoe UI", Roboto, "DejaVu Sans", sans-serif; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; gap: 12px; align-items: center;
+           flex-wrap: wrap; padding: 12px 20px; background: rgba(4, 8, 15, .92);
+           border-bottom: 1px solid var(--line); backdrop-filter: blur(6px); }
+  header h1 { font-size: 18px; margin: 0; flex: 1 1 auto; }
+  main { max-width: 1280px; margin: 0 auto; padding: 16px 20px 96px; }
+  .chip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 12px;
+          border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line);
+          color: var(--muted); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); } .dot.err { background: var(--err); }
+  .dot.warn { background: var(--warn); }
+  section.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+                 padding: 16px 18px; margin-bottom: 16px; }
+  section.card > h2 { margin: 0 0 12px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+  section.card > h2 .sp { flex: 1; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 16px; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  label.f { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  label.f > span.h { font-size: 12px; color: #6f86a8; }
+  input[type=text], input[type=password], input[type=number], input[type=url], select {
+    width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+    background: #060d1a; color: var(--text); font: inherit; }
+  input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+  label.chk { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; color: var(--text); }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line);
+           background: var(--panel-2); color: var(--text); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.small { padding: 4px 10px; font-size: 13px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .msg { font-size: 13px; color: var(--muted); }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+  .preview { position: relative; background: #000; border-radius: 10px; overflow: hidden;
+             aspect-ratio: 1920 / 462; border: 1px solid var(--line); }
+  .preview img { width: 100%; height: 100%; display: block; object-fit: contain; }
+  .preview .overlay { position: absolute; inset: 0; display: grid; place-items: center;
+                      color: var(--muted); font-size: 14px; text-align: center; padding: 12px; }
+  table.slots { width: 100%; border-collapse: collapse; }
+  table.slots td { padding: 5px 4px; vertical-align: middle; }
+  table.slots td.lbl { width: 150px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  table.slots td.val { width: 130px; font-size: 13px; color: var(--accent-2); text-align: right;
+                       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px; }
+  table.slots tr.group td { padding-top: 10px; font-size: 12px; color: #6f86a8; text-transform: uppercase;
+                            letter-spacing: .06em; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg label { padding: 6px 12px; cursor: pointer; color: var(--muted); font-size: 14px; }
+  .seg input { display: none; }
+  .seg input:checked + span { color: #fff; }
+  .seg label:has(input:checked) { background: var(--accent); color: #fff; }
+  .hidden { display: none !important; }
+  .temps .trow { display: grid; grid-template-columns: 140px 1fr 110px auto; gap: 8px; align-items: center;
+                 margin-bottom: 8px; }
+  @media (max-width: 600px) { .temps .trow { grid-template-columns: 1fr 1fr; } }
+  footer { position: fixed; bottom: 0; left: 0; right: 0; z-index: 5; display: flex; gap: 12px;
+           align-items: center; justify-content: flex-end; padding: 12px 20px;
+           background: rgba(4, 8, 15, .95); border-top: 1px solid var(--line); }
+  footer .msg { flex: 1; }
+  .note { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+  code { background: #0b1830; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cấu hình màn hình Trofeo Vision 9.16</h1>
+  <span class="chip" id="lcd-status"><span class="dot"></span><span>Đang kiểm tra…</span></span>
+</header>
+
+<main>
+  <!-- Xem trước -->
+  <section class="card">
+    <h2>Xem trước <span class="sp"></span>
+      <span class="seg" role="radiogroup" aria-label="Nguồn số liệu xem trước">
+        <label><input type="radio" name="pmode" value="live" checked><span>Số liệu thật</span></label>
+        <label><input type="radio" name="pmode" value="demo"><span>Số liệu mẫu</span></label>
+      </span>
+      <button class="small" id="btn-refresh" type="button">Làm mới</button>
+    </h2>
+    <div class="preview">
+      <img id="preview" alt="Ảnh xem trước màn hình">
+      <div class="overlay" id="preview-msg">Đang vẽ…</div>
+    </div>
+    <p class="note">Ảnh xem trước dùng cấu hình <b>đã lưu</b>. Bấm “Lưu &amp; áp dụng” để thấy thay đổi;
+      màn hình thật cập nhật ở lần gửi kế tiếp.</p>
+  </section>
+
+  <div class="cols">
+    <!-- Home Assistant -->
+    <section class="card">
+      <h2>Home Assistant <span class="sp"></span>
+        <label class="chk"><input type="checkbox" data-k="home_assistant.enabled"> Bật</label></h2>
+      <div class="grid">
+        <label class="f">Tiêu đề thẻ<input type="text" data-k="home_assistant.title"></label>
+        <label class="f">Địa chỉ<input type="url" data-k="home_assistant.url"
+               placeholder="http://homeassistant.local:8123"></label>
+        <label class="f">Token truy cập dài hạn
+          <input type="password" data-k="home_assistant.token" autocomplete="off" id="ha-token">
+          <span class="h">Hồ sơ người dùng → Bảo mật → Mã thông báo truy cập dài hạn</span></label>
+        <label class="chk"><input type="checkbox" data-k="home_assistant.verify_ssl"> Kiểm tra chứng chỉ HTTPS</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button type="button" id="btn-ha-load">Kết nối &amp; tải danh sách entity</button>
+        <button type="button" id="btn-ha-auto" class="small">Tự dò System Monitor</button>
+        <span class="msg" id="ha-msg"></span>
+      </div>
+      <table class="slots" id="ha-slots"></table>
+    </section>
+
+    <!-- NAS -->
+    <section class="card">
+      <h2>NAS <span class="sp"></span>
+        <label class="chk"><input type="checkbox" data-k="nas.enabled"> Bật</label></h2>
+      <div class="grid">
+        <label class="f">Tiêu đề thẻ<input type="text" data-k="nas.title"></label>
+        <div class="f">Lấy số liệu từ
+          <span class="seg">
+            <label><input type="radio" name="nas-source" value="synology" data-k="nas.source"><span>Synology DSM</span></label>
+            <label><input type="radio" name="nas-source" value="home_assistant" data-k="nas.source"><span>Entity Home Assistant</span></label>
+          </span>
+        </div>
+      </div>
+      <div id="nas-dsm" style="margin-top:12px">
+        <div class="grid">
+          <label class="f">Địa chỉ DSM<input type="url" data-k="nas.url" placeholder="https://192.168.1.10:5001"></label>
+          <label class="f">Tài khoản<input type="text" data-k="nas.username" autocomplete="off"></label>
+          <label class="f">Mật khẩu<input type="password" data-k="nas.password" autocomplete="off" id="nas-pass"></label>
+          <label class="f">Volume<input type="text" data-k="nas.volume" placeholder="để trống = tất cả">
+            <span class="h">vd. <code>volume_1</code></span></label>
+          <label class="chk"><input type="checkbox" data-k="nas.verify_ssl"> Kiểm tra chứng chỉ HTTPS</label>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <button type="button" id="btn-nas-test">Kiểm tra kết nối</button>
+          <span class="msg" id="nas-msg"></span>
+        </div>
+        <p class="note">Tài khoản cần thuộc nhóm <b>administrators</b> và không bật xác thực 2 bước.</p>
+      </div>
+      <div id="nas-ha" class="hidden" style="margin-top:12px">
+        <div class="row"><button type="button" id="btn-nas-auto" class="small">Tự dò tích hợp Synology DSM</button>
+          <span class="msg" id="nas-ha-msg"></span></div>
+        <table class="slots" id="nas-slots"></table>
+      </div>
+    </section>
+  </div>
+
+  <div class="cols">
+    <!-- Nhiệt độ -->
+    <section class="card temps">
+      <h2>Nhiệt độ <span class="sp"></span>
+        <button type="button" class="small" id="btn-temp-add">+ Thêm dòng</button></h2>
+      <div id="temp-rows"></div>
+      <div class="grid" style="margin-top:8px">
+        <label class="f">Nhiệt độ ứng với thanh đầy (°C)<input type="number" step="1" min="30" max="150"
+               data-k="temperature.max_temp"></label>
+      </div>
+      <p class="note">Nguồn: <code>local:cpu</code>, <code>local:gpu</code> (máy này),
+        <code>nas:cpu</code>, <code>nas:disk</code>, <code>ha:cpu</code>, hoặc chọn một entity Home Assistant.
+        Thẻ hiển thị đẹp nhất với 3 dòng (tối đa 4).</p>
+    </section>
+
+    <!-- Mạng + Thời tiết -->
+    <section class="card">
+      <h2>Mạng</h2>
+      <div class="seg">
+        <label><input type="radio" name="net-source" value="local" data-k="network.source"><span>Card mạng máy này</span></label>
+        <label><input type="radio" name="net-source" value="home_assistant" data-k="network.source"><span>Entity Home Assistant</span></label>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <label class="f" id="net-if">Card mạng<input type="text" data-k="network.interface"
+               placeholder="để trống = tổng mọi card"><span class="h">vd. <code>enp3s0</code>, xem bằng <code>ip link</code></span></label>
+        <label class="f net-ha">Entity tốc độ tải xuống<input type="text" list="ha-entities" data-k="network.download_entity"></label>
+        <label class="f net-ha">Entity tốc độ tải lên<input type="text" list="ha-entities" data-k="network.upload_entity"></label>
+      </div>
+
+      <h2 style="margin-top:20px">Thời tiết <span class="sp"></span>
+        <label class="chk"><input type="checkbox" data-k="weather.enabled"> Bật</label></h2>
+      <div class="grid">
+        <label class="f">Thành phố có sẵn
+          <select id="city-preset"><option value="">— Tự nhập toạ độ —</option></select></label>
+        <label class="f">Tên hiển thị<input type="text" data-k="weather.city"></label>
+        <label class="f">Vĩ độ<input type="number" step="0.0001" data-k="weather.latitude"></label>
+        <label class="f">Kinh độ<input type="number" step="0.0001" data-k="weather.longitude"></label>
+        <label class="f">Cập nhật mỗi (phút)<input type="number" step="1" min="5" data-k="weather.refresh_minutes"></label>
+      </div>
+    </section>
+  </div>
+
+  <!-- Màn hình -->
+  <section class="card">
+    <h2>Màn hình &amp; gửi ảnh</h2>
+    <div class="grid">
+      <label class="f">Mã thiết bị (trcc detect)<input type="text" data-k="display.device_key"></label>
+      <label class="f">Cập nhật mỗi (giây)<input type="number" step="1" min="1" data-k="display.interval"></label>
+      <label class="f">Cách gửi ảnh
+        <select data-k="display.sender">
+          <option value="auto">Tự chọn</option><option value="python">Python API của trcc</option>
+          <option value="cli">Lệnh trcc display send-image</option>
+        </select></label>
+      <label class="f">Lệnh trcc<input type="text" data-k="display.trcc_command" readonly>
+        <span class="h">Chỉ sửa được trong file cấu hình (vì lý do an toàn)</span></label>
+      <label class="f">Ảnh nền ô đồng hồ<input type="text" data-k="display.background_image"
+             placeholder="để trống = tự vẽ"><span class="h">Đường dẫn file ảnh trên máy này</span></label>
+    </div>
+    <p class="note" id="cfg-path"></p>
+  </section>
+</main>
+
+<footer>
+  <span class="msg" id="save-msg"></span>
+  <button type="button" id="btn-reload">Huỷ thay đổi</button>
+  <button type="button" class="primary" id="btn-save">Lưu &amp; áp dụng</button>
+</footer>
+
+<datalist id="ha-entities"></datalist>
+<datalist id="temp-sources"></datalist>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+
+const SLOT_LABELS = {
+  cpu: "CPU (%)", cpu_temp: "Nhiệt độ CPU",
+  ram_pct: "RAM (%)", ram_used: "RAM đã dùng", ram_free: "RAM còn trống", ram_total: "RAM tổng",
+  disk_pct: "Ổ đĩa (%)", disk_used: "Ổ đĩa đã dùng", disk_free: "Ổ đĩa còn trống",
+  disk_total: "Ổ đĩa tổng", disk_temp: "Nhiệt độ ổ cứng",
+};
+const SLOT_GROUPS = [["CPU", ["cpu", "cpu_temp"]],
+                     ["Bộ nhớ", ["ram_pct", "ram_used", "ram_free", "ram_total"]],
+                     ["Ổ đĩa", ["disk_pct", "disk_used", "disk_free", "disk_total", "disk_temp"]]];
+
+// Hồ sơ tự dò: anchor = hậu tố entity dùng để tìm tiền tố, map = hậu tố cho từng ô.
+const PROFILES = {
+  system_monitor: { anchor: /processor_use$/, map: {
+    cpu: /^processor_use$/, cpu_temp: /^processor_temperature$/, ram_pct: /^memory_usage$/,
+    ram_used: /^memory_use$/, ram_free: /^memory_free$/, disk_pct: /^disk_usage/,
+    disk_used: /^disk_use(?!age)/, disk_free: /^disk_free/ } },
+  synology: { anchor: /cpu_utilization_total$/, map: {
+    cpu: /^cpu_utilization_total$/, cpu_temp: /^temperature$/, ram_pct: /^memory_usage_real$/,
+    ram_total: /^memory_total_real$/, disk_pct: /^volume_\d+_volume_used$/,
+    disk_used: /^volume_\d+_used_space$/, disk_total: /^volume_\d+_total_size$/,
+    disk_temp: /^drive_\d+_temperature$/ } },
+};
+
+const CITIES = [
+  ["Hà Nội", 21.0285, 105.8542], ["Bắc Ninh", 21.1861, 106.0763], ["Hải Phòng", 20.8449, 106.6881],
+  ["Hạ Long", 20.9517, 107.0807], ["Huế", 16.4637, 107.5909], ["Đà Nẵng", 16.0544, 108.2022],
+  ["Nha Trang", 12.2388, 109.1967], ["Đà Lạt", 11.9404, 108.4583],
+  ["TP. Hồ Chí Minh", 10.8231, 106.6297], ["Cần Thơ", 10.0452, 105.7469],
+];
+const TEMP_SPECIAL = [["local:cpu", "CPU máy này"], ["local:gpu", "GPU máy này"],
+                      ["nas:cpu", "Hệ thống NAS"], ["nas:disk", "Ổ cứng NAS (nóng nhất)"],
+                      ["ha:cpu", "CPU máy Home Assistant"], ["ha:disk", "Ổ đĩa máy Home Assistant"]];
+
+let state = { config: null, secrets: {}, entities: new Map() };
+
+// ---------------------------------------------------------------- tiện ích
+async function api(path, body) {
+  const opt = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  const data = await r.json().catch(() => ({ ok: false, error: `HTTP ${r.status}` }));
+  if (!r.ok || data.ok === false) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+function setMsg(el, text, kind = "") { el.textContent = text; el.className = "msg " + kind; }
+function getPath(obj, path) { return path.split(".").reduce((o, k) => (o ? o[k] : undefined), obj); }
+function setPath(obj, path, val) {
+  const ks = path.split("."); const last = ks.pop();
+  ks.reduce((o, k) => (o[k] ??= {}), obj)[last] = val;
+}
+function fmtState(e) { return e ? `${e.state}${e.unit ? " " + e.unit : ""}` : ""; }
+
+// ---------------------------------------------------------------- bảng ô entity
+function buildSlots(table, section) {
+  table.innerHTML = "";
+  for (const [title, slots] of SLOT_GROUPS) {
+    const g = table.insertRow(); g.className = "group";
+    const c = g.insertCell(); c.colSpan = 3; c.textContent = title;
+    for (const slot of slots) {
+      const tr = table.insertRow();
+      tr.insertCell().outerHTML = `<td class="lbl">${SLOT_LABELS[slot]}</td>`;
+      const td = tr.insertCell();
+      const inp = document.createElement("input");
+      inp.type = "text"; inp.setAttribute("list", "ha-entities");
+      inp.dataset.slot = `${section}.entities.${slot}`;
+      inp.placeholder = "sensor.…"; inp.setAttribute("aria-label", SLOT_LABELS[slot]);
+      inp.addEventListener("input", () => showVal(inp));
+      td.appendChild(inp);
+      const v = tr.insertCell(); v.className = "val";
+    }
+  }
+}
+function showVal(inp) {
+  const cell = inp.closest("tr")?.querySelector(".val");
+  if (!cell) return;
+  const e = state.entities.get(inp.value.trim());
+  cell.textContent = e ? fmtState(e) : (inp.value.trim() && state.entities.size ? "không thấy" : "");
+  cell.title = e ? e.name : "";
+}
+function autoDetect(section, profileName, msgEl) {
+  if (!state.entities.size) { setMsg(msgEl, "Hãy tải danh sách entity trước", "err"); return; }
+  const prof = PROFILES[profileName];
+  const ids = [...state.entities.keys()];
+  const anchor = ids.find((id) => prof.anchor.test(id));
+  if (!anchor) { setMsg(msgEl, "Không tìm thấy entity phù hợp", "err"); return; }
+  const prefix = anchor.slice(0, anchor.search(prof.anchor));
+  let n = 0;
+  for (const [slot, re] of Object.entries(prof.map)) {
+    const hit = ids.find((id) => id.startsWith(prefix) && re.test(id.slice(prefix.length)));
+    const inp = $(`[data-slot="${section}.entities.${slot}"]`);
+    if (hit && inp) { inp.value = hit; showVal(inp); n++; }
+  }
+  setMsg(msgEl, `Đã điền ${n} ô từ ${prefix}… — nhớ bấm Lưu`, "ok");
+}
+
+// ---------------------------------------------------------------- dòng nhiệt độ
+function addTempRow(label = "", src = "") {
+  const box = $("#temp-rows");
+  if (box.children.length >= 4) return;
+  const row = document.createElement("div"); row.className = "trow";
+  row.innerHTML = `<input type="text" class="t-label" placeholder="Nhãn" aria-label="Nhãn">
+    <input type="text" class="t-src" list="temp-sources" placeholder="local:cpu hoặc sensor.…" aria-label="Nguồn">
+    <span class="val tval" style="color:var(--accent-2);font-size:13px"></span>
+    <button type="button" class="small" title="Xoá dòng" aria-label="Xoá dòng">✕</button>`;
+  row.querySelector(".t-label").value = label;
+  const srcIn = row.querySelector(".t-src"); srcIn.value = src;
+  srcIn.addEventListener("input", () => tempVal(row));
+  row.querySelector("button").onclick = () => { row.remove(); updTempAdd(); };
+  box.appendChild(row); tempVal(row); updTempAdd();
+}
+function tempVal(row) {
+  const src = row.querySelector(".t-src").value.trim();
+  const cell = row.querySelector(".tval");
+  const sp = TEMP_SPECIAL.find(([k]) => k === src);
+  const e = state.entities.get(src);
+  cell.textContent = sp ? sp[1] : e ? fmtState(e) : "";
+}
+function updTempAdd() { $("#btn-temp-add").disabled = $("#temp-rows").children.length >= 4; }
+
+// ---------------------------------------------------------------- datalist
+function fillDatalists() {
+  const all = $("#ha-entities"); all.innerHTML = "";
+  const temps = $("#temp-sources"); temps.innerHTML = "";
+  for (const [k, name] of TEMP_SPECIAL) temps.appendChild(new Option(name, k));
+  for (const e of state.entities.values()) {
+    const label = `${e.name || e.entity_id} — ${fmtState(e)}`;
+    all.appendChild(new Option(label, e.entity_id));
+    if (e.device_class === "temperature" || /°[CF]$/.test(e.unit)) temps.appendChild(new Option(label, e.entity_id));
+  }
+  $$("[data-slot]").forEach(showVal);
+  $$("#temp-rows .trow").forEach(tempVal);
+}
+
+// ---------------------------------------------------------------- form <-> cấu hình
+function fillForm(data) {
+  state.config = data.config; state.secrets = data.secrets;
+  for (const el of $$("[data-k]")) {
+    const v = getPath(data.config, el.dataset.k);
+    if (el.type === "checkbox") el.checked = !!v;
+    else if (el.type === "radio") el.checked = el.value === v;
+    else el.value = v ?? "";
+  }
+  for (const sec of ["home_assistant", "nas"]) {
+    for (const inp of $$(`[data-slot^="${sec}."]`)) {
+      inp.value = data.config[sec].entities[inp.dataset.slot.split(".").pop()] || "";
+      showVal(inp);
+    }
+  }
+  $("#ha-token").placeholder = data.secrets.ha_token ? "•••••• đã lưu — để trống để giữ nguyên" : "dán token vào đây";
+  $("#nas-pass").placeholder = data.secrets.nas_password ? "•••••• đã lưu — để trống để giữ nguyên" : "";
+  $("#temp-rows").innerHTML = "";
+  for (const [label, src] of data.config.temperature.rows) addTempRow(label, src);
+  const c = data.config.weather;
+  $("#city-preset").value = CITIES.find(([n, la, lo]) => n === c.city && la === c.latitude && lo === c.longitude)?.[0] || "";
+  syncVisibility();
+}
+function readForm() {
+  const cfg = structuredClone(state.config);
+  for (const el of $$("[data-k]")) {
+    if (el.type === "radio") { if (el.checked) setPath(cfg, el.dataset.k, el.value); continue; }
+    let v = el.type === "checkbox" ? el.checked : el.value.trim();
+    if (el.type === "number") v = Number(v);
+    setPath(cfg, el.dataset.k, v);
+  }
+  for (const sec of ["home_assistant", "nas"]) {
+    cfg[sec].entities = {};
+    for (const inp of $$(`[data-slot^="${sec}."]`)) {
+      if (inp.value.trim()) cfg[sec].entities[inp.dataset.slot.split(".").pop()] = inp.value.trim();
+    }
+  }
+  cfg.temperature.rows = $$("#temp-rows .trow")
+    .map((r) => [r.querySelector(".t-label").value.trim(), r.querySelector(".t-src").value.trim()])
+    .filter(([l, s]) => l && s);
+  return cfg;
+}
+function syncVisibility() {
+  const nasHa = $('input[name="nas-source"]:checked')?.value === "home_assistant";
+  $("#nas-dsm").classList.toggle("hidden", nasHa);
+  $("#nas-ha").classList.toggle("hidden", !nasHa);
+  const netHa = $('input[name="net-source"]:checked')?.value === "home_assistant";
+  $("#net-if").classList.toggle("hidden", netHa);
+  $$(".net-ha").forEach((el) => el.classList.toggle("hidden", !netHa));
+}
+
+// ---------------------------------------------------------------- hành động
+async function loadConfig() {
+  const data = await api("/api/config");
+  fillForm(data);
+  $("#cfg-path").innerHTML = "";
+}
+async function loadEntities(quiet = false) {
+  const msg = $("#ha-msg");
+  if (!quiet) setMsg(msg, "Đang kết nối…");
+  try {
+    const body = { url: $('[data-k="home_assistant.url"]').value.trim(), token: $("#ha-token").value.trim(),
+                   verify_ssl: $('[data-k="home_assistant.verify_ssl"]').checked };
+    const data = await api("/api/ha/entities", body);
+    state.entities = new Map(data.entities.map((e) => [e.entity_id, e]));
+    fillDatalists();
+    setMsg(msg, `Đã kết nối — ${data.entities.length} entity`, "ok");
+  } catch (e) { if (!quiet || state.config.home_assistant.enabled) setMsg(msg, e.message, "err"); }
+}
+async function testNas() {
+  const msg = $("#nas-msg"); setMsg(msg, "Đang kết nối…");
+  try {
+    const body = { url: $('[data-k="nas.url"]').value.trim(), username: $('[data-k="nas.username"]').value.trim(),
+                   password: $("#nas-pass").value, verify_ssl: $('[data-k="nas.verify_ssl"]').checked,
+                   volume: $('[data-k="nas.volume"]').value.trim() };
+    const { stats: s } = await api("/api/nas/test", body);
+    const f = (v, u = "") => (v == null ? "--" : Math.round(v) + u);
+    setMsg(msg, `OK — CPU ${f(s.cpu_pct, "%")}, RAM ${f(s.ram_pct, "%")}, ổ ${f(s.disk_pct, "%")}, ` +
+                `nhiệt độ ${f(s.cpu_temp, "°C")} / ổ ${f(s.disk_temp, "°C")}`, "ok");
+  } catch (e) { setMsg(msg, e.message, "err"); }
+}
+async function save() {
+  const msg = $("#save-msg"); const btn = $("#btn-save");
+  btn.disabled = true; setMsg(msg, "Đang lưu…");
+  try {
+    const data = await api("/api/config", { config: readForm() });
+    $("#ha-token").value = ""; $("#nas-pass").value = "";
+    fillForm(data);
+    setMsg(msg, "Đã lưu — màn hình sẽ cập nhật ở lần gửi tới", "ok");
+    refreshPreview();
+  } catch (e) { setMsg(msg, "Không lưu được: " + e.message, "err"); }
+  finally { btn.disabled = false; }
+}
+
+// ---------------------------------------------------------------- xem trước + trạng thái
+let previewUrl = null;
+async function refreshPreview() {
+  const mode = $('input[name="pmode"]:checked').value;
+  const over = $("#preview-msg");
+  try {
+    const r = await fetch(`/api/preview.png?mode=${mode}&t=${Date.now()}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `HTTP ${r.status}`);
+    const blob = await r.blob();
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(blob);
+    $("#preview").src = previewUrl; over.classList.add("hidden");
+  } catch (e) { over.textContent = "Không vẽ được: " + e.message; over.classList.remove("hidden"); }
+}
+async function refreshStatus() {
+  const chip = $("#lcd-status"); const dot = $(".dot", chip); const txt = chip.lastElementChild;
+  try {
+    const s = await api("/api/status");
+    $("#cfg-path").innerHTML = `File cấu hình: <code></code>`;
+    $("#cfg-path code").textContent = s.config_path;
+    if (!s.lcd_enabled) { dot.className = "dot"; txt.textContent = "Chỉ chạy trang cấu hình (không gửi lên màn hình)"; return; }
+    if (s.last_ok == null) { dot.className = "dot warn"; txt.textContent = s.message; return; }
+    const t = new Date(s.last_sent * 1000).toLocaleTimeString("vi-VN");
+    dot.className = "dot " + (s.last_ok ? "ok" : "err");
+    txt.textContent = s.last_ok ? `Màn hình: đã gửi lúc ${t}` : `Màn hình lỗi (${t}): ${s.message}`;
+  } catch (e) { dot.className = "dot err"; txt.textContent = "Mất kết nối tới chương trình dashboard"; }
+}
+
+// ---------------------------------------------------------------- khởi động
+function init() {
+  buildSlots($("#ha-slots"), "home_assistant");
+  buildSlots($("#nas-slots"), "nas");
+  const sel = $("#city-preset");
+  for (const [n] of CITIES) sel.add(new Option(n, n));
+  sel.onchange = () => {
+    const c = CITIES.find(([n]) => n === sel.value);
+    if (!c) return;
+    $('[data-k="weather.city"]').value = c[0];
+    $('[data-k="weather.latitude"]').value = c[1];
+    $('[data-k="weather.longitude"]').value = c[2];
+  };
+  $$('input[name="nas-source"], input[name="net-source"]').forEach((r) => (r.onchange = syncVisibility));
+  $$('input[name="pmode"]').forEach((r) => (r.onchange = refreshPreview));
+  $("#btn-refresh").onclick = refreshPreview;
+  $("#btn-ha-load").onclick = () => loadEntities();
+  $("#btn-ha-auto").onclick = () => autoDetect("home_assistant", "system_monitor", $("#ha-msg"));
+  $("#btn-nas-auto").onclick = () => autoDetect("nas", "synology", $("#nas-ha-msg"));
+  $("#btn-nas-test").onclick = testNas;
+  $("#btn-temp-add").onclick = () => addTempRow();
+  $("#btn-save").onclick = save;
+  $("#btn-reload").onclick = () => loadConfig().then(() => setMsg($("#save-msg"), "Đã tải lại cấu hình đã lưu"));
+  loadConfig().then(() => {
+    refreshPreview(); refreshStatus();
+    if (state.secrets.ha_token) loadEntities(true);
+  }).catch((e) => setMsg($("#save-msg"), "Không đọc được cấu hình: " + e.message, "err"));
+  setInterval(refreshStatus, 5000);
+  setInterval(() => { if (!document.hidden) refreshPreview(); }, 15000);
+}
+init();
+</script>
+</body>
+</html>

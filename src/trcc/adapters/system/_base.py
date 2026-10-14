@@ -1,0 +1,600 @@
+"""Shared OS base — one abstract skeleton; factory children supply the internals.
+
+There is only *the OS* (the :class:`~trcc.core.ports.Platform` port).  Every
+concrete OS has the **same method names** (the contract); the plumbing that is
+identical across OSes lives here **once**, and each factory child overrides only
+the method bodies whose internals genuinely differ.
+
+Adding a new OS — Solaris, Haiku, whatever ships next — is therefore one
+subclass that names its key in its own class line — ``class HaikuPlatform(BaseOS,
+key="haiku")`` — and implements the twelve members this class leaves abstract,
+with nothing copied.  Five are internal hooks (``_make_paths`` /
+``_build_sensors`` / ``_build_autostart`` / ``_build_hotplug`` / ``_open_scsi``);
+seven are the port's own questions that have no shared answer (``setup`` /
+``check_permissions`` / ``distro_name`` / ``memory_info`` / ``disk_info`` /
+``no_devices_hint`` / ``permission_denied_hint``).  Miss one and the class
+refuses to instantiate, naming it — that ``TypeError`` is the to-do list, and
+for this layer it is the only one there is: TRCC's C# original has exactly one
+OS and never abstracted it, so there is no oracle to check a port against.
+That is the future-proofing: new OS = new subclass, no touched callers.
+
+:data:`PLATFORMS` lives here rather than in the package ``__init__`` so the base
+class can register its own children without importing its own package (a cycle).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+from abc import abstractmethod
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import usb.util  # pyright: ignore[reportMissingImports]
+
+from ...core.factory import FallBackTo, Registry
+from ...core.logs import per_frame
+from ...core.models import DeviceInfo, DisplayServer, DisplaySession, Wire
+from ...core.ports import (
+    AutostartManager,
+    HotplugMonitor,
+    HttpFetcher,
+    PackageManager,
+    Paths,
+    Platform,
+    ScreenCapture,
+    ScsiTransport,
+    SensorEnumerator,
+    Transport,
+)
+from ...core.registry import ALL_DEVICES
+from ..device._pyusb_find import find as usb_find
+from ..device._pyusb_find import usb_path
+from ..device.transport import PyUsbBulkTransport
+from ..visual import VISUALS as _VISUALS
+
+if TYPE_CHECKING:
+    from ...core.models import UsbPowerState
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+# The OS table.  A miss falls back to Linux with a warning rather than raising,
+# so a debug session on a niche OS reaches a usable app instead of dying at the
+# composition root.  See ``core.factory.FallBackTo``.
+PLATFORMS: Registry[str, type[Platform]] = Registry(
+    "platform", on_missing=FallBackTo("linux"),
+)
+
+
+class BasePaths(Paths):
+    """User-data locations, all derived from ``_root`` / ``_user_content``.
+
+    The four accessors are identical across every OS — they differ only in the
+    two roots (and macOS's ``Logs/`` subdir).  Subclasses set the two roots in
+    ``__init__``; macOS additionally overrides :meth:`log_file`.  Defined once
+    here so the accessors — and their resolved-value debug logs — never drift.
+    """
+
+    _root: Path
+    _user_content: Path
+
+    def config_dir(self) -> Path:
+        log.debug("%s.config_dir → %s", type(self).__name__, self._root)
+        return self._root
+
+    def data_dir(self) -> Path:
+        path = self._root / "data"
+        frame_log.debug("%s.data_dir → %s", type(self).__name__, path)
+        return path
+
+    def user_content_dir(self) -> Path:
+        frame_log.debug("%s.user_content_dir → %s",
+                  type(self).__name__, self._user_content)
+        return self._user_content
+
+    def log_file(self) -> Path:
+        path = self._root / "trcc.log"
+        log.debug("%s.log_file → %s", type(self).__name__, path)
+        return path
+
+
+
+
+def disambiguate(infos: list[DeviceInfo]) -> list[DeviceInfo]:
+    """Give each unit a key of its own — but ONLY where one is needed.
+
+    ``key`` is the public identity: it names a device in 98 Commands, 115 API
+    routes and 87 CLI arguments, and it is the string ``trcc.json`` persists
+    per-device settings under.  Suffixing it unconditionally would orphan
+    every existing config and break every documented ``trcc … 0416:5302``, to
+    fix a problem almost nobody has.  So a VID/PID with ONE unit present is
+    left exactly as it has always been, and only a genuine collision — two of
+    the same cooler (#287) — earns a port suffix.
+
+    The consequence, stated rather than discovered: unplugging one of a pair
+    returns the survivor to the plain ``vid:pid``, and the settings it wrote
+    while disambiguated no longer match.  :meth:`Settings.for_device` is the
+    ONE lookup chokepoint and falls back to the plain key, so that case
+    degrades to "inherits the shared settings" instead of "loses them".
+
+    A colliding pair on a host that cannot supply a port (``path is None``)
+    is left collapsed and WARNED about, because the alternative — keying on
+    enumeration order — would hand two devices each other's settings the
+    first time they came up in a different order.
+    """
+    log.debug("disambiguate: %d device(s)", len(infos))
+    groups: dict[tuple[int, int], list[DeviceInfo]] = {}
+    for info in infos:
+        groups.setdefault((info.vid, info.pid), []).append(info)
+
+    out: list[DeviceInfo] = []
+    for (vid, pid), units in groups.items():
+        if len(units) == 1:
+            out.extend(units)
+            continue
+        if any(u.path is None for u in units):
+            log.warning(
+                "disambiguate: %d units of %04x:%04x but this host supplies "
+                "no USB port for at least one — they share the key %04x:%04x "
+                "and only one is usable (#287)",
+                len(units), vid, pid, vid, pid,
+            )
+            out.extend(units)
+            continue
+        log.info("disambiguate: %d units of %04x:%04x -> ports %s",
+                 len(units), vid, pid, [u.path for u in units])
+        out.extend(replace(u, unit=u.path or "") for u in units)
+    return out
+
+
+#: Where every TRCC release lives; ``latest/download/<alias>`` is each
+#: package's fixed-name copy, so an upgrade line never names a version.
+RELEASES_URL = "https://github.com/Lexonight1/thermalright-trcc-linux/releases/latest"
+#: The legacy deb's own venv: it reads as a "pip" install, but pip must not
+#: upgrade a venv a package owns.
+_LEGACY_DEB_VENV = "/opt/trcc-linux"
+
+
+def download_and_install(asset: str, installer: str) -> str:
+    """One copy-paste line: fetch the release's *asset*, install it.
+
+    ``wget -O``, never ``-c``: continuing onto a stale file of the same name
+    corrupts it or keeps the old one (measured, the #181 symptom).
+    """
+    line = (f"wget -O /tmp/{asset} {RELEASES_URL}/download/{asset} && "
+            f"{installer} /tmp/{asset}")
+    log.debug("download_and_install: %s", line)
+    return line
+
+
+class BaseOS(Platform):
+    """Shared skeleton for every concrete OS :class:`Platform`.
+
+    Owns the behaviour identical across OSes — USB bulk transport, device
+    scan, memoised sensor/autostart/hotplug enumerators, install detection,
+    dict-based install hints — and delegates the genuinely-different internals
+    to abstract hooks the factory children implement.  Twelve members stay
+    abstract (see the module docstring), which is what keeps this class from
+    instantiating on its own and what tells a new OS's author what to write.
+    """
+
+    #: Every audio visual TRCC has: the ``VISUALS`` registry.
+    VISUALS = _VISUALS
+
+    def __init_subclass__(cls, key: str | None = None, **kwargs: Any) -> None:
+        """Register the subclass under the ``key=`` it declares.
+
+        An OS states its own ``sys.platform`` key in its class line::
+
+            class LinuxOS(BaseOS, key="linux"): ...
+
+        ``key=None`` means "intermediate base, don't register".
+        """
+        super().__init_subclass__(**kwargs)
+        if key is None:
+            log.debug("%s: intermediate OS base, not registered", cls.__name__)
+            return
+        log.debug("%s: registering as OS %r", cls.__name__, key)
+        PLATFORMS.register(key)(cls)
+
+    # ── Shared answers to port questions ─────────────────────────────────
+    #
+    # The port asks every OS all 21 of its questions (``core/ports.py``); these
+    # are the ones with a real shared answer, so they live here — one MRO step
+    # below the contract.  A new OS inherits them and overrides only what
+    # genuinely differs, which is the whole point of this class.
+    #
+    # The port deliberately keeps NO body of its own: a default up there let an
+    # unimplemented method return a plausible value, making "this OS cannot
+    # tell" indistinguishable from "nobody wrote it yet".  Down here the same
+    # default is a decision an OS layer made, not a hole the contract papered
+    # over.  The four with no shared answer — ``memory_info`` / ``disk_info`` /
+    # ``no_devices_hint`` / ``permission_denied_hint``, all four of which every
+    # OS already implements — get no body here either, so they stay abstract
+    # alongside ``setup`` / ``check_permissions`` / ``distro_name`` and a new OS
+    # is told about them at instantiation.
+
+    def disk_partitions(self) -> list[tuple[str, str]]:
+        """Mounted partitions via psutil — one answer for every OS.
+
+        psutil reports partitions identically everywhere we ship, so this is a
+        SHARED answer and lives here rather than four times over.  It sits in
+        the adapter layer because that is where a hardware probe belongs:
+        ``ListDisks`` used to ``import psutil`` inside
+        ``core/commands/system.py``, the only such import in ``core`` or
+        ``services``, which put a probe on the wrong side of the hexagon.
+
+        ``all=False`` keeps it to real mounted filesystems (no tmpfs / proc),
+        matching what the Command has always returned.  An unavailable or
+        failing psutil yields an empty list — the same "measured nothing"
+        convention ``memory_info`` and ``disk_info`` document.
+        """
+        try:
+            import psutil  # type: ignore[import-untyped]
+        except ImportError:
+            log.warning("%s.disk_partitions: psutil unavailable",
+                        type(self).__name__)
+            return []
+        try:
+            parts = psutil.disk_partitions(all=False)
+        except (OSError, RuntimeError):
+            log.exception("%s.disk_partitions: enumeration failed",
+                          type(self).__name__)
+            return []
+        log.debug("%s.disk_partitions: %d partition(s)",
+                  type(self).__name__, len(parts))
+        return [(p.device, p.mountpoint) for p in parts]
+
+    def package_manager(self) -> str:
+        """The system package manager, or "" when this OS has none of ours.
+
+        Only Linux ships trcc through a distro manager, so the other OSes
+        answer "" — an honest "not applicable", not a guess.
+        """
+        log.debug("%s.package_manager: none", type(self).__name__)
+        return ""
+
+    def upgrade_hint(self) -> str:
+        """The command that upgrades THIS install -- shown, never run.
+
+        It used to be argv that ``RunUpgrade`` ran under sudo: ``apt upgrade
+        -y trcc-linux`` upgraded the whole system and reported success,
+        because no distro repo carries trcc-linux.  How TRCC got here decides
+        the answer; the OS adds its native package (``LinuxOS``).
+        """
+        method = self.install_method()
+        if method == "pipx":
+            hint = "pipx upgrade trcc-linux"
+        elif method == "pip" and sys.prefix == _LEGACY_DEB_VENV:
+            hint = download_and_install("trcc-linux-latest.legacy_all.deb",
+                                        "sudo apt install")
+        elif method == "pip":
+            hint = f"{sys.executable} -m pip install --upgrade trcc-linux"
+        else:
+            hint = f"download the latest release from {RELEASES_URL}"
+        log.info("%s.upgrade_hint: %s install -> %s", type(self).__name__,
+                 method, hint)
+        return hint
+
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> UsbPowerState | None:
+        """Not exposed by default — only Linux publishes runtime PM per device.
+
+        An honest ``None`` beats a stub inventing a value: this exists so a
+        timed-out handshake can be told apart from a SUSPENDED panel (#150),
+        and a wrong answer would mislead exactly the debugging it serves.
+        """
+        log.debug("%s.usb_power_state: not exposed on this OS (%04x:%04x "
+                  "unit=%r)", type(self).__name__, vid, pid, unit)
+        return None
+
+    def configure_stdout(self) -> None:
+        """Nothing to do — this OS's console already speaks UTF-8.
+
+        Windows overrides to rewrap cp1252 streams before the logging
+        StreamHandler attaches to them.
+        """
+        log.debug("%s.configure_stdout: console already UTF-8, no-op",
+                  type(self).__name__)
+
+    def worker_thread_context(self) -> AbstractContextManager[None]:
+        """No per-thread setup needed.  Windows overrides (COM apartment)."""
+        log.debug("%s.worker_thread_context: null context",
+                  type(self).__name__)
+        return nullcontext()
+
+    #: tool → install one-liner; the default :meth:`software_install_hint`
+    #: reads this.  Dict-driven OSes (macOS/Windows/BSD) set it; Linux
+    #: overrides the whole method (distro package-manager detection).
+    _INSTALL_HINTS: dict[str, str] = {}
+
+    def __init__(self) -> None:
+        log.info("%s: initialising", type(self).__name__)
+        self._paths: Paths = self._make_paths()
+        self._sensors: SensorEnumerator | None = None
+        self._sensors_lock = threading.Lock()
+        self._autostart: AutostartManager | None = None
+        self._hotplug: HotplugMonitor | None = None
+        self._packages: PackageManager | None = None
+        self._screen_capture: ScreenCapture | None = None
+        self._http_fetcher: HttpFetcher | None = None
+
+    # ── Abstract hooks — the per-OS internals ────────────────────────────
+
+    @abstractmethod
+    def _make_paths(self) -> Paths:
+        """Build this OS's :class:`Paths` (its user-data location scheme)."""
+
+    @abstractmethod
+    def _build_sensors(self) -> SensorEnumerator:
+        """Build this OS's sensor enumerator (called once, then memoised)."""
+
+    @abstractmethod
+    def _build_autostart(self) -> AutostartManager:
+        """Build this OS's autostart manager (called once, then memoised)."""
+
+    @abstractmethod
+    def _build_hotplug(self) -> HotplugMonitor:
+        """Build this OS's hotplug monitor (called once, then memoised)."""
+
+    def _build_packages(self) -> PackageManager:
+        """Build this OS's package-manager query surface.
+
+        Concrete, unlike its five siblings, and deliberately: the default is
+        "this OS cannot be asked", which is the truthful answer for every OS
+        whose manager nobody has run.  Making it abstract would force each OS
+        to write a stub, and a stub is where a confident wrong answer comes
+        from -- which is the failure this port exists to remove.
+        """
+        from ._packages import NoPackageManager
+        log.debug("%s._build_packages: none for this OS", type(self).__name__)
+        return NoPackageManager()
+
+    def display_session(self) -> DisplaySession:
+        """The session variables, read as the XDG spec defines them.
+
+        ``XDG_SESSION_TYPE`` is authoritative when set; ``WAYLAND_DISPLAY``
+        and ``DISPLAY`` stand in for it under compositors and X servers
+        started by hand.  Neither present is a headless process -- an ssh
+        shell, a service -- and is said so rather than guessed as X11.
+        ``XDG_CURRENT_DESKTOP`` is a colon list, most specific first
+        (``ubuntu:GNOME``), kept whole and lower-cased so a consumer tests
+        membership.
+        """
+        session_type = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
+        wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
+        display = os.environ.get("DISPLAY", "")
+        current = os.environ.get("XDG_CURRENT_DESKTOP", "")
+        if session_type == "wayland" or wayland_display:
+            server = DisplayServer.WAYLAND
+        elif session_type == "x11" or display:
+            server = DisplayServer.X11
+        else:
+            server = DisplayServer.HEADLESS
+        desktops = tuple(
+            token.strip().lower() for token in current.split(":")
+            if token.strip())
+        log.info("%s.display_session: %s desktops=%s (XDG_SESSION_TYPE=%r "
+                 "WAYLAND_DISPLAY=%r DISPLAY=%r XDG_CURRENT_DESKTOP=%r)",
+                 type(self).__name__, server.value, desktops, session_type,
+                 wayland_display, display, current)
+        return DisplaySession(server, desktops)
+
+    def _build_screen_capture(self) -> ScreenCapture:
+        """Build this OS's capture source (called once, then memoised).
+
+        Concrete, and truthfully so — unlike the defaults deleted on
+        2026-08-21, this one WORKS everywhere rather than answering on an
+        OS's behalf: the chain is composed from :meth:`display_session`, so
+        a Wayland desktop gets the portal and its own tool, X11 gets Qt's
+        grab and the X11 grabbers, native windowing gets Qt alone.
+        Override when a native path beats it.
+        """
+        from ..screencast import build_screen_capture
+
+        log.info("%s._build_screen_capture: delegating to the shared backend "
+                 "chooser", type(self).__name__)
+        return build_screen_capture(self.display_session(),
+                                    self.paths().config_dir())
+
+    # ── Shared transport / scan ──────────────────────────────────────────
+
+    def _transport_openers(
+        self,
+    ) -> Mapping[Wire, Callable[..., Transport]]:
+        """Wire → the opener that serves it.  **Unlisted wires use bulk.**
+
+        The same shape as ``_udev._WIRE_SUBSYSTEMS``: a per-``(OS, wire)`` fact
+        stated as a table row rather than as control flow.  Only SCSI needs a
+        native path; HID / BULK / LY / LED all speak plain USB bulk
+        via libusb, identically everywhere, so they need no rows at all.
+
+        A new wire needing a new kernel interface is one row **here** — not a
+        new abstract method on the port and an implementation in every OS.  An
+        OS whose mapping genuinely differs overrides this one method.
+        """
+        openers = {Wire.SCSI: self._open_scsi}
+        log.debug("%s._transport_openers: %s (all other wires -> bulk)",
+                  type(self).__name__, [w.value for w in openers])
+        return openers
+
+    def open_transport(self, wire: Wire, vid: int, pid: int,
+                       serial: str | None = None,
+                       unit: str = "", *,
+                       hid_reports: bool = False,
+                       report_id: int = 0x00) -> Transport:
+        """Return an unopened transport for *wire* — the port's one entry point.
+
+        *unit* names WHICH of several identical devices to open (#287); empty
+        is "the only one of this model", which is every single-device user and
+        therefore the behaviour this signature had before the keyword existed.
+        *hid_reports* asks the USB opener for the firmware override (#228),
+        writing HID report *report_id*.
+        """
+        if hid_reports:
+            log.info("%s.open_transport: wire=%s %04x:%04x unit=%s → "
+                     "_open_bulk(hid_reports, report 0x%02x)",
+                     type(self).__name__, wire.value, vid, pid,
+                     unit or "(only)", report_id)
+            return self._open_bulk(vid, pid, serial, unit, hid_reports=True,
+                                   report_id=report_id)
+        opener = self._transport_openers().get(wire, self._open_bulk)
+        log.info("%s.open_transport: wire=%s %04x:%04x serial=%r unit=%s → %s",
+                 type(self).__name__, wire.value, vid, pid, serial,
+                 unit or "(only)", getattr(opener, "__name__", opener))
+        return opener(vid, pid, serial, unit)
+
+    def _open_bulk(self, vid: int, pid: int, serial: str | None = None,
+                   unit: str = "", hid_reports: bool = False,
+                   report_id: int = 0x00) -> Transport:
+        """The USB opener — identical on every OS: libusb bulk, or, for the
+        firmware-4.07 override, HID output reports through hidapi (#228).
+
+        One opener for both, so a stand-in platform that scripts USB scripts
+        the override too: when it was built outside the Platform, a mock run
+        retried a failed handshake on a REAL hidapi handle.
+        """
+        log.debug("%s._open_bulk: %04x:%04x serial=%r unit=%s hid_reports=%s "
+                  "report=0x%02x", type(self).__name__, vid, pid, serial,
+                  unit or "(only)", hid_reports, report_id)
+        if hid_reports:
+            from ..device.transport import HidApiTransport
+            return HidApiTransport(vid, pid, serial, unit, report_id=report_id)
+        return PyUsbBulkTransport(vid, pid, serial, unit)
+
+    @abstractmethod
+    def _open_scsi(self, vid: int, pid: int, serial: str | None = None,
+                   unit: str = "") -> ScsiTransport:
+        """Open this OS's native SCSI passthrough — the one divergent path."""
+
+    def scan_devices(self) -> list[DeviceInfo]:
+        """Walk :data:`ALL_DEVICES` and return a DeviceInfo per present pair.
+
+        The bcdDevice fingerprint is read on every OS (harmless where absent);
+        the composition root uses it to resolve per-firmware quirks (#228).
+        """
+        log.info("%s.scan_devices: scanning %d known VID/PID pairs",
+                 type(self).__name__, len(ALL_DEVICES))
+        found: list[DeviceInfo] = []
+        for (vid, pid) in ALL_DEVICES:
+            for dev in (usb_find(find_all=True, idVendor=vid, idProduct=pid) or []):
+                serial_idx = getattr(dev, "iSerialNumber", 0)
+                serial = ""
+                try:
+                    if serial_idx:
+                        serial = usb.util.get_string(dev, serial_idx) or ""
+                except Exception:
+                    serial = ""
+                bcd = int(getattr(dev, "bcdDevice", 0) or 0)
+                found.append(DeviceInfo(vid=vid, pid=pid, serial=serial or None,
+                                        bcd_device=bcd, path=usb_path(dev)))
+                log.info("  found %04x:%04x serial=%r bcdDevice=%#06x path=%s",
+                         vid, pid, serial, bcd, usb_path(dev) or "(none)")
+        log.info("%s.scan_devices: %d device(s) total",
+                 type(self).__name__, len(found))
+        return disambiguate(found)
+
+    # ── Filesystem + memoised enumerators ────────────────────────────────
+
+    def paths(self) -> Paths:
+        log.debug("%s.paths()", type(self).__name__)
+        return self._paths
+
+    def sensors(self) -> SensorEnumerator:
+        """The one enumerator, built on first ask by whichever thread asks.
+
+        Under a lock, so two threads asking at once build it once (on Windows
+        a second build would spawn LibreHardwareMonitor twice).  Inside the
+        thread's OS setup, because the first ask is not always the main
+        thread -- the gui primes devices on its splash worker, and building
+        means WMI discovery, which needs a COM apartment on that thread.
+        """
+        with self._sensors_lock:
+            if self._sensors is None:
+                log.info("%s.sensors: building enumerator on %s",
+                         type(self).__name__, threading.current_thread().name)
+                with self.worker_thread_context():
+                    self._sensors = self._build_sensors()
+            else:
+                frame_log.debug("%s.sensors: returning cached enumerator",
+                                type(self).__name__)
+            return self._sensors
+
+    def autostart(self) -> AutostartManager:
+        if self._autostart is None:
+            log.info("%s.autostart: building manager", type(self).__name__)
+            self._autostart = self._build_autostart()
+        else:
+            log.debug("%s.autostart: returning cached manager",
+                      type(self).__name__)
+        return self._autostart
+
+    def hotplug(self) -> HotplugMonitor:
+        if self._hotplug is None:
+            log.info("%s.hotplug: building monitor", type(self).__name__)
+            self._hotplug = self._build_hotplug()
+        else:
+            log.debug("%s.hotplug: returning cached monitor",
+                      type(self).__name__)
+        return self._hotplug
+
+    def screen_capture(self) -> ScreenCapture:
+        if self._screen_capture is None:
+            log.info("%s.screen_capture: building capture source",
+                     type(self).__name__)
+            self._screen_capture = self._build_screen_capture()
+        else:
+            log.debug("%s.screen_capture: returning cached source",
+                      type(self).__name__)
+        return self._screen_capture
+
+    def http_fetcher(self) -> HttpFetcher:
+        """The real network -- one fetcher, built on first use."""
+        if self._http_fetcher is None:
+            from ..repo.http import UrllibHttpFetcher
+            log.info("%s.http_fetcher: building the urllib fetcher",
+                     type(self).__name__)
+            self._http_fetcher = UrllibHttpFetcher()
+        return self._http_fetcher
+
+    def packages(self) -> PackageManager:
+        if self._packages is None:
+            log.info("%s.packages: building query surface",
+                     type(self).__name__)
+            self._packages = self._build_packages()
+        else:
+            log.debug("%s.packages: returning cached query surface",
+                      type(self).__name__)
+        return self._packages
+
+    # ── Install detection (OS-agnostic) ──────────────────────────────────
+
+    def install_method(self) -> str:
+        """How this package got here — the one honest, OS-agnostic detector."""
+        from ..diagnostics.install import detect_installer
+        method = detect_installer()
+        log.info("%s.install_method: %s", type(self).__name__, method)
+        return method
+
+    def software_install_hint(self, tool: str) -> str:
+        """Default dict-based hint from :attr:`_INSTALL_HINTS`.
+
+        Linux overrides this with distro package-manager detection.
+        """
+        log.debug("%s.software_install_hint: tool=%s", type(self).__name__, tool)
+        hint = self._INSTALL_HINTS.get(tool)
+        if hint is None:
+            return f"Install {tool} and ensure it is on PATH"
+        # ONE LINE.  Every consumer appends this to a list that is later
+        # "\n".join-ed under a `hint: ` label -- doctor.py:39,
+        # debug_report.py:522, qtgui/system_panel.py:182 -- so an embedded
+        # newline broke the second half out of both the indent and the label,
+        # in the very output reporters paste to us.  The "{tool} not found"
+        # preamble is dropped with it: the renderer already printed the
+        # message ("7z not on PATH") on the line above.
+        return hint

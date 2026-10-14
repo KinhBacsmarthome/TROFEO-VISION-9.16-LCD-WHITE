@@ -1,0 +1,1343 @@
+"""Shared fixtures for tests/next.
+
+Provides fakes at the transport boundary so tests exercise real
+protocol logic (ScsiLcd.connect, DisplayService.render) without
+touching USB / SG_IO / ioctl.
+"""
+from __future__ import annotations
+
+import os
+
+# The suite runs OFFSCREEN, and that is a GUARANTEE — not a default.
+#
+# Five places used to write ``os.environ.setdefault("QT_QPA_PLATFORM",
+# "offscreen")``, which does NOTHING when a contributor's shell already
+# exports the variable.  Five tests assert offscreen behaviour outright
+# (``test_offscreen_qpa_is_set``, three in ``test_screencast_capture_chain``
+# asserting Qt declines to grab, and the video-cut close test, which needs
+# ``QWidget.close()`` to deliver ``closeEvent`` synchronously — an xcb window
+# does not).  Under a real plugin all five fail, which is what a contributor
+# reported on 2026-09-21 as an unexplained environment difference.
+#
+# Assignment, and here at import time: this module is imported before any test
+# module, so it lands before the first PySide6 import in any worker.  The
+# production ``adapters/render/qt.py`` keeps ``setdefault`` on purpose — a real
+# user needs their real plugin.
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+# CLI output is PLAIN text, on every machine.  Typer decides at import whether
+# to force colour, and forces it whenever ``GITHUB_ACTIONS`` is set -- so on CI,
+# and only there, ``--yes`` in captured help arrived split by escape codes and a
+# help test failed that passes everywhere else.  Typer's own switch, set here
+# for the same reason as the line above: before the first import.
+os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
+# Every test builds its App IN-PROCESS.  Production's default is the shared
+# App (``_boot.trcc`` finds or STARTS a daemon), so a test that reaches the
+# factory without this would spawn a real background process on the host's
+# real USB.  Measured before the default flipped: 2 tests reach it that way
+# (``test_docs_api_consistency``).  Assignment, not ``setdefault``, for the same
+# reason as the offscreen pin: a shell exporting TRCC_DAEMON=1 must not leak
+# in.  Tests of daemon mode set it themselves with ``monkeypatch``.
+os.environ["TRCC_DAEMON"] = "0"
+
+
+import inspect
+import ipaddress
+import logging
+import socket
+from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+
+import pytest
+
+from trcc.core.models import (
+    DEFAULT_AUTOSTART_TARGET,
+    DisplayServer,
+    DisplaySession,
+    RawFrame,
+    UsbPowerState,
+    Wire,
+)
+from trcc.core.ports import (
+    AutostartManager,
+    BulkTransport,
+    CpuSource,
+    GpuSource,
+    HotplugMonitor,
+    HttpFetcher,
+    MemorySource,
+    PackageManager,
+    Paths,
+    Platform,
+    Renderer,
+    ScreenCapture,
+    ScsiTransport,
+    SensorEnumerator,
+    Transport,
+    WriteBuffer,
+)
+
+# ── Transport fakes ──────────────────────────────────────────────────
+
+
+class FakeBulkTransport(BulkTransport):
+    """In-memory BulkTransport — records both halves, yields scripted reads.
+
+    ``reads`` records the *request* side of a read — the endpoint and the
+    length asked for — which ``read_script`` alone cannot show.  Half of what
+    a handshake puts on the wire is the size it asks back (the C# gives LY 512
+    and LY1 511, from the same 16-byte command), and until this list existed
+    that number was unobservable, so nothing could gate it.  Recording only;
+    the reply still comes from ``read_script`` unconditioned on the request.
+    """
+
+    def __init__(self) -> None:
+        self._open = False
+        self.writes: List[Tuple[int, bytes]] = []
+        self.reads: List[Tuple[int, int]] = []
+        self.read_script: List[bytes] = []
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def open(self) -> bool:
+        self._open = True
+        return True
+
+    def close(self) -> None:
+        self._open = False
+
+    def write(self, endpoint: int, data: WriteBuffer, timeout_ms: int = 100) -> int:
+        payload = bytes(data)
+        self.writes.append((endpoint, payload))
+        return len(payload)
+
+    def read(self, endpoint: int, length: int, timeout_ms: int = 100) -> bytes:
+        self.reads.append((endpoint, length))
+        if not self.read_script:
+            return b""
+        buf = self.read_script.pop(0)
+        return buf[:length]
+
+
+class FakeScsiTransport(ScsiTransport):
+    """In-memory ScsiTransport — records both CDB paths, yields scripted data.
+
+    ``sent`` holds ``send_cdb`` (data-out); ``reads`` holds ``read_cdb``
+    (data-in).  They are separate lists because callers count ``sent`` to mean
+    "frames written", and a poll folded into it would move every one of those
+    numbers.  ``read_cdb`` recorded nothing at all until this existed, so
+    ``ScsiLcd``'s POLL command — the first thing it puts on the wire — was
+    invisible to every test; the one assertion that looked like it covered the
+    poll is reading ``sent[0]``, which is the INIT.
+    """
+
+    def __init__(self) -> None:
+        self._open = False
+        self.sent: List[Tuple[bytes, bytes]] = []
+        self.reads: List[Tuple[bytes, int]] = []
+        self.read_script: List[bytes] = []
+        self.send_should_succeed = True
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def open(self) -> bool:
+        self._open = True
+        return True
+
+    def close(self) -> None:
+        self._open = False
+
+    def send_cdb(self, cdb: bytes, data: bytes, timeout_ms: int = 5000) -> bool:
+        self.sent.append((bytes(cdb), bytes(data)))
+        return self.send_should_succeed
+
+    def read_cdb(self, cdb: bytes, length: int, timeout_ms: int = 5000) -> bytes:
+        self.reads.append((bytes(cdb), length))
+        if not self.read_script:
+            return b""
+        buf = self.read_script.pop(0)
+        return buf[:length]
+
+
+# ── Platform fake ────────────────────────────────────────────────────
+
+
+class FakePaths(Paths):
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def config_dir(self) -> Path:
+        return self._root
+
+    def data_dir(self) -> Path:
+        return self._root / "data"
+
+    def user_content_dir(self) -> Path:
+        return self._root / "user"
+
+    def log_file(self) -> Path:
+        return self._root / "trcc.log"
+
+
+class FakeAutostart(AutostartManager):
+    """In-memory autostart entry that models the PORT's contract.
+
+    ``command`` is what an entry written right now would launch;
+    ``installed_command`` is what the installed entry actually says.  They
+    diverge exactly when an install has moved — the #201 state ``refresh``
+    exists to repair, and the only thing about a refresh a test can SEE.
+
+    Without them ``refresh`` was ``pass``, which satisfied every assertion in
+    the suite by accident: ``RefreshAutostart`` could stop calling the port
+    altogether and 4266 tests stayed green, the 38 real-adapter ones included.
+    """
+
+    def __init__(self) -> None:
+        self._enabled = False
+        self._target: str | None = None
+        #: What an entry written NOW would launch.  Move it to simulate the
+        #: relocated install that makes an existing entry stale.
+        self.command: str = "trcc"
+        #: What the installed entry says — stale until the next refresh.
+        self.installed_command: str | None = None
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def entry_location(self) -> str:
+        return "/fake/autostart/trcc.desktop"
+
+    def installed_target(self) -> str | None:
+        return self._target if self._enabled else None
+
+    def enable(self, target: str | None = None) -> None:
+        self._enabled = True
+        self._target = target or DEFAULT_AUTOSTART_TARGET
+        self.installed_command = self.command
+
+    def disable(self) -> None:
+        self._enabled = False
+        self._target = None
+        self.installed_command = None
+
+    def refresh(self) -> None:
+        # The shape XDG, Windows and macOS all share: nothing installed -> do
+        # nothing; otherwise re-render with the CURRENT command and the
+        # INSTALLED target, so a repair never changes the user's choice.
+        if not self._enabled:
+            return
+        self.enable(self.installed_target())
+
+
+class FakeCpu(CpuSource):
+    def __init__(self) -> None:
+        self.values = {"temp": 42.0, "usage": 15.0, "freq": 3200.0, "power": 65.0}
+
+    @property
+    def name(self) -> str:
+        return "Fake CPU"
+
+    def temp(self) -> Optional[float]:
+        return self.values["temp"]
+
+    def usage(self) -> Optional[float]:
+        return self.values["usage"]
+
+    def freq(self) -> Optional[float]:
+        return self.values["freq"]
+
+    def power(self) -> Optional[float]:
+        return self.values["power"]
+
+
+class FakeMemory(MemorySource):
+    def used(self) -> Optional[float]:
+        return 8192.0
+
+    def available(self) -> Optional[float]:
+        return 24576.0
+
+    def total(self) -> Optional[float]:
+        return 32768.0
+
+    def percent(self) -> Optional[float]:
+        return 25.0
+
+
+class FakeGpu(GpuSource):
+    def __init__(self, index: int, discrete: bool = True,
+                 vendor: str = "test") -> None:
+        self._index = index
+        self._discrete = discrete
+        self._vendor = vendor
+        self.values = {
+            "temp": 55.0, "hotspot": 71.0, "mem_temp": 62.0,
+            "usage": 30.0, "clock": 1800.0, "power": 180.0,
+            "fan": 42.0, "fan_rpm": 1500.0,
+            "vram_used": 1024.0, "vram_total": 8192.0,
+        }
+
+    @property
+    def key(self) -> str:
+        return f"{self._vendor}:{self._index}"
+
+    @property
+    def name(self) -> str:
+        return f"Fake {self._vendor.upper()} GPU {self._index}"
+
+    @property
+    def is_discrete(self) -> bool:
+        return self._discrete
+
+    def temp(self) -> Optional[float]:
+        return self.values["temp"]
+
+    def usage(self) -> Optional[float]:
+        return self.values["usage"]
+
+    def clock(self) -> Optional[float]:
+        return self.values["clock"]
+
+    def power(self) -> Optional[float]:
+        return self.values["power"]
+
+    def hotspot(self) -> Optional[float]:
+        return self.values["hotspot"]
+
+    def mem_temp(self) -> Optional[float]:
+        return self.values["mem_temp"]
+
+    def fan(self) -> Optional[float]:
+        return self.values["fan"]
+
+    def fan_rpm(self) -> Optional[float]:
+        return self.values["fan_rpm"]
+
+    def vram_used(self) -> Optional[float]:
+        return self.values["vram_used"]
+
+    def vram_total(self) -> Optional[float]:
+        return self.values["vram_total"]
+
+
+class FakeScreenCapture(ScreenCapture):
+    """Deterministic desktop grab — a solid frame of the requested size.
+
+    Records every region asked for, so a test can assert WHICH rectangle a
+    caller grabbed rather than only that it grabbed something.
+    """
+
+    def __init__(self, fill: int = 0x40) -> None:
+        self.regions: List[tuple] = []
+        self._fill = fill
+
+    def grab_region(self, x: int, y: int, width: int, height: int) -> RawFrame:
+        self.regions.append((x, y, width, height))
+        return RawFrame(
+            data=bytes([self._fill]) * (width * height * 3),
+            width=width, height=height,
+        )
+
+
+class FakeMic:
+    """``App.audio`` without PortAudio — counts the lifecycle calls.
+
+    **Not a convenience.**  The real :class:`~trcc.services.audio.AudioCapture`
+    opens an ``sd.InputStream`` with a callback on a native thread, and a test
+    that dispatches ``StartScreencast(audio=True)`` against a real ``App``
+    leaves that stream open for the rest of the session.  Measured
+    2026-09-23: one such test killed an xdist worker with ``Fatal Python
+    error: Illegal instruction``, and the test that DIED was a different one
+    each run — whichever happened to follow it.  Assign this over
+    ``app.audio`` (a plain attribute, ``app.py:216``) in any test that turns
+    screencast audio on.
+
+    The counts are the point: a fake that never stops still reads
+    ``running=True``, so only ``starts``/``stops`` can prove that nothing
+    released the microphone.
+    """
+
+    def __init__(self) -> None:
+        self.running = False
+        self.starts = 0
+        self.stops = 0
+
+    def start(self) -> bool:
+        self.running = True
+        self.starts += 1
+        return True
+
+    def stop(self) -> None:
+        self.running = False
+        self.stops += 1
+
+    def get_spectrum(self) -> tuple[float, ...]:
+        return (0.0, 0.5, 1.0, 0.5)
+
+
+class FakePlatform(Platform):
+    """Minimal Platform fake — bulk/scsi transports replayable from tests."""
+
+    def http_fetcher(self) -> HttpFetcher:
+        """Offline: a test reaches the network only through a fetcher it
+        injects itself."""
+        from trcc.adapters.repo.http import OfflineHttpFetcher
+        return OfflineHttpFetcher()
+
+    def __init__(self, tmp_home: Path) -> None:
+        self.bulk = FakeBulkTransport()
+        self.scsi = FakeScsiTransport()
+        self._paths = FakePaths(tmp_home)
+        self._autostart = FakeAutostart()
+        self._sensors: Optional[SensorEnumerator] = None
+        self.capture = FakeScreenCapture()
+
+    def screen_capture(self) -> ScreenCapture:
+        return self.capture
+
+    def open_transport(self, wire, vid, pid, serial=None,
+                       unit="", *, hid_reports=False,
+                       report_id=0x00) -> Transport:
+        # *unit* accepted and ignored: one fake transport per wire is the
+        # point of this double.  Tests that care WHICH unit was asked for
+        # spy on this method (see test_usb_unit_path).
+        return self.scsi if wire is Wire.SCSI else self.bulk
+
+    def scan_devices(self) -> List:
+        return []
+
+    def paths(self) -> Paths:
+        return self._paths
+
+    def sensors(self) -> SensorEnumerator:
+        if self._sensors is None:
+            from trcc.adapters.sensors.aggregator import BaselineSensors
+            self._sensors = BaselineSensors(
+                cpu=FakeCpu(), memory=FakeMemory(),
+                gpus=[FakeGpu(0, discrete=True, vendor="nvidia")],
+                fans=[],
+            )
+        return self._sensors
+
+    def autostart(self) -> AutostartManager:
+        return self._autostart
+
+    def hotplug(self) -> HotplugMonitor:
+        from trcc.adapters.system._hotplug import NoopHotplugMonitor
+        if not hasattr(self, "_hotplug_monitor"):
+            self._hotplug_monitor = NoopHotplugMonitor(reason="test fake")
+        return self._hotplug_monitor
+
+    def setup(self, dry_run: bool = False) -> int:
+        return 0
+
+    def check_permissions(self) -> List[str]:
+        return []
+
+    #: What ``display_session`` answers; a test sets these to simulate a
+    #: Wayland or headless session without touching the environment.
+    display_server: DisplayServer = DisplayServer.X11
+    desktops: tuple[str, ...] = ("fake",)
+
+    def display_session(self) -> DisplaySession:
+        return DisplaySession(self.display_server, self.desktops)
+
+    def distro_name(self) -> str:
+        return "Fake Linux"
+
+    def install_method(self) -> str:
+        return "test"
+
+    # ── The rest of the port ──────────────────────────────────────────
+    #
+    # This double stays on ``Platform`` rather than extending ``BaseOS``,
+    # deliberately: ``BaseOS.scan_devices`` calls libusb, and the fake exists
+    # to be an OS without being a real one.  The price is answering the whole
+    # contract here — and that price is the point.  When the port grows a
+    # question, this class stops instantiating with a ``TypeError`` naming it,
+    # which is the same message a new OS's author gets, delivered to us first.
+
+    def usb_power_state(self, vid: int, pid: int,
+                        unit: str = "") -> Optional[UsbPowerState]:
+        return None
+
+    def packages(self) -> PackageManager:
+        """Answers "cannot be asked" — a fake must not invent a package DB."""
+        from trcc.adapters.system._packages import NoPackageManager
+        return NoPackageManager()
+
+    def package_manager(self) -> str:
+        return ""
+
+    def upgrade_hint(self) -> str:
+        return ""
+
+    def software_install_hint(self, tool: str) -> str:
+        return f"fake platform: install {tool}"
+
+    def no_devices_hint(self) -> str:
+        return "fake platform: no devices attached"
+
+    def permission_denied_hint(self) -> str:
+        return "fake platform: no USB permission"
+
+    def configure_stdout(self) -> None:
+        """Nothing to rewrap — the test runner's streams are already UTF-8."""
+
+    def worker_thread_context(self) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def memory_info(self) -> List[Dict[str, str]]:
+        """Scriptable via ``platform.memory_slots`` — default empty, the
+        honest answer for a platform with no probe."""
+        return getattr(self, "memory_slots", [])
+
+    def disk_partitions(self) -> List[tuple]:
+        """Two partitions on one drive — the shape that matters.
+
+        Deliberately NOT one-per-drive: a physical disk supplies several
+        partitions, which is exactly why ``ListDisks`` and ``disk_info``
+        cannot index each other.
+        """
+        return [("/dev/fake0p1", "/"), ("/dev/fake0p2", "/home")]
+
+    def disk_info(self) -> List[Dict[str, str]]:
+        return []
+
+
+# ── Fixtures ─────────────────────────────────────────────────────────
+
+
+# ── The scope trap ───────────────────────────────────────────────────
+#
+# pytest sets HIGHER-scoped fixtures up FIRST.  A function-scoped autouse
+# guard therefore does NOT protect anything a session-, package-, module- or
+# class-scoped fixture does in its own setup — that work runs before the guard
+# exists.  Measured 2026-09-11: a module-scoped fixture sees the real
+# ``HOME=/home/<user>`` and the REAL ``DataInstallService.ensure_all``, while
+# the test body it feeds sees the tmp_path and the stub.
+#
+# That is not hypothetical.  ``tests/test_integration_pipeline.py`` drives the
+# full-pipeline smoke from a MODULE-scoped fixture, so ``_stub_data_install``
+# below — whose docstring says "every test is offline-safe" — was never in
+# effect for it, and every suite run downloaded 23.4 MB of theme archives from
+# GitHub.  With no route the suite failed outright.
+#
+# So a guard that must hold EVERYWHERE is session-scoped, and the per-test
+# guards below narrow it further.  Six module-scoped fixtures exist in tests/.
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _the_suite_is_hermetic() -> Iterator[None]:
+    """Nothing in the suite talks to the network.
+
+    ``ConnectionRefusedError`` rather than something louder so production error
+    handling behaves exactly as it does on a machine with no route:
+    ``UrllibHttpFetcher`` turns ``OSError`` into ``HttpFetchError`` and every
+    caller degrades the way it was written to.  A green suite then means the
+    same thing online and offline, which is the property that was missing.
+
+    Loopback stays open — blocking it would break any future in-process server
+    — but nothing reaches off the machine.  Measured before landing this: the
+    only outbound connections in the whole suite were to GitHub.
+    """
+    real_connect = socket.socket.connect
+
+    def _is_local(family: int, address: object) -> bool:
+        if family == getattr(socket, "AF_UNIX", None):
+            return True
+        if not (isinstance(address, tuple) and address):
+            return False
+        host = address[0]
+        if not isinstance(host, str):
+            return False
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return host == "localhost"
+
+    def connect(self: socket.socket, address: Any) -> Any:
+        if not _is_local(self.family, address):
+            raise ConnectionRefusedError(
+                f"the trcc test suite is hermetic — blocked an outbound "
+                f"connection to {address!r}.  Stub the port (HttpFetcher, "
+                f"DataInstallService, GithubReleases) instead of reaching "
+                f"the network.",
+            )
+        return real_connect(self, address)
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+        # ``create_connection`` resolves BEFORE it connects, so a guard on
+        # connect alone still sent the lookup -- and with no network a lookup
+        # has no time limit (data_install.py says so).  Measured 2026-10-05:
+        # the suite made 0 such lookups once stand-in platforms went offline;
+        # this keeps it at 0.
+        if host is None or host == "localhost" or _is_local(
+                socket.AF_INET, (host, 0)):
+            return real_getaddrinfo(host, *args, **kwargs)
+        raise socket.gaierror(
+            f"the trcc test suite is hermetic — blocked a DNS lookup of "
+            f"{host!r}.  Stub the port (HttpFetcher, DataInstallService, "
+            f"GithubReleases) instead of reaching the network.",
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(socket.socket, "connect", connect)
+        mp.setattr(socket, "getaddrinfo", getaddrinfo)
+        yield
+
+
+#: Programs no test may run: they act as root (``pkexec``/``sudo``/``doas``)
+#: or read the host's firmware tables and disks (``dmidecode``/``smartctl``, and
+#: our own pkexec helpers ``trcc-dmi``/``trcc-imc``).
+_ELEVATORS = frozenset({"pkexec", "sudo", "doas"})
+_PRIVILEGED_TOOLS = frozenset({"dmidecode", "smartctl", "trcc-dmi", "trcc-imc",
+                               "trcc-ram-access", "trcc-ram-access-off"})
+#: Every refused attempt, as ``(PYTEST_CURRENT_TEST, command)``.
+_PRIVILEGED_ATTEMPTS: list[tuple[str, str]] = []
+
+
+def _privileged(argv: Any) -> str | None:
+    """The command line if *argv* would run something privileged, else None.
+
+    Whole words only, by basename, so ``sudo_reexec`` or a path that merely
+    contains "sudo" is not mistaken for the program.
+    """
+    words = (argv.split() if isinstance(argv, str)
+             else [os.fsdecode(w) for w in argv] if argv else [])
+    names = [os.path.basename(w) for w in words]
+    if names and (names[0] in _ELEVATORS
+                  or any(n in _PRIVILEGED_TOOLS for n in names)):
+        return " ".join(words)
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_privileged_commands() -> Iterator[list[tuple[str, str]]]:
+    """Nothing in the suite runs a command as root or reads the host's firmware.
+
+    Measured 2026-10-07: one full run asked for ``pkexec /usr/bin/dmidecode -t
+    memory`` 263 times, from 39 test files.  ``MockPlatform`` built the HOST's
+    real sensors by default, the memory clock reads the configured speed through
+    dmidecode, and the polkit rule this project installs (``allow_active=yes``)
+    let every call run as root without a prompt -- the developer's journal held
+    52,092 of them.
+
+    ``PermissionError`` is what a host without the polkit rule gives, so the
+    code under test degrades exactly as it does there.  Every attempt is
+    recorded: one made by a test's body fails that test
+    (``pytest_runtest_call`` below), and one made anywhere else -- a fixture's
+    setup or teardown, or outside any test -- fails the session here.  Session
+    scope for the reason "The scope trap" above gives.
+    """
+    import subprocess
+
+    attempts = _PRIVILEGED_ATTEMPTS
+    real_popen_init = subprocess.Popen.__init__
+
+    def refuse(command: str) -> PermissionError:
+        attempts.append((os.environ.get("PYTEST_CURRENT_TEST", "<outside a test>"),
+                         command))
+        return PermissionError(
+            f"the trcc test suite runs nothing privileged -- refused "
+            f"{command!r}.  Use MockPlatform's default fake sensors, or stub "
+            f"the call.")
+
+    def popen_init(self: Any, args: Any, *a: Any, **k: Any) -> None:
+        if (command := _privileged(args)) is not None:
+            raise refuse(command)
+        real_popen_init(self, args, *a, **k)
+
+    def guarded_exec(real: Any) -> Any:
+        def exec_(path: Any, args: Any, *rest: Any) -> Any:
+            if (command := _privileged([path, *list(args)[1:]])) is not None:
+                raise refuse(command)
+            return real(path, args, *rest)
+        return exec_
+
+    real_system = os.system
+
+    def system(command: str) -> int:
+        if (privileged := _privileged(command)) is not None:
+            raise refuse(privileged)
+        return real_system(command)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess.Popen, "__init__", popen_init)
+        for name in ("execv", "execve", "execvp", "execvpe"):
+            mp.setattr(os, name, guarded_exec(getattr(os, name)))
+        mp.setattr(os, "system", system)
+        yield attempts
+    elsewhere = [(where, command) for where, command in attempts
+                 if not where.endswith("(call)")]
+    assert not elsewhere, (
+        f"a fixture tried to run privileged commands, which the suite "
+        f"refuses: {elsewhere}")
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+    """Fail the test whose body asked for a privileged command (it was refused)."""
+    before = len(_PRIVILEGED_ATTEMPTS)
+    result = yield
+    asked = [command for _where, command in _PRIVILEGED_ATTEMPTS[before:]]
+    if asked:
+        pytest.fail(f"this test asked to run privileged commands, which the "
+                    f"suite refuses: {asked}", pytrace=False)
+    return result
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _home_is_never_the_real_one_at_any_scope(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Cover the window the per-test HOME guard cannot reach.
+
+    See "The scope trap" above: the function-scoped guard below is set up
+    AFTER every higher-scoped fixture, so a module-scoped one that resolves a
+    log path or a data dir does it against the developer's real ``~``.  This
+    closes that window for the whole session; the per-test guard still gives
+    each test its own fresh directory.
+    """
+    root = tmp_path_factory.mktemp("session-home")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("HOME", str(root))
+        mp.setenv("XDG_CONFIG_HOME", str(root / ".config"))
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _home_is_never_the_real_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No test may touch the developer's own ``~``.  Autouse, for cause.
+
+    Function-scoped, so it does NOT reach module/session fixture setup — see
+    "The scope trap" above; ``_home_is_never_the_real_one_at_any_scope``
+    covers that window.
+
+    ``tmp_home`` below has done this since forever, but only for the tests that
+    ASKED for it, and the ones that write are not the ones that ask: anything
+    reaching a real entry point resolves its log path through the REAL platform
+    (``ensure_configured`` -> ``current_platform().paths().log_file()``), so it
+    lands in ``~/.trcc/`` regardless of what fixtures the test declared.
+
+    MEASURED 2026-09-10 with ``HOME`` pointed at an empty directory and a
+    per-test tracer: a full run left ``trcc.log``, ``trcc.latest.log``, two
+    lock files, a ``.run`` marker and a ``data/`` tree there, from tests spread
+    across at least a dozen unrelated files — API routes, device catalog smoke,
+    geometry, quirks, the Windows WMI seam.  It is diffuse, which is exactly
+    why it has to be a blanket guard rather than a fixture each of them
+    remembers to request.
+
+    That matters beyond tidiness: ``~/.trcc/trcc.log`` is the file ``trcc
+    report`` tails, so a developer who ran the suite and then produced a report
+    was pasting test output into it.
+
+    I first measured this over EIGHT files, found one culprit
+    (``test_gui_entry_exit.py``) and concluded it was a one-file problem worth
+    a one-file fix.  The full trace overturned that.  Recorded because the
+    narrow measurement looked every bit as conclusive as the wide one.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    # Re-pinned PER TEST, not only at import: ``DaemonUI.compose`` pops
+    # TRCC_DAEMON (it must, #162), and so does test_ui_bus.  Pinned once, the
+    # first test to run a daemon compose in-process unpinned every later test
+    # in that worker — each then tried to start a real daemon, waited out the
+    # 10 s spawn timeout, and 5 CLI tests failed on the noise (measured when
+    # the default flipped to the shared App).
+    monkeypatch.setenv("TRCC_DAEMON", "0")
+
+
+@pytest.fixture(autouse=True)
+def _runtime_dir_is_never_the_real_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """No test sees the developer's ``$XDG_RUNTIME_DIR``.  Autouse, for cause.
+
+    Every TRCC socket and the one-App lock live there, and the real one holds
+    the developer's RUNNING App: a test that asked ``daemon_running()`` got
+    True from it, and one that took the App lock would have refused to start
+    while the real App ran -- or stopped it from starting.  Per test, and
+    short: an AF_UNIX path stops at 107 bytes, which a ``tmp_path`` can pass.
+    """
+    import shutil
+    import tempfile
+    runtime = tempfile.mkdtemp(prefix="trcc-rt-")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+    yield
+    shutil.rmtree(runtime, ignore_errors=True)
+
+
+@pytest.fixture
+def tmp_home(tmp_path: Path) -> Path:
+    """The per-test HOME as a value.
+
+    The redirection itself is autouse above; this just names the directory for
+    the tests that want to read or seed it.
+    """
+    return tmp_path
+
+
+@pytest.fixture
+def fake_platform(tmp_home: Path) -> FakePlatform:
+    return FakePlatform(tmp_home)
+
+
+@pytest.fixture
+def make_window() -> Iterator[Callable[[Any], Any]]:
+    """Build qtgui ``MainWindow``s that are DESTROYED at teardown.
+
+    Closing one only hides it to the tray, and a window a test never closes
+    lives on: measured 2026-09-30, 8 were still alive after
+    ``test_gui_panels.py``, each with its preview timer dispatching
+    ``BuildPreview`` into later tests' closed Apps -- the WARNING that failed
+    whichever test ran next.  ``deleteLater`` + flushing the deferred deletes
+    ends them for good.
+    """
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication
+
+    from trcc.ui.qtgui.app import MainWindow
+
+    built: list[Any] = []
+
+    def make(app: Any) -> Any:
+        window = MainWindow(app)
+        built.append(window)
+        return window
+
+    yield make
+    for window in built:
+        window.deleteLater()
+    QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.fixture
+def fake_bulk() -> FakeBulkTransport:
+    return FakeBulkTransport()
+
+
+@pytest.fixture
+def fake_scsi() -> FakeScsiTransport:
+    return FakeScsiTransport()
+
+
+def assert_stub_matches(real: Callable[..., Any], stub: Callable[..., Any]) -> None:
+    """Fail loudly when a monkeypatched stub stops matching what it replaces.
+
+    A stub restates a signature, so it drifts — and it drifts SILENTLY: the
+    caller raises ``TypeError``, something upstream catches it, and the suite
+    stays green while the stub stubs nothing.  ``_stub_data_install`` spent a
+    release in exactly that state after ``ensure_all`` gained two parameters
+    (0709ad5f), and the only symptom was an ERROR line nobody read.
+
+    Compares everything after the receiver by name, kind and required-ness, so
+    a renamed ``self`` is fine and a new parameter is not.  Call this from any
+    fixture that patches a real method with a hand-written replacement.
+    """
+    def shape(fn: Callable[..., Any]) -> list[tuple[str, object, bool]]:
+        params = list(inspect.signature(fn).parameters.values())[1:]
+        return [(p.name, p.kind, p.default is p.empty) for p in params]
+
+    if shape(real) != shape(stub):
+        raise AssertionError(
+            f"stub signature drifted from {real.__qualname__}:\n"
+            f"  real: {inspect.signature(real)}\n"
+            f"  stub: {inspect.signature(stub)}\n"
+            "Update the stub — a mismatched one raises TypeError at the call "
+            "site and is swallowed, leaving the suite green and unstubbed."
+        )
+
+
+def renderable_theme(root: Path, name: str) -> Path:
+    """A minimal theme the real renderer draws: a solid 320x320 ``00.png``."""
+    from PySide6.QtGui import QColor, QImage
+
+    theme = root / name
+    theme.mkdir(parents=True)
+    (theme / "trcc.json").write_text(
+        '{"name": "%s", "width": 320, "height": 320, "elements": []}' % name,
+        encoding="utf-8")
+    img = QImage(320, 320, QImage.Format.Format_RGB888)
+    img.fill(QColor(0, 64, 128))
+    assert img.save(str(theme / "00.png"))
+    return theme
+
+
+def show_a_theme(app: Any, key: str) -> None:
+    """Give connected panel *key* an active theme -- what every real panel has.
+
+    A background (``PlayVideo`` / ``SetBackground``) is the background OF a
+    theme.  On a panel with none they used to answer "playing" and draw
+    nothing; now they show the saved theme first, or refuse (P4c).  Tests
+    about decode, cursors or events set the panel up the realistic way with
+    this, instead of leaning on that old false success.  In-memory: nothing
+    is read from its folder.
+    """
+    from trcc.core.models import Theme
+
+    resolution = app.devices[key].profile.resolution
+    app.active_themes[key] = Theme(path=Path("/nonexistent/test-theme"),
+                                   name="Test", resolution=resolution)
+
+
+def loopback_client(api: Any) -> Any:
+    """A FastAPI ``TestClient`` that arrives the way ``trcc api`` is reached.
+
+    ``TestClient`` sends ``Host: testserver``, and a token-less server refuses
+    any Host that is not loopback (``ui/api/_shared.is_loopback_client``) — the
+    refusal that stops a DNS-rebinding page.  So the suite reaches the API as
+    a loopback client, like every real local caller.
+
+    ``base_url`` covers HTTP only: Starlette's WebSocket handshake hardcodes
+    ``Host: testserver`` whatever the base URL says (measured), so the
+    handshake gets its Host set explicitly.
+    """
+    from fastapi.testclient import TestClient
+
+    class _Loopback(TestClient):
+        def websocket_connect(self, url: str, *args: Any, **kwargs: Any) -> Any:
+            kwargs["headers"] = {"host": "127.0.0.1", **(kwargs.get("headers") or {})}
+            return super().websocket_connect(url, *args, **kwargs)
+
+    return _Loopback(api, base_url="http://127.0.0.1")
+
+
+@pytest.fixture(autouse=True)
+def _stub_data_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test downloads theme archives over the network.
+
+    Both ``DiscoverDevices`` and (now) ``ConnectDevice`` call
+    ``DataInstallService.ensure_all``, which would otherwise run the real
+    ``UrllibHttpFetcher``.  Stub it at the class so every test is offline-safe;
+    tests that assert on the call replace ``app.data_install`` locally.
+
+    Function-scoped, so "every test" is literally true and no more: work done
+    in a module- or session-scoped fixture's SETUP runs before this exists.
+    See "The scope trap" above — that gap really did ship.  The hermetic
+    guard is the session-scoped backstop.
+    """
+    from trcc.services.data_install import DataInstallService, EnsureDataResult
+
+    def _noop(
+        _self: object, resolution: tuple[int, int],
+        variant: str = "", mask_variant: str = "",
+    ) -> EnsureDataResult:
+        # Signature MUST track ``DataInstallService.ensure_all``.  It gained
+        # ``variant`` / ``mask_variant`` with the per-SKU artwork libraries
+        # (0709ad5f) and this stub did not, so every call raised TypeError,
+        # ``data_install_runner`` swallowed it, and the suite stayed green
+        # while the stub stubbed nothing.
+        del variant, mask_variant
+        return EnsureDataResult(
+            resolution=resolution, themes_ok=True, web_ok=True, masks_ok=True,
+        )
+
+    assert_stub_matches(DataInstallService.ensure_all, _noop)
+    monkeypatch.setattr(DataInstallService, "ensure_all", _noop)
+
+    # ...and keep the install SYNCHRONOUS under test.  Production runs it on a
+    # daemon worker so the GUI's startup never waits on ~30 MB of archives
+    # (#275); a background thread in the suite would make every assertion on
+    # installed data a race.  Same shape as SyncSendScheduler.  App imports
+    # ThreadDataInstallRunner lazily inside __init__, so patching the module
+    # attribute here reaches every App built after this fixture runs.
+    from trcc.adapters.infra import data_install_runner
+
+    monkeypatch.setattr(
+        data_install_runner, "ThreadDataInstallRunner",
+        data_install_runner.SyncDataInstallRunner,
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _qapplication() -> Iterator[object]:
+    """One full QApplication per session (per xdist worker), made BEFORE any test.
+
+    ``QtRenderer._ensure_qt_app`` creates a bare ``QGuiApplication`` when no app
+    exists — fine for offscreen QPainter rendering, but a ``QGuiApplication``
+    cannot host ``QWidget``s and Qt forbids a second app instance.  So if a
+    renderer-building test ran before a GUI-panel test in the same worker, the
+    panel's QWidget construction ABORTED ("Cannot create a QWidget without
+    QApplication") — an order-dependent flake under ``pytest -n`` (xdist).
+
+    Creating the QApplication first (idempotent) removes the ordering
+    dependency: every test shares one QApplication, which also satisfies
+    offscreen rendering (QApplication is-a QGuiApplication).
+    """
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    yield app
+    # Session end: GUI tests build widgets/timers parented to this long-lived
+    # QApplication; left in place they're destroyed during interpreter
+    # finalization — where a still-running daemon thread (``MetricsLoop`` /
+    # ``LedAnimationLoop`` / hotplug from an App a fixture didn't close) makes
+    # the destroy land off the main thread, tripping Qt's
+    # ``QObject::killTimer: Timers cannot be stopped from another thread``.
+    # Destroying them HERE — on the main thread, before finalization — kills
+    # their timers on the owning thread, silently and deterministically.
+    for w in list(QApplication.topLevelWidgets()):
+        w.deleteLater()
+    QApplication.processEvents()
+    import gc
+    gc.collect()
+    QApplication.processEvents()
+    # No quit() — other Qt tests share this process; tearing down breaks them.
+
+
+@pytest.fixture(autouse=True)
+def _release_trcc_singleton() -> Iterator[None]:
+    """Release the ``TRCCApp`` process-singleton after each test.
+
+    ``TRCCApp.__new__`` enforces one instance per process; production releases
+    it in ``closeEvent``, which tests don't trigger.  So a test that builds a
+    ``TRCCApp`` leaves ``_instance`` set and the NEXT one in the same xdist
+    worker hits 'TRCCApp is a singleton'.  Reset it here (and delete the window
+    on the main thread) so every test starts clean.  Guarded on the module
+    already being imported, so non-GUI tests pay nothing — no forced import.
+    """
+    yield
+    import sys
+    mod = sys.modules.get("trcc.ui.gui.trcc_app")
+    if mod is None:
+        return
+    inst = mod.TRCCApp._instance
+    if inst is None:
+        return
+    inst.deleteLater()
+    mod.TRCCApp._instance = None
+    from PySide6.QtWidgets import QApplication
+    QApplication.processEvents()
+
+
+# =========================================================================
+# CLI fixtures — typer.testing.CliRunner + _ctx App override
+# =========================================================================
+#
+# Moved here from test_cli_commands.py so future per-command test files
+# (test_cli_display.py, test_cli_led.py, …) consume them directly.
+# The fixture is the foundation; per-file tests are the example.
+
+
+@pytest.fixture
+def cli_runner():
+    """typer.testing.CliRunner — captures stdout + exit codes."""
+    from typer.testing import CliRunner
+
+    return CliRunner()
+
+
+class _CliRenderer(Renderer):
+    """Stand-in for QtRenderer used by CLI command bodies.
+
+    CLI rarely renders anything itself, but ``display color`` /
+    ``display boot-anim`` / etc. exercise the DisplayService which
+    needs *some* renderer.  This one short-circuits every method to
+    a trivial result so tests stay headless.
+
+    A real ``Renderer`` subclass (not a duck type) so it inherits the
+    port's concrete defaults — ``list_fonts`` → ``[]`` etc. — and any
+    future port method automatically, instead of breaking when one lands.
+    """
+
+    def create_surface(self, width, height, color=None):
+        return _Surface(width, height)
+
+    def open_image(self, path):
+        return _Surface(100, 100)
+
+    def surface_size(self, surface):
+        return (surface.w, surface.h)
+
+    def surface_nbytes(self, surface):
+        return surface.w * surface.h * 4
+
+    def composite(self, base, overlay, position, mask=None):
+        return base
+
+    def resize(self, surface, width, height):
+        return _Surface(width, height)
+
+    def rotate(self, surface, degrees):
+        return surface
+
+    def apply_brightness(self, surface, percent):
+        return surface
+
+    def draw_text(self, surface, x, y, text, color, size,
+                  bold=False, italic=False, family=""):
+        pass
+
+    def encode_rgb565(self, surface, byte_order=">"):
+        return b"\x00\x00" * (surface.w * surface.h)
+
+    def encode_jpeg(self, surface, quality=95, max_size=0):
+        return b""
+
+    def from_raw_rgb24(self, frame):
+        return _Surface(100, 100)
+
+    def decode_image(self, data):
+        return _Surface(100, 100)
+
+
+class _Surface:
+    def __init__(self, w: int = 100, h: int = 100) -> None:
+        self.w, self.h = w, h
+
+
+@pytest.fixture(autouse=False)
+def cli_app(fake_platform):
+    """Pre-wire the CLI's lru_cached App so every command body runs
+    against FakePlatform + a smoke renderer.
+
+    Not autouse — tests that don't touch the CLI shouldn't pay the
+    fixture cost.  The CLI test files opt in.
+    """
+    from trcc.ui.cli import _ctx
+
+    _ctx.set_platform(fake_platform)
+    _ctx.set_renderer(_CliRenderer())  # type: ignore[arg-type]
+    yield _ctx.compose_app()
+    _reset_cli_ctx()
+
+
+def _reset_cli_ctx() -> None:
+    """Forget the CLI's cached App and its overrides -- a fresh process."""
+    import sys
+
+    if "trcc.ui.cli._ctx" not in sys.modules:   # never imported: nothing cached
+        return
+    from trcc.ui.cli import _ctx
+
+    _ctx.get_app.cache_clear()
+    _ctx.compose_app.cache_clear()
+    _ctx._platform_override = None
+    _ctx._renderer_override = None
+
+
+@pytest.fixture(autouse=True)
+def _cli_app_never_outlives_its_test() -> Iterator[None]:
+    """The CLI caches ONE App per process (``_ctx.compose_app``), and three
+    fixtures filled it without clearing it.  The next test on that worker then
+    got their App: ``test_status_and_kill_through_a_ui_never_start_an_app``
+    failed whenever one ran before it, which a new test FILE decided by
+    reshuffling the workers (2026-09-30).  Reset after every test, so no
+    fixture has to remember to."""
+    yield
+    _reset_cli_ctx()
+
+
+# =========================================================================
+# A log record that cannot be written fails the test it happened in
+# =========================================================================
+
+@pytest.fixture(autouse=True)
+def _fresh_once_only_log_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test starts with nothing reported yet.
+
+    ``recurring_warning`` / ``recurring_failure`` log a message once per
+    PROCESS; a worker runs many tests, so without this a warning another test
+    already triggered would be silent here -- an order-dependent pass or fail.
+    """
+    from trcc.core import logs
+    monkeypatch.setattr(logs, "_REPORTED", set())
+
+
+@pytest.fixture(autouse=True)
+def _no_logging_error_in_a_test(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Fail the test during which a handler could not write a record.
+
+    ``logging`` does not raise when a handler fails -- it prints
+    ``--- Logging error ---`` to stderr and carries on.  One such report, for
+    ``[%s] %s failed: %s``, appeared in one full run of about twelve on
+    2026-09-29 and never in CI: a stray line that named no test, so nothing
+    could be done with it.  This names it.
+
+    Defined BEFORE ``_logging_state_is_not_global`` and the thread guard, so
+    it is set up first and torn down LAST: its check covers their teardown too
+    -- the thread guard's ``App.close`` and the logging restore -- which is
+    where the suspect lives.  The original ``handleError`` still runs, so the
+    stderr report is kept.
+
+    A test that drives a handler into ``handleError`` ON PURPOSE is marked
+    ``expects_logging_error`` -- and must then produce one, so a marker left
+    behind after the behaviour changes fails instead of hiding nothing.
+    """
+    import sys
+    import threading
+
+    errors: list[str] = []
+    real = logging.Handler.handleError
+
+    def _record(self: logging.Handler, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        try:
+            text = record.getMessage()
+        except Exception:                   # the failure may BE the formatting
+            text = f"{record.msg!r} % {record.args!r}"
+        errors.append(
+            f"{type(self).__name__} could not write {text!r} (logged at "
+            f"{record.pathname}:{record.lineno} on thread "
+            f"{threading.current_thread().name!r}): "
+            f"{type(exc).__name__}: {exc}")
+        real(self, record)
+
+    monkeypatch.setattr(logging.Handler, "handleError", _record)
+    yield
+    expected = request.node.get_closest_marker("expects_logging_error")
+    if expected is not None and not errors:
+        pytest.fail("marked expects_logging_error, but no log record failed "
+                    "to write -- remove the marker", pytrace=False)
+    if errors and expected is None:
+        pytest.fail("a log record could not be written during this test:\n  "
+                    + "\n  ".join(errors), pytrace=False)
+
+
+# =========================================================================
+# Global logging state — restored around every test
+# =========================================================================
+
+@pytest.fixture(autouse=True)
+def _logging_state_is_not_global() -> Iterator[None]:
+    """Undo what a test does to the ROOT logger, because it is shared.
+
+    ``configure_logging`` sets the root level, sets the per-frame family's
+    level, and attaches three handlers -- and nothing put it back.  Two things
+    call it during the suite: ``test_diagnostics`` directly (16 times), and
+    EVERY CLI test that invokes a real command, because the Typer root callback
+    configures logging (measured: one ``CliRunner().invoke`` leaves root at
+    DEBUG with 3 handlers).  That is 125 invocations across five files.
+
+    Any test scheduled after one of those in the same xdist worker inherited
+    DEBUG, which is not hypothetical: it made
+    ``test_a_vanished_pin_warns_ONCE_across_many_polls`` and its neighbour fail
+    roughly one run in two, because an INFO line they did not expect became
+    visible to ``caplog``.  Those two were hardened in `cb524768`; this closes
+    the vector so the next victim never appears.
+
+    Handlers a test opened are CLOSED, not merely detached: ``configure_logging``
+    drops its own tagged handlers without closing them, so a suite that
+    reconfigures 141 times leaks that many file descriptors.
+    """
+    from trcc.adapters.infra.logging import _HANDLER_TAG
+    from trcc.core.logs import PER_FRAME_ROOT
+
+    root = logging.getLogger()
+    frame = logging.getLogger(PER_FRAME_ROOT)
+    before = (root.level, frame.level, list(root.handlers))
+    try:
+        yield
+    finally:
+        for handler in root.handlers:
+            if handler not in before[2] and getattr(handler, _HANDLER_TAG, False):
+                handler.close()
+        root.handlers[:] = before[2]
+        root.setLevel(before[0])
+        frame.setLevel(before[1])
+
+
+# =========================================================================
+# Background threads — a test that starts one stops it
+# =========================================================================
+
+#: Thread names this project starts (``trcc-send-<key>``, ``trcc-video``,
+#: ``trcc-metrics``, ``trcc-ipc-events``, ...) plus the sensor poller.  Threads
+#: a library starts (``AnyIO worker thread`` under FastAPI's TestClient) are
+#: not ours to stop and are not checked.
+_OUR_THREADS = ("trcc-", "sensor-poll")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_microphone_in_a_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refuse the real ``AudioCapture.start`` -- name the test instead of crashing.
+
+    A real one opens a PortAudio stream whose callback runs on a native
+    thread and outlives the App; the process later dies with ``Fatal Python
+    error: Illegal instruction`` in whichever test happens to be running.
+    That has now happened TWICE: 2026-09-23 (a screencast test), and
+    2026-09-26, when auto-connect let ``SaveTheme``'s reload of a screencast
+    theme reach ``_sync_audio`` in ``test_theme_persistence``.  The
+    :class:`FakeMic` docstring asked every author to remember; this does not
+    ask.  Assign ``FakeMic()`` over ``app.audio`` in a test that turns
+    screencast audio on.
+    """
+    from trcc.services.audio import AudioCapture
+
+    def _refuse(self: AudioCapture) -> bool:
+        raise AssertionError(
+            "a test started the REAL microphone (AudioCapture.start) -- its "
+            "PortAudio callback outlives the test and kills the worker later. "
+            "Assign conftest.FakeMic() over app.audio in this test.")
+
+    monkeypatch.setattr(AudioCapture, "start", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_background_thread_outlives_its_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Close every App a test built, then fail if its threads still run.
+
+    Measured 2026-09-25: **203 tests** left threads running -- sender workers,
+    IPC event readers, and three coldplug tests that each left a WHOLE session
+    (video, metrics and LED loops plus the sensor poller) alive in the worker.
+    Those loops publish and render from background threads while later tests
+    drive Qt on the main thread, and CI's pytest workers died with a segfault
+    inside Qt's event processing -- with exactly those three sessions in the
+    crash dump.  CI never failed on it, because the test step's exit code was
+    ``tee``'s.
+
+    Every App built during the test is closed here, which is what the process
+    exit a real UI performs would do.  A thread that survives THAT was started
+    by something the test itself must stop (an IPC client, a server), and the
+    test fails naming it.
+    """
+    import threading
+    import time
+
+    from trcc.app import App
+
+    built: list[App] = []
+    init = App.__init__
+
+    def recording_init(self: App, *args: Any, **kwargs: Any) -> None:
+        init(self, *args, **kwargs)
+        built.append(self)
+
+    monkeypatch.setattr(App, "__init__", recording_init)
+    before = {t.ident for t in threading.enumerate()}
+    # The REAL clock, taken now: tests script ``time.monotonic`` and their
+    # patch is still in place when this teardown runs.
+    clock = time.monotonic
+    yield
+    for app in built:
+        try:
+            app.close()
+        except Exception:
+            logging.getLogger(__name__).exception("closing a test's App raised")
+
+    def ours() -> list[threading.Thread]:
+        return [t for t in threading.enumerate()
+                if t.ident not in before and t.is_alive()
+                and t.name.startswith(_OUR_THREADS)]
+
+    deadline = clock() + 2.0
+    while (leaked := ours()) and clock() < deadline:
+        leaked[0].join(timeout=0.1)
+    assert not leaked, (
+        "this test left background threads running: "
+        f"{sorted(t.name for t in leaked)} -- stop what the test started "
+        "(close the client / server / App) before it returns")

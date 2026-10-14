@@ -1,0 +1,550 @@
+"""An unstable replug must not wedge the panel forever (#254).
+
+chamalkalakshan tested a real unplug/replug end to end on v9.9.4.  A clean
+re-enumeration recovered.  An UNSTABLE one — theirs re-enumerated three times
+after two `can't set config #1, error -71` failures — left the GUI logging
+`send() called before connect()` 7000+ times over five minutes and never
+recovering, while the device itself was properly connected and a separate
+`trcc display test` worked fine.  Only killing the process fixed it.
+"""
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from trcc.app import App
+from trcc.core.commands import ConnectDevice
+
+_KEY = "0402:3922"
+_SPEC = [{"type": "lcd", "name": "Frozen Warframe", "vid": "0402",
+          "pid": "3922", "fbl": 100}]
+
+
+@pytest.fixture
+def app() -> App:
+    from .mock_platform import MockPlatform
+    return App(platform=MockPlatform(_SPEC, Path(tempfile.mkdtemp())))
+
+
+def test_a_sender_left_on_a_released_device_is_replaced(app: App) -> None:
+    """The wedge: a worker outliving the device it was built for.
+
+    ``_on_device_attached`` runs on the hotplug thread, so a burst of `add`
+    events can register a sender just after another pass released the device
+    it was built for.  ``start_sender`` then saw a sender already present and
+    returned — so the reconnected device never got a worker, and the stale one
+    kept writing to a dead handle.
+
+    MUTATION CHECK: restore ``if key in self.senders: return`` and this fails
+    — the sender is still the stale object and its device is disconnected.
+    """
+    app.dispatch(ConnectDevice(key=_KEY))
+    stale = app.senders[_KEY]
+
+    # The interleave, exactly: the device goes away AFTER its sender exists.
+    app.devices.pop(_KEY).disconnect()
+    assert _KEY in app.senders, "precondition: the stale worker is still registered"
+
+    app.dispatch(ConnectDevice(key=_KEY))       # the replug finally settles
+
+    assert app.devices[_KEY].is_connected
+    assert app.senders[_KEY] is not stale, "the stale worker must be replaced"
+    assert app.senders[_KEY].device is app.devices[_KEY], \
+        "the worker must drive the device we actually hold"
+
+
+def test_a_healthy_reconnect_keeps_its_sender(app: App) -> None:
+    """Idempotence still holds — this must not churn a working worker.
+
+    A duplicate `add` (coldplug replay, a monitor that repeats itself) has to
+    stay a no-op, or every replay would tear down a perfectly good wire.
+    """
+    app.dispatch(ConnectDevice(key=_KEY))
+    sender = app.senders[_KEY]
+
+    app.start_sender(_KEY)
+    app.start_sender(_KEY)
+
+    assert app.senders[_KEY] is sender
+
+
+def test_the_worker_always_matches_the_attached_device(app: App) -> None:
+    """The invariant the wedge broke, stated once: whatever is in ``senders``
+    drives whatever is in ``devices``."""
+    app.dispatch(ConnectDevice(key=_KEY))
+    for _ in range(3):                          # an unstable burst
+        app.devices.pop(_KEY).disconnect()
+        app.dispatch(ConnectDevice(key=_KEY))
+
+    assert app.senders[_KEY].device is app.devices[_KEY]
+    assert app.devices[_KEY].is_connected
+
+
+# ── A panel taken without an unplug (2026-10-06) ─────────────────────────────
+#
+# A VM with the panel passed through took it from a running daemon: the
+# kernel node vanished, writes failed, the device's own `_reconnect` could not
+# re-open — and closed its transport.  `is_connected` read the HANDSHAKE, so the
+# corpse stayed "connected": the video tick kept sending into it (two records
+# and an ErrorOccurred per frame, three hours), and when the panel came back a
+# replug's `connect_unit` saw "already connected" and did nothing.
+
+
+def _take_the_panel(app: App) -> None:
+    """The node vanishes under a connected device: writes fail, re-open fails."""
+    import errno
+
+    transport = app.devices[_KEY]._transport
+
+    def gone(*_args: object, **_kwargs: object) -> bool:
+        raise OSError(errno.ENODEV, "No such device")
+
+    transport.send_cdb = gone           # type: ignore[method-assign]
+    transport.open = lambda: False      # type: ignore[method-assign]
+    app.send(_KEY, b"\x00" * 204800)    # the frame that finds out
+
+
+def test_a_panel_whose_transport_closed_is_not_connected(app: App) -> None:
+    app.dispatch(ConnectDevice(key=_KEY))
+
+    _take_the_panel(app)
+
+    assert not app.devices[_KEY]._transport.is_open, "precondition: closed"
+    assert not app.devices[_KEY].is_connected
+
+
+def test_producers_stop_sending_into_a_closed_transport(
+    app: App, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The per-frame render refuses a dead panel instead of writing to it.
+
+    MUTATION CHECK: read ``is_connected`` off the handshake alone and every
+    render below queues a frame, each one failing in the worker.
+    """
+    import logging
+
+    from trcc.core.commands import RenderAndSend
+    from trcc.core.errors import TransportError
+
+    from .conftest import show_a_theme
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    show_a_theme(app, _KEY)
+    _take_the_panel(app)
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG):
+        results = [app.dispatch(RenderAndSend(key=_KEY)) for _ in range(20)]
+        # Drain: a waited frame runs after anything queued before it.
+        with pytest.raises(TransportError):
+            app.send(_KEY, b"\x00" * 204800)
+
+    assert [r.connected for r in results] == [False] * 20
+    refused = [r for r in caplog.records
+               if "send() called before connect()" in r.getMessage()]
+    assert len(refused) == 1, "only the drain frame may reach the dead transport"
+
+
+def test_a_replug_heals_a_panel_whose_transport_closed(app: App) -> None:
+    """``connect_unit`` releases the corpse and connects a fresh device.
+
+    MUTATION CHECK: read ``is_connected`` off the handshake alone and the
+    hotplug add answers "already connected" — the same dead object stays.
+    """
+    from trcc.core.events import DeviceAttached
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    corpse = app.devices[_KEY]
+    _take_the_panel(app)
+
+    app._on_device_attached(DeviceAttached(key=_KEY, vid=0x0402, pid=0x3922))
+
+    assert app.devices[_KEY] is not corpse
+    assert app.devices[_KEY].is_connected
+    assert app.senders[_KEY].device is app.devices[_KEY]
+    assert app.send(_KEY, b"\x00" * 204800) is True
+
+
+# ── The loss is announced once (increment 2) ─────────────────────────────────
+#
+# Nothing ever said the panel had gone: DeviceDisconnected was published only
+# for DeviceDisconnectedError, and a panel whose re-open failed never raises
+# one -- its first failure RETURNS False, every later one is a plain
+# TransportError.
+
+
+def _disconnects(app: App) -> list[str]:
+    from trcc.core.events import DeviceDisconnected
+
+    seen: list[str] = []
+    app.events.subscribe(DeviceDisconnected, lambda e: seen.append(e.key))
+    return seen
+
+
+def test_a_lost_panel_is_announced_once(app: App) -> None:
+    """By the frame that finds out, and never again for that loss."""
+    from trcc.core.errors import TransportError
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    seen = _disconnects(app)
+
+    _take_the_panel(app)                       # a waited frame: returns False
+    assert seen == [_KEY]
+
+    for _ in range(10):
+        app.send(_KEY, b"\x00" * 204800, wait=False)
+    with pytest.raises(TransportError):
+        app.send(_KEY, b"\x00" * 204800)       # drain the ten
+    assert seen == [_KEY]
+
+
+def test_a_fire_and_forget_frame_announces_the_loss(app: App) -> None:
+    """The per-frame path: no waiter, the first failure returns False."""
+    import errno
+    import time
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    seen = _disconnects(app)
+    transport = app.devices[_KEY]._transport
+
+    def gone(*_args: object, **_kwargs: object) -> bool:
+        raise OSError(errno.ENODEV, "No such device")
+
+    transport.send_cdb = gone                  # type: ignore[method-assign]
+    transport.open = lambda: False             # type: ignore[method-assign]
+    app.send(_KEY, b"\x00" * 204800, wait=False)
+
+    deadline = time.monotonic() + 5
+    while not seen and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert seen == [_KEY]
+
+
+def test_a_panel_lost_again_after_a_reconnect_is_announced_again(app: App) -> None:
+    from trcc.core.events import DeviceAttached
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    seen = _disconnects(app)
+
+    _take_the_panel(app)
+    app._on_device_attached(DeviceAttached(key=_KEY, vid=0x0402, pid=0x3922))
+    _take_the_panel(app)
+
+    assert seen == [_KEY, _KEY]
+
+
+# ── Handed back without an event (increment 3) ───────────────────────────────
+
+
+def test_a_panel_handed_back_without_an_event_is_reconnected(tmp_path: Path) -> None:
+    """The 2026-10-06 sequence, minus the three hours.
+
+    A VM takes the panel (writes fail, no node for a fresh connect), then
+    hands it back -- usb-storage re-binds, /dev/sg0 returns, and no usb add is
+    ever published.  Only the reconnect watcher can notice.
+
+    MUTATION CHECK: drop ``self.watch_for_return(key)`` from ``note_lost`` and
+    the panel stays lost however long the clock runs.
+    """
+    import errno
+
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.core.errors import TransportError
+
+    from .mock_platform import MockPlatform
+
+    clock = SyncSendScheduler()
+    app = App(platform=MockPlatform(_SPEC, tmp_path), send_scheduler=clock)
+    app.dispatch(ConnectDevice(key=_KEY))
+
+    # The VM takes it.
+    transport = app.devices[_KEY]._transport
+
+    def gone(*_args: object, **_kwargs: object) -> bool:
+        raise OSError(errno.ENODEV, "No such device")
+
+    transport.send_cdb = gone                  # type: ignore[method-assign]
+    transport.open = lambda: False             # type: ignore[method-assign]
+    hand_back = app.platform.open_transport
+
+    def no_node(*_args: object, **_kwargs: object) -> object:
+        raise TransportError("No SCSI device node found for 0402:3922")
+
+    app.platform.open_transport = no_node      # type: ignore[method-assign]
+    app.send(_KEY, b"\x00" * 204800, wait=False)
+    for now in range(0, 30):                   # the VM keeps it for 30 s
+        clock.tick(float(now))
+    assert not (_KEY in app.devices and app.devices[_KEY].is_connected)
+
+    # The VM hands it back -- no event.
+    app.platform.open_transport = hand_back    # type: ignore[method-assign]
+    for now in range(30, 120):
+        clock.tick(float(now))
+
+    assert app.devices[_KEY].is_connected
+    assert app.senders[_KEY].device is app.devices[_KEY]
+
+
+def test_an_explicit_disconnect_is_never_undone(tmp_path: Path) -> None:
+    """``DisconnectDevice`` is the user letting go: no watcher brings it back."""
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.core.commands import DisconnectDevice
+
+    from .mock_platform import MockPlatform
+
+    clock = SyncSendScheduler()
+    app = App(platform=MockPlatform(_SPEC, tmp_path), send_scheduler=clock)
+    app.dispatch(ConnectDevice(key=_KEY))
+
+    app.dispatch(DisconnectDevice(key=_KEY))
+    app.watch_for_return(_KEY)                 # anything asking afterwards
+    for now in range(0, 120):
+        clock.tick(float(now))
+
+    assert _KEY not in app.devices
+
+
+def test_a_hotplug_add_with_no_node_yet_keeps_waiting(tmp_path: Path) -> None:
+    """The journal's order: remove, an add whose node does not exist yet
+    (the VM claimed it), then the silent hand-back.
+
+    MUTATION CHECK: drop ``self.watch_for_return(key)`` from ``connect_unit``
+    and the failed add is the end of it.
+    """
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.core.errors import TransportError
+    from trcc.core.events import DeviceAttached, DeviceDetached
+
+    from .mock_platform import MockPlatform
+
+    clock = SyncSendScheduler()
+    app = App(platform=MockPlatform(_SPEC, tmp_path), send_scheduler=clock)
+    app.dispatch(ConnectDevice(key=_KEY))
+    hand_back = app.platform.open_transport
+
+    def no_node(*_args: object, **_kwargs: object) -> object:
+        raise TransportError("No SCSI device node found for 0402:3922")
+
+    app._on_device_detached(DeviceDetached(key=_KEY, vid=0x0402, pid=0x3922))
+    app.platform.open_transport = no_node      # type: ignore[method-assign]
+    app._on_device_attached(DeviceAttached(key=_KEY, vid=0x0402, pid=0x3922))
+    assert _KEY not in app.devices, "precondition: the add found no node"
+
+    app.platform.open_transport = hand_back    # type: ignore[method-assign]
+    for now in range(0, 60):
+        clock.tick(float(now))
+
+    assert app.devices[_KEY].is_connected
+
+
+# ── Bounded reporting (increment 4) ──────────────────────────────────────────
+
+
+def test_a_lost_panel_raises_no_error_event_per_frame(app: App) -> None:
+    """The loss was announced; an ErrorOccurred per later frame is noise to
+    every window.  MUTATION CHECK: publish it for a lost panel and the ten
+    frames below send ten."""
+    import time
+
+    from trcc.core.errors import TransportError
+    from trcc.core.events import ErrorOccurred
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    _take_the_panel(app)
+    errors: list[str] = []
+    app.events.subscribe(ErrorOccurred, lambda e: errors.append(e.message))
+
+    # Paced: back to back, latest-wins would fold all ten into the waited
+    # drain frame, whose failure goes to its caller -- and test nothing.
+    failures: list[str] = []
+    sender = app.senders[_KEY]
+    sender._on_failure = lambda key, exc: (  # type: ignore[method-assign]
+        failures.append(key), app._on_sender_failure(key, exc))
+    for _ in range(10):
+        app.send(_KEY, b"\x00" * 204800, wait=False)
+        deadline = time.monotonic() + 2
+        while sender._has_pending and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.02)
+    with pytest.raises(TransportError):
+        app.send(_KEY, b"\x00" * 204800)
+
+    assert len(failures) >= 5, "precondition: the frames reached the worker"
+    assert errors == []
+
+
+def test_a_screencast_frame_is_not_sent_to_a_dead_panel(
+    app: App, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The one per-tick producer that did not ask ``is_connected`` first.
+
+    MUTATION CHECK: look the device up with ``app.get`` again and the frame
+    is built and written into the closed transport.
+    """
+    import logging
+
+    from trcc.core.commands import SendScreencastFrame
+    from trcc.core.models import RawFrame
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    _take_the_panel(app)
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG):
+        result = app.dispatch(SendScreencastFrame(
+            key=_KEY, frame=RawFrame(data=b"\0" * 12, width=2, height=2)))
+
+    assert result.ok is False
+    assert result.message == ("0402:3922 not connected — dispatch "
+                              "ConnectDevice first")
+    assert not [r for r in caplog.records
+                if "send() called before connect()" in r.getMessage()
+                or "refused again" in r.getMessage()]
+
+
+def test_a_panel_whose_node_is_late_after_a_wake_is_retried(tmp_path: Path) -> None:
+    """A wake can arrive before the panel's node is back.
+
+    MUTATION CHECK: reconnect with one ``ConnectDevice`` again (the old wake)
+    and that failure is the end of it -- still dark with the node long back.
+    """
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+    from trcc.core.errors import TransportError
+    from trcc.core.events import SystemResumed
+
+    from .mock_platform import MockPlatform
+
+    clock = SyncSendScheduler()
+    app = App(platform=MockPlatform(_SPEC, tmp_path), send_scheduler=clock)
+    app.dispatch(ConnectDevice(key=_KEY))
+    hand_back = app.platform.open_transport
+
+    def no_node(*_args: object, **_kwargs: object) -> object:
+        raise TransportError("No SCSI device node found for 0402:3922")
+
+    app.platform.open_transport = no_node      # type: ignore[method-assign]
+    app.events.publish(SystemResumed())
+    assert not (_KEY in app.devices and app.devices[_KEY].is_connected), \
+        "precondition: the wake's own connect found no node"
+
+    app.platform.open_transport = hand_back    # type: ignore[method-assign]
+    for now in range(0, 30):
+        clock.tick(float(now))
+
+    assert app.devices[_KEY].is_connected
+
+
+# ── A panel that was not ready when TRCC started ─────────────────────────────
+
+
+def _coldplug_without(tmp_path: Path, error: Exception):  # type: ignore[no-untyped-def]
+    """Start an App whose panel's node fails to open with *error*."""
+    from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+
+    from .mock_platform import MockPlatform
+
+    clock = SyncSendScheduler()
+    app = App(platform=MockPlatform(_SPEC, tmp_path), send_scheduler=clock)
+    hand_back = app.platform.open_transport
+
+    def failing(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    app.platform.open_transport = failing      # type: ignore[method-assign]
+    app.discover_and_connect()
+    assert _KEY not in app.devices or not app.devices[_KEY].is_connected, \
+        "precondition: the startup connect failed"
+    return app, clock, hand_back
+
+
+def test_a_panel_held_when_trcc_starts_is_waited_for(tmp_path: Path) -> None:
+    """A VM holding it since boot, a node still coming: tried until it answers.
+
+    MUTATION CHECK: coldplug with a bare ``ConnectDevice`` again and the
+    failure at startup is the end of it.
+    """
+    from trcc.core.errors import TransportError
+
+    app, clock, hand_back = _coldplug_without(
+        tmp_path, TransportError("No SCSI device node found for 0402:3922"))
+    app.platform.open_transport = hand_back    # type: ignore[method-assign]
+    for now in range(0, 120):
+        clock.tick(float(now))
+
+    assert app.devices[_KEY].is_connected
+
+
+@pytest.mark.parametrize("where", ["build", "open"])
+def test_a_panel_nobody_may_open_is_not_retried(tmp_path: Path, where: str) -> None:
+    """A denied open stays denied until the user runs setup; retrying would
+    repeat the same error once every few minutes for as long as TRCC runs.
+
+    Both doors: the bulk/HID transports can refuse while being BUILT, the
+    Linux SCSI one when OPENED inside the handshake.
+
+    MUTATION CHECK: record either as retryable and its watcher is armed.
+    """
+    from trcc.core.errors import PermissionError_
+
+    denied = PermissionError_("permission denied on /dev/sg0")
+    if where == "build":
+        app, _clock, _back = _coldplug_without(tmp_path, denied)
+    else:
+        from trcc.adapters.infra.send_scheduler import SyncSendScheduler
+
+        from .mock_platform import MockPlatform
+
+        app = App(platform=MockPlatform(_SPEC, tmp_path),
+                  send_scheduler=SyncSendScheduler())
+        build = app.platform.open_transport
+
+        def refusing_to_open(*args: object, **kwargs: object) -> object:
+            transport = build(*args, **kwargs)
+
+            def no(*_a: object, **_k: object) -> bool:
+                raise denied
+
+            transport.open = no                # type: ignore[attr-defined]
+            return transport
+
+        app.platform.open_transport = refusing_to_open  # type: ignore[method-assign]
+        app.discover_and_connect()
+
+    watcher = app._watchers.get(_KEY)
+    assert watcher is None or not watcher.armed
+    assert [i.message for i in app.connection_issues()] == [
+        "permission denied on /dev/sg0"]
+
+
+def test_a_ui_action_waits_for_a_connect_already_under_way(app: App) -> None:
+    """``EnsureConnected`` (every Command that connects first) shares the
+    App's one connect path, so it cannot run beside the reconnect watcher's.
+
+    Two at once on a SCSI panel: the single-owner claim fails one, and its
+    cleanup releases the device by KEY -- possibly the one just connected.
+
+    MUTATION CHECK: dispatch ``ConnectDevice`` from ``EnsureConnected`` again
+    and it runs while the lock is held.
+    """
+    import threading
+
+    from trcc.core.commands import EnsureConnected
+
+    app.dispatch(ConnectDevice(key=_KEY))
+    _take_the_panel(app)
+    finished = threading.Event()
+
+    def ui_action() -> None:
+        app.dispatch(EnsureConnected(key=_KEY))
+        finished.set()
+
+    with app._connect_lock:                    # the watcher, mid-connect
+        worker = threading.Thread(target=ui_action, daemon=True)
+        worker.start()
+        assert not finished.wait(0.5), "it ran beside the connect under way"
+    worker.join(5)
+
+    assert finished.is_set()
+    assert app.devices[_KEY].is_connected

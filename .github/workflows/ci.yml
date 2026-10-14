@@ -1,0 +1,439 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags-ignore: [ "**" ]
+    paths-ignore:
+      - 'doc/**'
+      - '*.md'
+      - 'packaging/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install system dependencies
+        uses: ./.github/actions/system-deps
+        with:
+          packages: libgl1 libegl1 libegl-mesa0 libgl1-mesa-dri ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]' pyright==1.1.408
+
+      - name: Lint with ruff
+        run: python -m ruff check .
+
+      - name: Type check with pyright
+        run: pyright src/
+
+      - name: Run tests with coverage
+        env:
+          QT_QPA_PLATFORM: offscreen
+        # pipefail: without it the step's status is tee's, which is always 0.
+        # Measured 2026-09-25: every run since at least v9.10.3 was green with
+        # 14-25 failing tests per Python -- including 3.10, where the GUI, API
+        # and daemon could not start at all -- and a pytest worker segfault.
+        # Coverage on 3.12 only: branch tracing slows every test, the badge and
+        # the uploaded metrics read the 3.12 job alone, and 3.10/3.11 are here
+        # to prove the suite PASSES on them, not to measure it three times.
+        run: |
+          set -o pipefail
+          cov=""
+          if [ "${{ matrix.python-version }}" = "3.12" ]; then
+            cov="--cov=trcc --cov-report=term-missing --cov-branch"
+          fi
+          pytest tests/ $cov --tb=short -q 2>&1 | tee pytest-output.txt
+
+      - name: Upload test metrics
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pytest-output
+          path: pytest-output.txt
+
+  tests-windows:
+    # Windows had NO test execution anywhere.  ``windows.yml`` runs on
+    # windows-latest and never calls pytest -- it builds the installer -- and
+    # every other workflow is ubuntu-only.  So a Windows code path could ship
+    # having never executed a line, which is exactly what happened to the
+    # multi-process log handler: its Windows half could not work (``os.rename``
+    # fails with WinError 32 while a peer holds the file) and the build was
+    # green throughout.  A platform with no test run is a platform whose bugs
+    # are found by reporters.
+    #
+    # DELIBERATELY A SUBSET.  The suite has never run on Windows, so its state
+    # there is unknown, and a job that is red for unrelated reasons gates
+    # nothing and gets ignored.  This gates the file/locking layer -- the part
+    # whose semantics genuinely differ per OS and the part just changed.
+    # Widening it to ``tests/`` is worth doing and needs its own pass: run it
+    # once, read what fails, fix or skip each with a reason.
+    name: tests (windows, file + locking layer)
+    runs-on: windows-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Diagnostics + logging tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/test_diagnostics.py tests/test_logging_coverage.py -q --tb=short
+
+      # The one thing only Windows can answer: whether a rotation actually
+      # succeeds while other processes are writing the same log.
+      - name: Multi-process log rotation
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src
+        run: python dev/smoke_log_multiprocess.py
+
+  smokes:
+    # The dev/ harnesses and meters, which until now ran only when someone
+    # remembered.  That is why smoke_rotation_mask asserted a behaviour the
+    # app had not had for two months, and why smoke_video_playback_bytes
+    # broke the same day it was broken -- both are harnesses whose whole job
+    # is catching silent failures.  Nothing that depends on memory survives.
+    name: dev harnesses + meters
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # 3.12 only: the project's dev gate (see CLAUDE.md "Development
+      # Environment").  The harnesses drive the real app, not the packaging
+      # surface, so the 3.10/3.11 matrix adds runtime without adding signal.
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        uses: ./.github/actions/system-deps
+        with:
+          packages: libgl1 libegl1 libegl-mesa0 libgl1-mesa-dri ffmpeg
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      # Every harness runs even after one fails, so a red build names ALL of
+      # them instead of only the first -- the failures are usually related.
+      # smoke_real_hardware needs a physical panel; smoke_anything runs below
+      # with its quarantine; smoke_reported_bugs runs here but cannot gate --
+      # see the case block for why.
+      - name: Smoke harnesses
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src:.
+        run: |
+          failed=""
+          for s in dev/smoke_*.py; do
+            n=$(basename "$s")
+            case "$n" in
+              smoke_real_hardware.py|smoke_anything.py) continue;;
+              # Its exit code answers "do any reported bugs still reproduce?",
+              # which is information, not a build verdict.  It is non-zero
+              # whenever an open bug is still open -- its normal state, and the
+              # state of every newly filed report.  Gating on it would make a
+              # red build the default and the signal worthless.  So: run it,
+              # show the summary, never fail on it.
+              smoke_reported_bugs.py)
+                echo "::group::$n (informational)"
+                python3 "$s" || true
+                echo "::endgroup::"
+                continue;;
+            esac
+            echo "::group::$n"
+            if python3 "$s"; then echo "PASS $n"; else failed="$failed $n"; fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::failing harnesses:$failed"
+            exit 1
+          fi
+
+      # The log harness again, under the WINDOWS file policy.  Windows cannot
+      # rename a file a peer holds open (WinError 32), so its handler closes
+      # after every write rather than holding it.  That policy is the half of
+      # the Windows fix a Linux runner can execute -- if closing between
+      # records cost records, doubled a rotation or stuck the lock, it shows up
+      # here instead of on a reporter's machine.  The rename itself still needs
+      # Windows; see the tests-windows job.
+      - name: Log harness under the Windows file policy
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src:.
+          TRCC_SMOKE_CLOSE_BETWEEN_RECORDS: "1"
+        run: python3 dev/smoke_log_multiprocess.py
+
+      # KNOWN OPEN DEFECT, quarantined so the rest of the matrix can gate:
+      #   video.size.portrait -- "portrait 320x480 decoded zero frames --
+      #   pipeline drops portrait", reproduces identically on all 10 devices,
+      #   so it is the video pipeline and not any panel.  The probe is named
+      #   in the run header AND the summary; it is never silently dropped.
+      #   DELETE the --skip-probe when the decode bug is fixed.
+      - name: Device probe matrix (1 probe quarantined)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: src:.
+        run: |
+          python3 dev/smoke_anything.py --device all \
+            --skip-probe video.size.portrait
+
+      # Ratchets, in the shape MAX_SILENT already proves works: the number
+      # only ever moves one way, and moving it is a deliberate edit here.
+      #
+      # 95 = 988 of the 1033 behaviour-bearing methods in TRCC 2.1.6, measured
+      # on the tree this ratchet actually runs against.
+      #
+      # It was first set to 100 against a control-flow.json extracted from a
+      # decompile that PREDATED the 2.1.6 installer by four months (1000
+      # methods where 2.1.6 has 1205), then lowered to 54 -- the honest score
+      # once the real tree was measured, with the note that the docs' line
+      # citations still pointed into the OLD files' numbering and had to be
+      # re-verified subsystem by subsystem before the number could rise.
+      #
+      # That re-verification happened (81b81ebb..27ff87ba): 1,237 citations
+      # re-anchored onto 2.1.6, 274 methods re-read, zero pasted C# left in the
+      # repo.  Leaving the floor at 54 would let every bit of it be deleted
+      # without failing a build -- which is the one thing a ratchet exists to
+      # prevent.  Raise it only after measuring; never to make a build pass.
+      - name: Ratchet — C# audit coverage
+        run: python3 dev/decompiler/audit_coverage.py --fail-under 95
+
+      - name: Ratchet — UI contract bypasses
+        env:
+          PYTHONPATH: src
+        run: python3 dev/tools/ui_contract.py --max-bypasses 20
+
+      # Not a count that may drift down -- a floor of zero.  dev/ and tests/
+      # must not name a trcc module, symbol or Platform attribute that no
+      # longer exists.  Static, because importing is exactly what the per-OS
+      # harnesses' sys.platform guards and the optional dependencies defeat:
+      # three of them had been importing renamed modules for months while
+      # exiting 0 on this runner by skipping.
+      - name: Ratchet — stale references
+        env:
+          PYTHONPATH: src
+        run: python3 dev/tools/stale_refs.py --check
+
+  update-badges:
+    name: Update README badges
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 10
+    needs: tests
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download test metrics
+        uses: actions/download-artifact@v8
+        with:
+          name: pytest-output
+          path: .
+
+      - name: Parse and update badges
+        run: |
+          TESTS=$(grep -oP '\d+ passed' pytest-output.txt | grep -oP '\d+' || true)
+          COV=$(grep -oP 'TOTAL.*\K\d+(?=%)' pytest-output.txt || true)
+          if [ -n "$TESTS" ]; then
+            sed -i "s/tests-[0-9]*_passed/tests-${TESTS}_passed/" README.md
+          fi
+          if [ -n "$COV" ]; then
+            sed -i "s/coverage-[0-9]*%25/coverage-${COV}%25/" README.md
+          fi
+
+      - name: Commit if changed
+        run: |
+          git diff --quiet README.md && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "ci: update test badges [skip ci]"
+          git push
+
+  security-scans:
+    name: Security scans (pip-audit, bandit) — non-blocking
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 10
+    needs: tests
+    outputs:
+      found: ${{ steps.scan.outputs.found }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install security tools
+        run: pip install pip-audit bandit
+
+      # The tools' exit codes are the verdict.  `pip-audit .` resolves TRCC's
+      # own dependency set (a bare `pip-audit` audits THIS job's env — the
+      # scanners — which is what it did until 2026-09-26).  It also exits 1,
+      # writing no JSON, when it cannot resolve; bandit exits 0 on a file it
+      # cannot parse and lists it under `.errors`.  Both count as findings:
+      # a scan that did not run must not read as clean.
+      - name: Scan
+        id: scan
+        run: |
+          found=false
+          pip-audit . -f json -o pip_audit.json || found=true
+          bandit -r src -lll -q -f json -o bandit.json || found=true
+          jq -e '.errors == []' bandit.json > /dev/null || found=true
+          {
+            echo "### pip-audit — TRCC's resolved dependencies"
+            jq -r '[.dependencies[] | .name as $n | .version as $v | .vulns[]
+                    | "- \($n) \($v): \(.id), fixed in \(.fix_versions | join(", ") | if . == "" then "no release yet" else . end)"]
+                   | unique | if . == [] then "- none" else .[] end' pip_audit.json \
+              || echo "- **the audit did not run** — read the step log"
+            echo "### bandit — HIGH severity"
+            jq -r '[(.results[] | "- \(.test_id) \(.filename):\(.line_number) \(.issue_text)"),
+                    (.errors[] | "- could not scan \(.filename): \(.reason)")]
+                   | if . == [] then "- none" else .[] end' bandit.json \
+              || echo "- **bandit did not run** — read the step log"
+          } > findings.md
+          cat findings.md >> "$GITHUB_STEP_SUMMARY"
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-reports
+          path: |
+            pip_audit.json
+            bandit.json
+            findings.md
+
+  security-triage:
+    name: Security triage (open or update one issue)
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 10
+    needs: security-scans
+    # Never on a PR: a fork's token cannot write issues, and an unmerged
+    # branch must not open one.  Its findings are in the run summary.
+    if: needs.security-scans.outputs.found == 'true' && github.event_name != 'pull_request'
+    permissions:
+      issues: write
+    steps:
+      - name: Download security reports
+        uses: actions/download-artifact@v8
+        with:
+          name: security-reports
+
+      # One open issue at a time, kept current by editing it — a comment per
+      # push to main would bury it.  The `automated` label is this job's alone.
+      - name: Open or update the security issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" >> findings.md
+          open=$(gh issue list --label security --label automated --state open --json number -q '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue edit "$open" --body-file findings.md
+          else
+            gh issue create --title '[SECURITY] Findings in CI scans' \
+              --label security --label automated --body-file findings.md
+          fi
+
+  build-artifacts:
+    name: Build artifacts (wheel + sdist)
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 10
+    needs: tests
+    if: github.event_name != 'pull_request' # only build on push or manual
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build sdist & wheel
+        run: |
+          python -m build --sdist --wheel --outdir dist
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist-artifacts
+          path: dist/*

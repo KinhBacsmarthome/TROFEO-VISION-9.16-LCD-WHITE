@@ -1,0 +1,1738 @@
+# Command reference
+
+**Generated — do not edit.** `PYTHONPATH=src python3 dev/gen_commands_reference.py`
+
+Every capability in TRCC, as the one surface all four UIs dispatch against. A new UI — a browser client, a VR panel, a TUI — needs only this page and an event subscription; it never imports a service or an adapter.
+
+**159 total: 114 Commands and 45 Queries.** A *Query* is a read and nothing else, which is why it is named separately — a missing read should be obvious rather than archaeological.
+
+## Dispatching one
+
+```python
+from trcc._boot import trcc
+from trcc.core.commands import SendColor
+
+app = trcc()                     # the shared App, or in-process
+result = app.dispatch(SendColor(key="0402:3922", r=255, g=0, b=0))
+result.ok, result.message
+```
+
+`trcc()` returns an `AppProxy` speaking to the shared App -- the default -- or an in-process `App` (`TRCC_DAEMON=0`, as root, or on Windows). Both are the same `CommandBus`: `dispatch(cmd) -> Result`, `events`, `remote` and `on_app_gone`, so a UI written against this page works either way.
+
+Over the socket the same call is one line of JSON:
+
+```json
+{"command": "SendColor", "kwargs": {"key": "0402:3922", "r": 255, "g": 0, "b": 0}}
+```
+
+Every Command is a frozen dataclass, so its fields below *are* its keyword arguments. Results are dataclasses too, and every one carries `ok` and `message`.
+
+## Devices, display and frames
+
+### `AddOverlayElement`
+
+Add a user-edited element to a device's overlay layer.
+
+*Command* → `OverlayElementResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `type` | `str` | no |
+| `x` | `int` | no |
+| `y` | `int` | no |
+| `color` | `str` | no |
+| `size` | `int` | no |
+| `font` | `str` | no |
+| `bold` | `bool` | no |
+| `italic` | `bool` | no |
+| `text` | `str` | no |
+| `metric` | `str` | no |
+| `format` | `str` | no |
+| `show_unit` | `bool` | no |
+| `source` | `str` | no |
+| `element_id` | `str` | no |
+
+### `ApplyMask`
+
+Set a user-supplied mask image that overrides the active theme's mask.
+
+*Command* → `MaskApplyResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+
+### `BuildPreview`
+
+Render the device's active theme and stop before the wire.
+
+*Query* → `PreviewResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `encode` | `Literal[, png, jpeg]` | no |
+| `sample_cols` | `int` | no |
+
+### `CaptureScreencastFrame`
+
+Grab the device's screencast region once, encode it, put it on the wire.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `CaptureStreamFrame`
+
+One tick of a web media source: its newest frame, onto the panel.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ConnectDevice`
+
+Attach + handshake with a discovered device.
+
+*Command* → `ConnectResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `CurrentFrame`
+
+The frame the device is showing RIGHT NOW — without rendering one.
+
+*Query* → `PreviewResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `DeleteOverlayElement`
+
+Remove a user-edited overlay element by id.
+
+*Command* → `OverlayElementDeleteResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `element_id` | `str` | yes |
+
+### `DeviceCanvas`
+
+The panel's NATIVE pixels — the size to AUTHOR an asset for.
+
+*Query* → `DeviceCanvasResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `DeviceConnectionIssues`
+
+Query devices that were found but failed to connect (with per-OS hints).
+
+*Query* → `ConnectionIssuesResult`
+
+Takes no arguments.
+
+### `DeviceState`
+
+Report what a device is — identity, connection, handshake geometry.
+
+*Query* → `DeviceStateResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `DisconnectDevice`
+
+Close the transport and drop the device.
+
+*Command* → `DisconnectResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `DiscoverDevices`
+
+List attached devices that match the product registry.
+
+*Command* → `DiscoverResult`
+
+Takes no arguments.
+
+### `EnableOverlay`
+
+Toggle the metric overlay layer for a device.
+
+*Command* → `OverlayResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool` | yes |
+
+### `EnsureConnected`
+
+Bring *key* up for a wire command only if it isn't already connected.
+
+*Command* → `ConnectResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `LcdSnapshot`
+
+Per-device LCD state snapshot — what settings.for_device holds.
+
+*Query* → `LcdSnapshotResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ListDevices`
+
+Every attached device — the answer to "what is here right now?".
+
+*Query* → `DevicesListResult`
+
+Takes no arguments.
+
+### `LoopVideo`
+
+Toggle whether playback wraps to frame 0 or sticks at the last frame.
+
+*Command* → `LoopVideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `loop` | `bool` | yes |
+
+### `PauseVideo`
+
+Toggle the per-device video playback pause flag.
+
+*Command* → `PauseVideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `paused` | `bool` | yes |
+
+### `PlayVideo`
+
+Decode a video into a per-device playback override.
+
+*Command* → `VideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+| `fps` | `int` | no |
+
+### `PreviewSize`
+
+How big a UI should draw this device's preview (#136).
+
+*Query* → `PreviewSizeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `RecentColors`
+
+*key*'s recent-colour row, newest first, padded with Silver.
+
+*Query* → `RecentColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `RememberColor`
+
+Push a colour onto *key*'s recent-colour row and return the row.
+
+*Command* → `RecentColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int]` | yes |
+
+### `RenderAndSend`
+
+Render the device's active theme with live sensors, push to the wire.
+
+*Command* → `RenderResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `RenderDcStandalone`
+
+Render a DC config standalone — no active device, no theme load.
+
+*Command* → `RenderDcResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `dc_path` | `Path` | yes |
+| `output_path` | `Path` | yes |
+| `width` | `int` | no |
+| `height` | `int` | no |
+
+### `ResetDevice`
+
+Power-cycle one device: disconnect, reconnect, put its display back.
+
+*Command* → `DisconnectResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ResolveOverlay`
+
+Ask what is on the device's screen — the read side of overlay.
+
+*Query* → `OverlayLayoutResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ResolveThemeDirectories`
+
+Which browser directories this device's theme/mask panels point at.
+
+*Query* → `ThemeDirectoriesResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `SeekVideo`
+
+Jump the playback cursor to a specific frame.
+
+*Command* → `SeekVideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `frame` | `int` | yes |
+
+### `SendColor`
+
+Push a solid-color frame to a connected LCD device.
+
+*Command* → `SendResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `r` | `int` | yes |
+| `g` | `int` | yes |
+| `b` | `int` | yes |
+
+### `SendFrame`
+
+Push already-built frame bytes to the device.
+
+*Command* → `SendResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `data` | `bytes` | yes |
+
+### `SendImage`
+
+Push an image file to the LCD without staging it as a theme.
+
+*Command* → `SendResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+
+### `SendScreencastFrame`
+
+Encode one already-captured frame for the device and put it on the wire.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `frame` | `RawFrame` | yes |
+
+### `SetBackground`
+
+Apply a file as the device's persistent background override.
+
+*Command* → `BackgroundResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+
+### `SetBackgroundMode`
+
+Pick what fills the LCD behind overlays.
+
+*Command* → `BackgroundModeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `mode` | `str` | yes |
+
+### `SetBrightness`
+
+Set per-device display brightness (0–100).
+
+*Command* → `BrightnessResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `percent` | `int` | yes |
+
+### `SetFitMode`
+
+Set how the background image/video fits the device canvas.
+
+*Command* → `FitModeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `mode` | `str` | yes |
+
+### `SetGameMode`
+
+Switch game mode and/or set its CPU threshold -- the C#'s ``buttonGame`` / ``textBoxCPU`` (UCThemeLocal.cs:620-727).
+
+*Command* → `GameModeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool | None` | no |
+| `threshold` | `int | None` | no |
+
+### `SetMaskPosition`
+
+Set the mask offset within the canvas, or pass None to reset to (0, 0).
+
+*Command* → `MaskPositionResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `x` | `int | None` | yes |
+| `y` | `int | None` | yes |
+
+### `SetMaskVisible`
+
+Toggle the mask overlay visibility for a device.
+
+*Command* → `MaskVisibilityResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `visible` | `bool` | yes |
+
+### `SetMediaPlayer`
+
+Set the device's media-player source — a URI (a resource on the computer) or a URL (a resource on the web / a stream).
+
+*Command* → `MediaPlayerResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `uri` | `str` | yes |
+
+### `SetOrientation`
+
+Set per-device rotation (0 / 90 / 180 / 270).
+
+*Command* → `OrientationResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `degrees` | `int` | yes |
+
+### `SetOverlayBackground`
+
+Set the solid color used when background_mode='color'.
+
+*Command* → `OverlayBackgroundResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int]` | yes |
+
+### `SetOverlayConfig`
+
+Replace the user-overlay layer wholesale.
+
+*Command* → `OverlayConfigResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `elements` | `tuple[dict, Ellipsis]` | no |
+
+### `SetScreencastRegion`
+
+Set the device's screencast region -- and its hide-border flag.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `x` | `int` | yes |
+| `y` | `int` | yes |
+| `w` | `int` | yes |
+| `h` | `int` | yes |
+| `hide_border` | `bool | None` | no |
+
+### `SetSplitMode`
+
+Set the Dynamic Island style for widescreen panels.
+
+*Command* → `SplitModeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `mode` | `int` | yes |
+
+### `SleepDevice`
+
+Blank a connected panel so it goes dark on shutdown / quit (#143).
+
+*Command* → `SendResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `StartScreencast`
+
+Begin a screen-capture session for a device, and drive it.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `x` | `int` | no |
+| `y` | `int` | no |
+| `w` | `int` | no |
+| `h` | `int` | no |
+| `audio` | `bool` | no |
+
+### `StopScreencast`
+
+End the screen-capture session for a device.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `StopVideo`
+
+Clear the device's playback override AND the persisted bg override.
+
+*Command* → `VideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `keep_override` | `bool` | no |
+
+### `TickDisplay`
+
+Advance a video playback one frame, then render + send (one tick).
+
+*Command* → `RenderResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `TickGameMode`
+
+One game-mode reading: read the row, step the hysteresis, act.
+
+*Command* → `GameModeTickResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ToggleVideo`
+
+Flip video playback between paused / playing — single-verb helper.
+
+*Command* → `PauseVideoResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `UpdateOverlayElement`
+
+Mutate fields on an existing user-edited overlay element.
+
+*Command* → `OverlayElementResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `element_id` | `str` | yes |
+| `x` | `int | None` | no |
+| `y` | `int | None` | no |
+| `color` | `str | None` | no |
+| `size` | `int | None` | no |
+| `font` | `str | None` | no |
+| `bold` | `bool | None` | no |
+| `italic` | `bool | None` | no |
+| `text` | `str | None` | no |
+| `metric` | `str | None` | no |
+| `format` | `str | None` | no |
+| `show_unit` | `bool | None` | no |
+| `source` | `str | None` | no |
+
+### `UploadBootAnimation`
+
+Upload a multi-frame compressed boot animation to a SCSI LCD's flash.
+
+*Command* → `BootAnimationResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `frame_paths` | `list[Path]` | yes |
+| `delays_ds` | `list[int]` | yes |
+
+### `VideoStatus`
+
+Ask what a device's video playback is doing.  Read-only.
+
+*Query* → `VideoStatusResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+## Themes, masks and media
+
+### `DeleteTheme`
+
+Delete the theme directory at ``path``.
+
+*Command* → `DeleteThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `path` | `Path` | yes |
+
+### `DownloadCloudTheme`
+
+Fetch a cloud background into the local cache WITHOUT applying it.
+
+*Command* → `CloudThemeLoadResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `theme_id` | `str` | yes |
+| `resolution` | `tuple[int, int]` | yes |
+
+### `EnsureDataDownload`
+
+Force-install the theme + cloud + mask archives for a resolution.
+
+*Command* → `EnsureDataDownloadResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `width` | `int` | yes |
+| `height` | `int` | yes |
+
+### `ExportCurrentTheme`
+
+Export what the device is SHOWING, saved or not, to a file.
+
+*Command* → `ThemeExportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `archive_path` | `Path` | yes |
+
+### `ExportDcTheme`
+
+Write a theme out as a legacy-compatible ``config1.dc`` file.
+
+*Command* → `ThemeDcExportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `theme_name` | `str` | yes |
+| `output_path` | `Path` | yes |
+
+### `ExportOverlay`
+
+Copy a theme's overlay config file to ``output_path``.
+
+*Command* → `ThemeExportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `theme_name` | `str` | yes |
+| `output_path` | `Path` | yes |
+
+### `ExportTheme`
+
+Export a theme under ``user_theme_dir(w, h) / theme_name`` to a file.
+
+*Command* → `ThemeExportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `theme_name` | `str` | yes |
+| `archive_path` | `Path` | yes |
+
+### `ExportVideoClip`
+
+Encode a clip of *path* into a loose ``Theme.zt`` for *key*'s panel.
+
+*Command* → `VideoExportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+| `start_ms` | `int` | no |
+| `end_ms` | `int | None` | no |
+| `rotation` | `int` | no |
+| `fit_mode` | `FitMode | None` | no |
+| `fps` | `int` | no |
+
+### `ImportTheme`
+
+Unpack a theme archive into ``user_theme_dir(w, h) / name``.
+
+*Command* → `ThemeImportResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `archive_path` | `Path` | yes |
+| `name` | `str` | no |
+
+### `ListCloudThemes`
+
+List themes available in Thermalright's hosted catalog.
+
+*Query* → `CloudThemesListResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `category` | `str` | no |
+| `resolution` | `tuple[int, int] | None` | no |
+
+### `ListMasks`
+
+Enumerate masks for a device resolution.
+
+*Query* → `MasksListResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `resolution` | `tuple[int, int] | None` | no |
+| `directory` | `Path | None` | no |
+| `key` | `str` | no |
+
+### `ListThemes`
+
+Enumerate themes for a device resolution.
+
+*Query* → `ThemesListResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `resolution` | `tuple[int, int] | None` | no |
+| `directory` | `Path | None` | no |
+
+### `ListWebThemes`
+
+List the downloaded cloud-theme previews for a resolution.
+
+*Query* → `WebThemesListResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `width` | `int` | yes |
+| `height` | `int` | yes |
+| `key` | `str` | no |
+
+### `LoadCloudTheme`
+
+Download a cloud video and apply it as the device's background.
+
+*Command* → `CloudThemeLoadResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `theme_id` | `str` | yes |
+
+### `LoadImage`
+
+Show one image on the LCD as the background of a single-image theme.
+
+*Command* → `ThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+
+### `LoadTheme`
+
+Parse a theme, persist it, render the first frame, and send it.
+
+*Command* → `ThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+| `reset_overrides` | `bool` | no |
+
+### `LoadVideo`
+
+Play a video on the LCD as a single-video theme.
+
+*Command* → `ThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `path` | `Path` | yes |
+| `start_ms` | `int` | no |
+| `end_ms` | `int | None` | no |
+| `rotation` | `int` | no |
+
+### `ProbeVideoDuration`
+
+How long is this video file, in milliseconds?
+
+*Query* → `VideoDurationResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `path` | `Path` | yes |
+
+### `RestoreDeviceState`
+
+Put *key*'s saved display back on the panel — the one restore Command.
+
+*Command* → `ThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `SaveTheme`
+
+Save the device's CURRENT rendered state as a new theme directory.
+
+*Command* → `ThemeResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `name` | `str` | yes |
+| `overwrite` | `bool` | no |
+
+### `UploadCustomMask`
+
+Copy a mask image into the user-mask dir for the device's resolution.
+
+*Command* → `MaskUploadResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `source` | `Path` | yes |
+
+## LED
+
+### `EnableLedTestMode`
+
+Enable / disable the 4-color diagnostic test cycle.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool` | yes |
+
+### `InitializeLed`
+
+Render ONE LED frame, connecting the device first — the one-shot render.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int] | None` | no |
+| `phase` | `int` | no |
+
+### `LedSnapshot`
+
+Per-device LED state snapshot.
+
+*Query* → `LedSnapshotResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ListLedModes`
+
+Enumerate the LEDMode enum names (STATIC, BREATHING, RAINBOW, …).
+
+*Query* → `LedModesListResult`
+
+Takes no arguments.
+
+### `ListLedStyles`
+
+Enumerate every LED style the PM registry can resolve.
+
+*Query* → `LedStylesListResult`
+
+Takes no arguments.
+
+### `RamLighting`
+
+Whether TRCC may reach RGB memory's bus -- read from files, no bus.
+
+*Query* → `RamLightingResult`
+
+Takes no arguments.
+
+### `RenderLed`
+
+Compute one LED frame from current settings + sensors and send it.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int] | None` | no |
+| `phase` | `int` | no |
+| `advance` | `bool` | no |
+
+### `RgbFollow`
+
+What follows the cooler, and what it is doing (#160).
+
+*Query* → `RgbFollowResult`
+
+Takes no arguments.
+
+### `SelectZone`
+
+Select exactly this zone: the page a page-style cooler shows, or the one zone a PA120/LF10 edit reaches.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `zone` | `int` | yes |
+
+### `SetClockFormat`
+
+12h/24h clock display for LC2-style LED segment devices.
+
+*Command* → `ClockFormatResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `is_24h` | `bool` | yes |
+
+### `SetHddEnabled`
+
+Toggle HDD metrics inclusion in sensor broadcasts.
+
+*Command* → `HddEnabledResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `enabled` | `bool` | yes |
+
+### `SetLedBrightness`
+
+Set the LED brightness percent (0–100): the global value, plus the zones the edit reaches on a multi-zone style (FormLED ``ucScrollWDelegate``).
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `percent` | `int` | yes |
+
+### `SetLedColor`
+
+Set the LED colour.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `color` | `tuple[int, int, int]` | yes |
+
+### `SetLedColors`
+
+Set LED color array + on/off + brightness on a connected Led device.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `colors` | `list[tuple[int, int, int]]` | yes |
+| `global_on` | `bool` | no |
+| `brightness` | `int` | no |
+
+### `SetLedLoadSource`
+
+Pick the sensor source for LOAD_LINKED mode (``'cpu'`` or ``'gpu'``).
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `source` | `str` | yes |
+
+### `SetLedMode`
+
+Set the LED animation mode.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `mode` | `LEDMode` | yes |
+
+### `SetLedTempSource`
+
+Pick the sensor source for TEMP_LINKED mode (``'cpu'`` or ``'gpu'``).
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `source` | `str` | yes |
+
+### `SetLedZoneBrightness`
+
+Set one zone's persistent brightness (0-100).
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `zone` | `int` | yes |
+| `percent` | `int` | yes |
+
+### `SetLedZoneColor`
+
+Set one zone's persistent color — mirrors legacy zone-aware setters.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `zone` | `int` | yes |
+| `color` | `tuple[int, int, int]` | yes |
+
+### `SetLedZoneMode`
+
+Set one zone's persistent LED mode.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `zone` | `int` | yes |
+| `mode` | `LEDMode` | yes |
+
+### `SetLedZoneSync`
+
+Enable/disable the zone-sync carousel for a device.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool` | yes |
+
+### `SetLedZoneSyncInterval`
+
+Set how many ticks between zone-sync rotations.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `ticks` | `int` | yes |
+
+### `SetLedZoneSyncZones`
+
+Set which pages/zones participate in the zone-sync carousel.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `zones` | `tuple[bool, Ellipsis]` | yes |
+
+### `SetMemoryRatio`
+
+Set the DDR memory multiplier (1, 2, or 4) for the LED memory gauge.
+
+*Command* → `MemoryRatioResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `ratio` | `int` | yes |
+
+### `SetRamLighting`
+
+Switch the opt-in RAM-lighting grant on or off.
+
+*Command* → `RamLightingResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `enabled` | `bool` | yes |
+
+### `SetRgbFollow`
+
+Pick what follows the LED cooler's colours (#160): one at a time.
+
+*Command* → `RgbFollowResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `mode` | `RgbFollowMode` | yes |
+| `host` | `str` | no |
+| `port` | `int` | no |
+| `source` | `str | None` | no |
+| `mapping` | `FollowMapping | None` | no |
+| `targets` | `tuple[str, Ellipsis] | None` | no |
+| `colors` | `FollowColors | None` | no |
+
+### `SetWeekStart`
+
+Week-start convention: ``True`` = Sunday-first, ``False`` = Monday-first.
+
+*Command* → `WeekStartResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `sunday_first` | `bool` | yes |
+
+### `ToggleLed`
+
+Toggle an LED device on/off — global, or one zone if ``zone`` is given.
+
+*Command* → `LedColorsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `on` | `bool` | yes |
+| `zone` | `int | None` | no |
+
+## System, settings and diagnostics
+
+### `AdvanceSlideshow`
+
+Advance a device's slideshow one tick; report the theme to load next.
+
+*Command* → `SlideshowAdvanceResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `CheckForUpdate`
+
+Ask GitHub Releases whether a newer trcc-linux is available.
+
+*Query* → `UpdateCheckResult`
+
+Takes no arguments.
+
+### `ConfigureSlideshow`
+
+Set the slideshow theme list + interval for a device.
+
+*Command* → `SlideshowResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `themes` | `tuple[str, Ellipsis] | None` | no |
+| `interval_s` | `float | None` | no |
+
+### `ControlCenterSnapshot`
+
+App-wide settings snapshot.
+
+*Query* → `ControlCenterSnapshotResult`
+
+Takes no arguments.
+
+### `DaemonStatus`
+
+Is the background daemon running, and where is its socket?
+
+*Query* → `DaemonResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `here` | `bool` | no |
+
+### `DisableAutostart`
+
+Remove the OS-specific autostart entry.
+
+*Command* → `AutostartResult`
+
+Takes no arguments.
+
+### `EnableAutostart`
+
+Install the OS-specific autostart entry (per-user, no sudo).
+
+*Command* → `AutostartResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `target` | `str | None` | no |
+
+### `GenerateDebugReport`
+
+Build a debug report bundle for the user to paste into a GitHub issue.
+
+*Command* → `DebugReportPayload`
+
+| Field | Type | Required |
+|---|---|---|
+| `output_path` | `Path | None` | no |
+| `log_tail_lines` | `int` | no |
+
+### `GetAutostartStatus`
+
+Report whether auto-launch-on-login is enabled.
+
+*Query* → `AutostartResult`
+
+Takes no arguments.
+
+### `GetFirstRunStatus`
+
+Has trcc finished onboarding on this machine?
+
+*Query* → `FirstRunStatusResult`
+
+Takes no arguments.
+
+### `GetPaths`
+
+Report where this install keeps things.  Read-only.
+
+*Query* → `PathsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `resolution` | `tuple[int, int] | None` | no |
+| `key` | `str` | no |
+
+### `GetPlatformInfo`
+
+Snapshot of OS identity + paths + permission warnings.
+
+*Query* → `PlatformInfoResult`
+
+Takes no arguments.
+
+### `GetSensorDashboard`
+
+Read the sensor-dashboard layout, auto-mapping any unbound row.
+
+*Query* → `SensorDashboardResult`
+
+Takes no arguments.
+
+### `KeepAliveLoop`
+
+Confirm or hold a device's screen keepalive.
+
+*Command* → `KeepaliveResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `count` | `int` | no |
+| `interval_s` | `float` | no |
+| `metric_interval_s` | `float` | no |
+
+### `ListDiskSensors`
+
+Every drive thermal sensor, with its current reading and the active pick.
+
+*Query* → `DiskSensorsResult`
+
+Takes no arguments.
+
+### `ListDisks`
+
+Enumerate mounted PARTITIONS — a filesystem view, not a sensor one.
+
+*Query* → `DisksListResult`
+
+Takes no arguments.
+
+### `ListFans`
+
+Enumerate every fan the sensors aggregator exposes, with live readings.
+
+*Query* → `FansListResult`
+
+Takes no arguments.
+
+### `ListFonts`
+
+List font families the renderer can draw with.
+
+*Query* → `FontsListResult`
+
+Takes no arguments.
+
+### `ListGpus`
+
+Enumerate every GPU the sensors aggregator exposes.
+
+*Query* → `GpusListResult`
+
+Takes no arguments.
+
+### `ListLanguages`
+
+Enumerate every language code the i18n table supports.
+
+*Query* → `LanguagesListResult`
+
+Takes no arguments.
+
+### `ListMemorySlots`
+
+Enumerate DRAM slots — identity on every OS, timings on Linux.
+
+*Query* → `MemorySlotsResult`
+
+Takes no arguments.
+
+### `ListSensors`
+
+Enumerate every sensor the platform knows — descriptors only.
+
+*Query* → `SensorsListResult`
+
+Takes no arguments.
+
+### `MarkFirstRunDone`
+
+Tell next/ the onboarding flow has been completed.
+
+*Command* → `FirstRunStatusResult`
+
+Takes no arguments.
+
+### `ProvideApiTls`
+
+The TLS files ``trcc api --tls`` serves, and the fingerprint to pin.
+
+*Command* → `ApiTlsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `bind_host` | `str` | no |
+| `cert` | `Path | None` | no |
+| `key` | `Path | None` | no |
+
+### `ReadSensors`
+
+Return current sensor readings — personalized to user prefs.
+
+*Query* → `SensorsResult`
+
+Takes no arguments.
+
+### `RefreshAutostart`
+
+Re-render an existing autostart entry so it picks up a new launch path.
+
+*Command* → `AutostartResult`
+
+Takes no arguments.
+
+### `RunDoctor`
+
+Run health checks + render a CLI-friendly summary + exit code.
+
+*Query* → `DoctorResultPayload`
+
+Takes no arguments.
+
+### `RunHealthCheck`
+
+Run the full health check suite and return the structured report.
+
+*Query* → `HealthReportResult`
+
+Takes no arguments.
+
+### `RunQuickstart`
+
+Walk the new-user happy path: doctor → scan.
+
+*Command* → `QuickstartResult`
+
+Takes no arguments.
+
+### `RunSetup`
+
+OS-specific one-time setup (udev, WinUSB guide, etc.).
+
+*Command* → `SetupResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `dry_run` | `bool` | no |
+
+### `RunUpgrade`
+
+Say how to upgrade this install -- the command, for the user to run.
+
+*Command* → `UpgradeResult`
+
+Takes no arguments.
+
+### `SetDateFormat`
+
+Set every date element's pattern — on ``key``, or on every device.
+
+*Command* → `DateFormatResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `fmt` | `str` | yes |
+| `key` | `str | None` | no |
+
+### `SetDiskDevice`
+
+Pin which drive supplies ``disk_temp`` (empty string = hottest).
+
+*Command* → `DiskDeviceResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `disk_key` | `str` | yes |
+
+### `SetGpuDevice`
+
+Pick the primary GPU by sensor key (e.g. 'nvidia:0', 'amd:0').
+
+*Command* → `GpuDeviceResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `gpu_key` | `str` | yes |
+
+### `SetLanguage`
+
+Set the UI language code (ISO 639-1, e.g. 'en', 'zh', 'fr').
+
+*Command* → `LanguageResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `language` | `str` | yes |
+
+### `SetRefreshInterval`
+
+Set the global metrics-refresh interval — when metric data is polled and updated (the render reads the cached snapshot between polls).
+
+*Command* → `RefreshIntervalResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `seconds` | `float` | yes |
+
+### `SetSensorDashboard`
+
+Replace the sensor-dashboard layout wholesale and persist it.
+
+*Command* → `SensorDashboardResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `panels` | `tuple[PanelConfig, Ellipsis]` | no |
+
+### `SetSlideshow`
+
+Switch the slideshow on or off — and with it, the rotation.
+
+*Command* → `SlideshowResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `enabled` | `bool` | yes |
+
+### `SetTempUnit`
+
+Set the global temperature unit ("C" or "F") and propagate to every device.
+
+*Command* → `TempUnitResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `unit` | `str` | yes |
+
+### `SetTimeFormat`
+
+Set every time element's clock to 12h or 24h — on ``key``, or on every device when ``key`` is None.
+
+*Command* → `TimeFormatResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `fmt` | `str` | yes |
+| `key` | `str | None` | no |
+
+### `StopDaemon`
+
+Ask a running daemon to shut down.
+
+*Command* → `DaemonResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `timeout` | `float` | no |
+
+### `UpdateStatus`
+
+What the App last heard about updates -- no network.
+
+*Query* → `UpdateCheckResult`
+
+Takes no arguments.
+
+## rgb
+
+### `RgbLights`
+
+The lights the RGB page lists, from the last scan -- touches no bus.
+
+*Query* → `RgbLightsResult`
+
+Takes no arguments.
+
+### `ScanRgbLights`
+
+Look for the lights: RGB memory on the SMBus, and OpenRGB's devices.
+
+*Command* → `RgbLightsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `host` | `str` | no |
+| `port` | `int` | no |
+
+### `SetAuraLeds`
+
+How many LEDs an ASUS Aura ARGB header drives -- the board cannot say, its header's data line runs one way.
+
+*Command* → `RgbLightsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `header` | `int` | yes |
+| `leds` | `int` | yes |
+
+### `SetRamEffect`
+
+Save one of the memory's own effects on the sticks named by ``refs`` (every stick when empty).
+
+*Command* → `RgbLightsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `effect` | `RamEffect` | yes |
+| `refs` | `tuple[str, Ellipsis]` | no |
+| `speed` | `EffectSpeed` | no |
+| `direction` | `EffectDirection | None` | no |
+| `colors` | `tuple[tuple[int, int, int], Ellipsis]` | no |
+| `random_colors` | `bool` | no |
+| `brightness` | `int` | no |
+
+## visual
+
+### `CaptureVisualFrame`
+
+One tick of an audio visual: its newest picture, onto the panel.
+
+*Command* → `ScreencastResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `ListVisuals`
+
+Every audio visual this machine can draw, and the preset files for the ones that draw presets -- the Audio Visuals page's gallery.  With a *key*, also what that panel plays and its slider values, so a window shows the same truth every other UI does.
+
+*Query* → `VisualsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | no |
+
+### `PlayVisual`
+
+Draw the panel's background with the audio visual *visual* (a ``VISUALS`` key), from what is playing.  *preset* is the preset file, relative to the visuals' folder, for a visual that draws presets; *settings* its slider values by name.  Whatever played before stops first.  Refused before anything changes for an unknown visual, a missing preset, or a panel that has not reported its size.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `visual` | `str` | yes |
+| `preset` | `str` | no |
+| `settings` | `dict[str, float]` | no |
+
+### `SetVisualCenter`
+
+The centre picture for audio visuals that show one -- any image the user picks; an empty *path* takes it away.  Every panel playing such a visual starts it again, so the picture shows at once.
+
+*Command* → `VisualsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `path` | `str` | no |
+
+### `SetVisualPicture`
+
+Switch the centre picture on or off -- it is kept while off, so on brings it back -- and set how hot it burns, 0 to 1 (the user's call: the fire belongs to the picture; no picture, no fire).  Each only when given.  Every panel playing a visual that shows it starts again.
+
+*Command* → `VisualsResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `shown` | `bool | None` | no |
+| `fire` | `float | None` | no |
+
+### `SetVisualSettings`
+
+New slider values for the panel's audio visual -- live: it keeps playing and takes them before its next picture.  Only the sliders named change; each is kept within its range; a name the visual has no slider for is refused.  Saved, so a restart plays them.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+| `settings` | `dict[str, float]` | no |
+
+### `StopVisual`
+
+End the panel's audio visual: the theme's own background returns, its video playing again -- the App decides, no UI reloads a theme.
+
+*Command* → `VisualResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `key` | `str` | yes |
+
+### `VisualTile`
+
+The gallery tile for *visual* (and its *preset*): what it draws for noise, *size* pixels a side, as PNG -- the same whatever is playing, so every UI's gallery shows each visual the same way.
+
+*Query* → `VisualTileResult`
+
+| Field | Type | Required |
+|---|---|---|
+| `visual` | `str` | yes |
+| `preset` | `str` | no |
+| `size` | `int` | no |

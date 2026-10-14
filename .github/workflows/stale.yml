@@ -1,0 +1,29 @@
+name: Close stale issues
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # daily at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/stale@v10
+        with:
+          # Only auto-close issues explicitly waiting on the reporter — never
+          # close fresh reports the maintainer simply hasn't read yet.
+          only-labels: 'awaiting-reporter'
+          days-before-stale: 14
+          days-before-close: 7
+          stale-issue-message: "Friendly bump — this is still tagged `awaiting-reporter`. If you've got the info we asked for, drop it here; otherwise I'll close in 7 days. Reopen any time."
+          close-issue-message: "Closing for now — feel free to reopen with the requested info and we'll pick it back up. Thanks!"
+          stale-issue-label: stale
+          exempt-issue-labels: pinned
+          operations-per-run: 30

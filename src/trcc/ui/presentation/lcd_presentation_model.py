@@ -1,0 +1,125 @@
+"""LcdPresentationModel — Qt-free coordination state for one LCD device View.
+
+The handler (``ui/gui/lcd_handler.py``) is a thin Qt View: it owns the
+``QTimer``s, the widget pokes, and ``app.dispatch(...)``.  The per-device display
+state and the decisions it coordinates are pure — this model holds them with
+**zero Qt, zero App handle, zero widgets**, so they unit-test without a
+``QApplication`` and a different presentation (TUI / web) could bind the same
+logic.
+
+Increment 5 of the PM refactor lifts the handler's state + decisions here one
+slice at a time.  B1 establishes the model and relocates the ``DeviceState``
+cache; later slices add the geometry, activation, restore and render decisions.
+Its purity (Qt-free, App-free, adapter-free) is machine-enforced by
+``tests/test_architecture_boundaries.py``.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from .preview_geometry import (
+    rotated_lcd_size,
+)
+
+if TYPE_CHECKING:
+    pass
+
+log = logging.getLogger(__name__)
+
+# Default brightness % before the user picks one (legacy default).
+_DEFAULT_BRIGHTNESS = 100
+
+# Panel resolutions that get the multi-zone "Dynamic Island" split editor
+# (legacy SPLIT_MODE_RESOLUTIONS) instead of the brightness-cycle button.
+SPLIT_MODE_RESOLUTIONS: frozenset[tuple[int, int]] = frozenset({
+    (480, 1280), (1280, 480),
+    (440, 1920), (1920, 440),
+    (462, 1920), (1920, 462),
+})
+
+
+@dataclass(slots=True)
+class DeviceState:
+    """Per-device cache of derived display state — a Qt-free value object.
+
+    Populated / refreshed on ``apply_device_config`` and event-driven callbacks
+    (orientation, theme-load, overlay-toggle).  Read locally per frame so the
+    hot path doesn't pay per-call dispatch overhead.
+    """
+
+    canvas_size: tuple[int, int] = (0, 0)        # pre-rotation (w, h)
+    lcd_size: tuple[int, int] = (0, 0)           # post-rotation (w, h)
+    is_rotated: bool = False                     # 90° / 270° → True
+    overlay_enabled: bool = False
+    current_theme_path: Path | None = None
+
+
+class LcdPresentationModel:
+    """Qt-free coordination model for one LCD device View.
+
+    Holds no Qt, no ``App`` handle and no widgets: the View feeds it primitives
+    and reads back its state / decisions.  B1 holds only :class:`DeviceState`;
+    subsequent slices grow the activation flags and the geometry / restore /
+    render decisions onto it.
+    """
+
+    def __init__(self, device_key: str) -> None:
+        log.debug("__init__: device_key=%s", device_key)
+        self.device_key = device_key
+        self.state = DeviceState()
+
+        # ── Activation / view-lifecycle flags (B3) ──
+        # ui_active: multi-display windows share one preview widget set; only
+        # the active handler may write to them — this is the gate.
+        self.ui_active = False
+        # configured: True once the first connect LOADED the persisted theme
+        # (distinguishes first activation from a read-only re-select).
+        self.configured = False
+        # Per-device display state mirrored from DeviceSettings on restore.
+        self.brightness_level = _DEFAULT_BRIGHTNESS
+        self.split_mode = 0
+        self.ldd_is_split = False
+
+    # ── Geometry (B2) ──────────────────────────────────────────────────
+
+    def set_canvas(self, width: int, height: int) -> None:
+        """Cache the device's pre-rotation canvas (connect / refresh).
+
+        Seeds ``lcd_size`` to the same value; a later :meth:`apply_rotation`
+        swaps it for portrait orientations.
+        """
+        self.state.canvas_size = (width, height)
+        self.state.lcd_size = (width, height)
+        log.info("set_canvas: %s → canvas=lcd=%dx%d",
+                 self.device_key, width, height)
+
+    def apply_rotation(self, degrees: int) -> None:
+        """Update ``is_rotated`` + post-rotation ``lcd_size`` for an orientation.
+
+        The catalogs + preview key off these; dispatching SetOrientation alone
+        rotates the DEVICE, not the GUI's cached geometry.
+        """
+        self.state.is_rotated, self.state.lcd_size = rotated_lcd_size(
+            self.state.canvas_size, degrees,
+        )
+        log.info("apply_rotation: %s %d° → is_rotated=%s lcd_size=%dx%d",
+                 self.device_key, degrees, self.state.is_rotated,
+                 *self.state.lcd_size)
+
+    def apply_split_mode(
+        self, app_mode: int, lcd_size: tuple[int, int],
+    ) -> None:
+        """Show the App's split mode, and whether this panel has the editor.
+
+        READ only.  It used to default 0 to 2 and hand back a mode for the gui to
+        WRITE on open; the default now lives in ``DeviceSettings`` (2, as the C#
+        starts), so 0 here is a user's "off" and is shown as off.  The App's
+        render already ignores split mode on a panel that is not widescreen.
+        """
+        self.split_mode = app_mode
+        self.ldd_is_split = lcd_size in SPLIT_MODE_RESOLUTIONS
+        log.info("apply_split_mode: %s mode=%d size=%dx%d ldd_is_split=%s",
+                 self.device_key, app_mode, *lcd_size, self.ldd_is_split)

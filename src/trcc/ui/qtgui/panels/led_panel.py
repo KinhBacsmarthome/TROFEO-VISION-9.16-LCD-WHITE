@@ -1,0 +1,202 @@
+"""LedPanel — host for the LED sub-tabs.
+
+Owns the device-key picker + connection status header and hosts a
+:class:`QTabWidget` that swaps between focused sub-panels:
+
+* :class:`ColorTab`    — global colour + brightness + presets
+* :class:`ModeTab`     — pick the animation mode
+* :class:`ZoneTab`     — per-zone colour + sync (hidden for single-zone)
+* :class:`AdvancedTab` — sensor source, test mode, clock options
+
+The panel follows the device's settings events (``settings_changed``) and
+app-wide changes (``app_settings_changed``), so a change from another UI or an
+API client refreshes every tab.  The Zone tab decides for itself whether it has
+content to show, so the panel asks on every refresh and hides it when not.
+
+qtgui's counterpart of the gui skin's ``uc_led_control.py``, which still ships.
+"""
+from __future__ import annotations
+
+import logging
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QTabWidget,
+    QVBoxLayout,
+)
+
+from ....core.commands import DeviceState, LedSnapshot
+from ....core.events import DiskDeviceChanged
+from ....core.led_models import LEGACY_STYLE_ID, LedStyle
+from ...presentation.led_panel import led_panel_for
+from ..base import BasePanel
+from ..device_picker import DevicePickerWidget
+from .led import AdvancedTab, ColorTab, ModeTab, ZoneTab
+
+log = logging.getLogger(__name__)
+
+
+class LedPanel(BasePanel):
+    """Tabbed LED control surface for a single LED device key."""
+
+    def _setup_ui(self) -> None:
+        # ── Header: device key + status ───────────────────────────────
+        log.debug("_setup_ui")
+        self._picker = DevicePickerWidget(
+            self.app, self._bus, kind_filter="led",
+            parent=self, selection=self._selection,
+        )
+        self._picker.key_changed.connect(self._on_key_changed)
+
+        header_form = QFormLayout()
+        header_form.addRow("Device key:", self._picker)
+
+        header_row = QHBoxLayout()
+        header_row.addLayout(header_form, stretch=1)
+
+        self._status_label = QLabel(
+            "Enter an LED device key (e.g. 0416:8001) and pick a tab.",
+            self,
+        )
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet("color: #aaa;")
+
+        # ── Tabs ─────────────────────────────────────────────────────
+        self._tabs = QTabWidget(self)
+
+        self._color_tab = ColorTab(self.app, self._current_key, self._tabs)
+        self._mode_tab = ModeTab(self.app, self._current_key, self._tabs)
+        self._zone_tab = ZoneTab(self.app, self._current_key, self._tabs)
+        self._advanced_tab = AdvancedTab(
+            self.app, self._current_key, self._tabs,
+        )
+
+        self._tabs.addTab(self._color_tab, "Colour")
+        self._tabs.addTab(self._mode_tab, "Mode")
+        # Indices used for show/hide.  Qt re-numbers when tabs are
+        # added/removed, so we always look up by widget reference.
+        self._tabs.addTab(self._zone_tab, "Zones")
+        self._tabs.addTab(self._advanced_tab, "Advanced")
+
+        # ── Compose ──────────────────────────────────────────────────
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+        root.addLayout(header_row)
+        root.addWidget(self._status_label)
+        root.addWidget(self._tabs, stretch=1)
+
+        # Refresh whenever the LED settings change, from any UI.  On the
+        # SETTINGS event -- it listened to LedColorsChanged, which every
+        # render publishes (~6.7/s animated), so three Queries ran per frame
+        # and a colour or brightness being picked was pulled back under the
+        # user.  QueuedConnection: the event may fire off the Qt thread.
+        self._bus.settings_changed.connect(
+            self._on_led_settings_changed,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
+        # The disk the Advanced tab picks is app-wide: follow it from any UI.
+        self._bus.app_settings_changed.connect(
+            self._on_app_settings_changed,
+            type=Qt.ConnectionType.QueuedConnection,
+        )
+        self._on_key_changed()          # show the selected device on open
+
+    def _on_app_settings_changed(self, event: object) -> None:
+        log.debug("_on_app_settings_changed: %s", type(event).__name__)
+        if isinstance(event, DiskDeviceChanged):
+            self._advanced_tab.show_disk_sensors()
+
+    # ── Key plumbing ─────────────────────────────────────────────────
+
+    def _current_key(self) -> str:
+        log.debug("_current_key")
+        return self._picker.current_key()
+
+    def _on_key_changed(self, _key: str = "") -> None:
+        log.info("_on_key_changed: _key=%s", _key)
+        self._refresh_all_tabs()
+
+    def _refresh_all_tabs(self) -> None:
+        log.debug("_refresh_all_tabs")
+        key = self._current_key()
+        if not key:
+            self._status_label.setText(
+                "Pick an LED device to load its state.  Open the "
+                "Devices panel to scan if no devices are listed.",
+            )
+            self._set_optional_tabs_visible(zones=False)
+            self._advanced_tab.apply_panel(led_panel_for(1))   # plain default
+            self._zone_tab.apply_style(None)
+            return
+        # One Query, six tabs — instead of handing each of them a live
+        # ``LedDeviceSettings`` reached off the App (an AttributeError under
+        # TRCC_DAEMON=1, and a domain object a UI must not hold).
+        state = self.dispatch(DeviceState(key=key))
+        # Rebuilt from the VALUE, not used as-is.  ``LedStyle`` is a str-enum,
+        # so this field arrives as the enum in-process and as a plain
+        # ``'ax120'`` across the daemon socket.  The ``LEGACY_STYLE_ID`` lookup
+        # below survives that on its own — a str-enum hashes and compares equal
+        # to its value — but ``style.name`` in the status line does NOT, and
+        # raises on a bare string.  Rebuilding makes both paths identical
+        # rather than leaving one of two uses wire-fragile.
+        style = LedStyle(state.led_style) if state.led_style else None
+        # Gate the Advanced tab's sub-sections to this device's LED style —
+        # the same C#-sourced composition the gui renders from.  Unknown
+        # style falls back to a plain panel (gauges only).
+        sid = LEGACY_STYLE_ID.get(style) if style else None
+        self._advanced_tab.apply_panel(led_panel_for(sid if sid is not None else 1))
+        # Before the tabs refresh: a page display has no zones, and the zone
+        # tab must know its pages to show them instead of "no zones".
+        self._zone_tab.apply_style(sid)
+
+        snapshot = self.dispatch(LedSnapshot(key=key))
+        for tab in (
+            self._color_tab,
+            self._mode_tab,
+            self._zone_tab,
+            self._advanced_tab,
+        ):
+            tab.refresh_from(snapshot)
+        # The Zone tab may have nothing to show — hide it rather than
+        # confusing the user with an empty editor.
+        self._set_optional_tabs_visible(
+            zones=self._zone_tab.has_visible_content(),
+        )
+
+
+        if not state.connected:
+            self._status_label.setText(
+                f"{key} isn't connected yet — settings will apply when "
+                "the device shows up.  Open the Device tab to scan.",
+            )
+        else:
+            style_name = style.name if style else "no style detected"
+            self._status_label.setText(
+                f"{key} • {state.vendor} {state.product} • "
+                f"style {style_name}",
+            )
+
+    def _set_optional_tabs_visible(self, *, zones: bool) -> None:
+        # Looked up by widget, not a stored index: indices shift when a tab
+        # is removed.
+        log.debug("_set_optional_tabs_visible: zones=%s", zones)
+        idx = self._tabs.indexOf(self._zone_tab)
+        if zones and idx == -1:
+            # Re-add at a stable position — after Mode, before Advanced.
+            self._tabs.insertTab(self._tabs.indexOf(self._advanced_tab),
+                                 self._zone_tab, "Zones")
+        elif not zones and idx != -1:
+            self._tabs.removeTab(idx)
+
+    # ── Bus subscription ─────────────────────────────────────────────
+
+    def _on_led_settings_changed(self, event) -> None:
+        if event.key != self._current_key():
+            return
+        log.info("_on_led_settings_changed: %s for %s",
+                 type(event).__name__, event.key)
+        self._refresh_all_tabs()

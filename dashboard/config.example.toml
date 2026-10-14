@@ -1,0 +1,87 @@
+# Cấu hình dashboard cho Thermalright Trofeo Vision 9.16 LCD.
+# Chép file này thành config.toml rồi sửa các giá trị bên dưới.
+
+[display]
+device_key = "0416:5408"   # lấy từ lệnh: trcc detect
+width = 1920
+height = 462
+interval = 5               # giây giữa hai lần cập nhật màn hình
+sender = "auto"            # auto | python | cli  (xem README)
+trcc_command = "trcc"
+font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+background_image = ""      # ảnh nền cho thẻ đồng hồ, để trống = tự vẽ núi/hồ
+state_dir = "~/.local/state/trcc-dashboard"
+
+[home_assistant]
+enabled = true
+title = "HOME ASSISTANT"
+url = "http://homeassistant.local:8123"
+# Hồ sơ người dùng (góc trái dưới HA) → Bảo mật → Mã thông báo truy cập dài hạn
+token = "DÁN_TOKEN_VÀO_ĐÂY"
+verify_ssl = true
+
+# Entity của tích hợp "System Monitor" trong Home Assistant.
+# Kiểm tra tên đúng tại: Công cụ nhà phát triển → Trạng thái.
+# Có thể bỏ bớt dòng nào không có; % sẽ tự tính từ used/free nếu thiếu.
+[home_assistant.entities]
+cpu       = "sensor.system_monitor_processor_use"
+cpu_temp  = "sensor.system_monitor_processor_temperature"
+ram_pct   = "sensor.system_monitor_memory_usage"
+ram_used  = "sensor.system_monitor_memory_use"
+ram_free  = "sensor.system_monitor_memory_free"
+disk_pct  = "sensor.system_monitor_disk_usage"
+disk_used = "sensor.system_monitor_disk_use"
+disk_free = "sensor.system_monitor_disk_free"
+
+[nas]
+enabled = true
+title = "NAS SYNOLOGY"
+# "synology": đọc thẳng Web API của DSM (cần tài khoản thuộc nhóm administrators,
+#             nên tạo tài khoản riêng, không bật 2FA).
+# "home_assistant": đọc từ tích hợp Synology DSM trong Home Assistant
+#             (khai báo entity ở [nas.entities] giống [home_assistant.entities]).
+source = "synology"
+url = "https://192.168.1.10:5001"
+username = "dashboard"
+password = "MẬT_KHẨU"
+verify_ssl = false         # DSM thường dùng chứng chỉ tự ký
+volume = ""                # vd. "volume_1"; để trống = cộng tất cả volume
+
+# Chỉ dùng khi source = "home_assistant", ví dụ:
+# [nas.entities]
+# cpu       = "sensor.nas_cpu_utilization_total"
+# cpu_temp  = "sensor.nas_temperature"
+# ram_pct   = "sensor.nas_memory_usage_real"
+# ram_total = "sensor.nas_memory_total_real"
+# disk_pct  = "sensor.nas_volume_1_volume_used"
+# disk_used = "sensor.nas_volume_1_used_space"
+# disk_total = "sensor.nas_volume_1_total_size"
+# disk_temp = "sensor.nas_drive_1_temperature"
+
+[temperature]
+# Mỗi dòng: [nhãn, nguồn]. Nguồn có thể là:
+#   "local:cpu", "local:gpu"  — máy đang cắm màn hình
+#   "nas:cpu", "nas:disk"     — từ mục [nas]
+#   "ha:cpu", "ha:disk"       — từ mục [home_assistant]
+#   "sensor.xxx"              — một entity bất kỳ của Home Assistant
+rows = [
+  ["CPU", "local:cpu"],
+  ["GPU", "local:gpu"],
+  ["NAS HDD", "nas:disk"],
+]
+max_temp = 90              # nhiệt độ ứng với thanh đầy
+
+[network]
+source = "local"           # local | home_assistant
+interface = ""             # vd. "enp3s0"; để trống = tổng mọi card mạng
+# Khi source = "home_assistant" (vd. tốc độ WAN của router):
+download_entity = ""
+upload_entity = ""
+
+[weather]
+enabled = true
+city = "Hà Nội"
+latitude = 21.0285
+longitude = 105.8542
+refresh_minutes = 10

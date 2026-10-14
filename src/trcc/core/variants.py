@@ -1,0 +1,279 @@
+"""Per-(PM, SUB) variant overrides — applied after handshake.
+
+One (VID, PID) often ships as multiple physical products sharing a
+chipset.  The USB descriptors don't distinguish them; only the
+handshake fingerprint (PM byte + optional SUB byte) does.
+
+This module mirrors legacy's variant registry verbatim — same C# case
+tables, same product-id strings — so a real port preserves every
+sidebar button mapping reporters have validated against hardware.
+
+Lookup:
+
+    from .variants import get_variant_override
+    override = get_variant_override(vid, pid, pm, sub)
+    if override and override.button_image:
+        product_info.button_image = override.button_image
+
+The override path runs once, post-handshake, when the App finalises
+the ProductInfo for the connected device.  Without it every device
+falls back to ``ProductInfo.button_image`` (registry default) and the
+GUI sidebar shows the wrong product picture.
+
+Source-of-truth comment from legacy ``device.py``:
+
+    Bulk USBLCDNEW family (C# case 257) — the largest PM table.  Bulk
+    (0x87AD:0x70DB) is the canonical home; SCSI thermalright VID/PIDs
+    alias to this same dict because the C# ADDUserButton dispatcher
+    routes SCSI handshakes through case 257 too.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class VariantOverride:
+    """Per-(PM, SUB) overrides applied after handshake.
+
+    Resolves cases where one (VID, PID) ships as multiple physical
+    products sharing a chipset — the handshake fingerprint
+    distinguishes them.
+    """
+    button_image: str = ""
+    display_name: str = ""
+
+
+def _v(button_image: str) -> VariantOverride:
+    """Shorthand for VariantOverride rows that carry only a button image."""
+    log.debug("_v: button_image=%s", button_image)
+    return VariantOverride(button_image=button_image)
+
+
+def _named(button_image: str, display_name: str) -> VariantOverride:
+    """A variant whose marketed product name someone has CONFIRMED on glass.
+
+    The registry stores one ``product`` string per (VID, PID), but a single
+    USB id covers dozens of coolers — every ``87ad:70db`` panel therefore
+    introduced itself as "GrandVision 360 AIO" no matter which cooler it
+    actually was (#272).
+
+    The name is not derived from ``button_image``.  Those strings are the C#'s
+    own button asset ids, and while some read as product names
+    (``A1GRAND VISION``) others are internal codes (``A1LM19SE``) that no
+    owner would recognise — so stripping the prefix would trade a wrong name
+    for an opaque one.  A row gets a display name only when a reporter has
+    told us what is printed on the cooler in their hand.
+    """
+    log.debug("_named: %s → %r", button_image, display_name)
+    return VariantOverride(button_image=button_image, display_name=display_name)
+
+
+# Bulk USBLCDNEW family (C# case 257) — the largest PM table.  Bulk
+# (0x87AD:0x70DB) is the canonical home; SCSI thermalright VID/PIDs alias
+# to this same dict.
+_BULK_VARIANTS: dict[int, dict[int | None, VariantOverride]] = {
+    1:   {0: _v('A1GRAND VISION'), 1: _v('A1GRAND VISION'),
+          48: _v('A1LM22'), 49: _v('A1LF14'), None: _v('A1GRAND VISION')},
+    3:   {None: _v('A1CORE VISION')},
+    # sub 1 confirmed by Seryogaberkut (#274), sub 5 by Ziusz (#272) — both
+    # working on real hardware, both reporting what the cooler is sold as.
+    4:   {0: _v('A1LM32'),                                    # 2.1.8: +sub0
+          1: _named('A1HYPER VISION', 'Hyper Vision 360'),
+          2: _v('A1RP130 VISION'), 3: _v('A1LM16SE'),
+          4: _v('A1LF10V'),
+          5: _named('A1LM19SE', 'Peerless Vision 360'),
+          6: _v('A1LF014'),    # 2.1.6: +sub6
+          7: _named('A1LM19SE', 'Peerless Vision 360')},       # 2.1.8: +sub7
+    5:   {None: _named('A1Mjolnir VISION', 'Mjolnir Vision')},     # #176
+    6:   {1: _v('frozen_warframe_ultra'), 2: _v('A1FROZEN VISION V2')},
+    7:   {1: _v('A1Stream Vision'), 2: _v('A1Mjolnir VISION PRO')},
+    9:   {0: _v('A1LC2JD'), 1: _v('A1LC2JD'), 2: _v('A1LC2JD'), 3: _v('A1LC2JD'),
+          4: _v('A1LC2JD'), None: _v('A1LF19')},
+    10:  {5: _v('A1LF16'), 6: _v('A1LF18'), 7: _v('A1LD6'), None: _v('A1LC3')},
+    11:  {6: _v('A1LD8'), 7: _v('A1LCO7'),                   # 2.1.8: +sub7
+          None: _v('A1LF19')},
+    12:  {None: _v('A1LF167')},
+    13:  {None: _v('A1PC1')},
+    14:  {1: _v('A1Stream Vision'), 2: _v('A1Mjolnir VISION PRO')},
+    15:  {2: _v('A1LC8'), None: _v('A1LC7')},
+    16:  {None: _v('A1CZ2')},
+    # 2.1.6 ADDUserButton case 17: sub1|5→PC1, sub2→LC8, sub3→LC10, else PC1.
+    # CHANGED vs our prior table (sub2 was LC9 — LC9 is 0416:5302 pm59, not here).
+    17:  {1: _v('A1PC1'), 2: _v('A1LC8'), 3: _v('A1LC10'), 5: _v('A1PC1'),
+          None: _v('A1PC1')},
+    18:  {1: _v('A1LC8'), 2: _v('A1LC10'),                    # 2.1.6: new pm
+          5: _v('A1LC8'), 6: _v('A1LC10'), 7: _v('A1LC14'),   # 2.1.8: +sub5/6/7
+          None: _v('A1PC1')},
+    19:  {None: _v('A1LF19')},                                   # 2.1.6: new pm
+    # ── TRCC 2.1.8 — three new PMs in ADDUserButton's case 257 ──────────
+    # 20 is also the new 854x480 geometry row (FormCZTV.cs:947); 21 and 22
+    # have NO FormCZTVInit branch, so they are artwork identities only and
+    # deliberately get no entry in the protocol tables.
+    20:  {6: _v('A1LD8'), None: _v('A1LF19')},                  # 2.1.8: new pm
+    21:  {1: _v('A1LCO1')},                                     # 2.1.8: new pm
+    22:  {1: _named('A1LM19SE', 'Peerless Vision 360'),         # 2.1.8: new pm
+          2: _v('A1RP130 VISION'), 3: _v('A1LM16SE'),
+          4: _v('A1LF10V'),
+          5: _named('A1LM19SE', 'Peerless Vision 360'),
+          6: _v('A1LF014'), 7: _v('A1LCO1')},
+    32:  {0: _v('A1ELITE VISION'), 1: _v('A1FROZEN WARFRAME PRO'),
+          None: _v('A1ELITE VISION')},
+    50:  {None: _v('A1FROZEN WARFRAME')},
+    51:  {None: _v('A1FROZEN WARFRAME')},
+    53:  {1: _v('A1LF21'), 2: _v('A1LF22'), None: _v('A1LF20')},
+    63:  {0: _v('A1FROZEN WARFRAME PRO'), 1: _v('A1LM22'), 2: _v('A1LM27'),
+          3: _v('A1LM30'), 4: _v('A1RX1')},   # 2.1.6: +sub4
+    # PM=64 SUB=3: Levita (new product) handshakes identically to LM30
+    # — same chipset, same wire bytes — so it keeps the "A1LM30" label.
+    # Its split-mode island is the C#'s SUB 3 rule in DisplayService, not a
+    # property of this row (#149).
+    64:  {0: _v('A1FROZEN WARFRAME PRO'), 1: _v('A1LM22'), 2: _v('A1LM27'),
+          3: _v('A1LM30'),
+          4: _v('A1RX1')},   # 2.1.6: +sub4
+    # 2.1.6 ADDUserButton case 65 sub4: A1LD11 (was A1LD10 in our prior table).
+    # (case 66's LD11 branch is dead code — `else if(sub<=4)` precedes it.)
+    65:  {0: _v('A1ELITE VISION'), 1: _v('A1LF14'), 2: _v('A1LF14'),
+          3: _v('A1LD7'), 4: _v('A1LD11'), 5: _v('A1LD7')},
+    66:  {0: _v('A1ELITE VISION'), 1: _v('A1LF14'), 2: _v('A1LF14'),
+          3: _v('A1LD7'), 4: _v('A1LD7')},
+    68:  {None: _v('A1LM24')},
+    69:  {2: _named('A1LD9', 'Trofeo Vision 11.3 LCD')},         # #289
+    100: {0: _v('A1FROZEN WARFRAME PRO'), 1: _v('A1LM22'),
+          None: _v('A1FROZEN WARFRAME PRO')},
+    101: {0: _v('A1ELITE VISION'), 1: _v('A1LF14'), None: _v('A1ELITE VISION')},
+    128: {None: _v('A1LM24')},
+    129: {None: _v('A1GRAND VISION')},
+}
+
+
+_VARIANT_REGISTRY: dict[
+    tuple[int, int], dict[int, dict[int | None, VariantOverride]],
+] = {
+    # ── LED (case 1) — 0x0416:0x8001 ────────────────────────────────────
+    (0x0416, 0x8001): {
+        1:   {None: _v('A1FROZEN HORIZON PRO')},
+        2:   {None: _v('A1FROZEN MAGIC PRO')},
+        3:   {None: _v('A1AX120 DIGITAL')},
+        16:  {None: _v('A1PA120 DIGITAL')},
+        23:  {None: _v('A1RK120 DIGITAL')},
+        32:  {None: _v('A1AK120 Digital')},
+        48:  {None: _v('A1LF8')},
+        49:  {None: _v('A1LF10')},
+        80:  {None: _v('A1LF12')},
+        96:  {None: _v('A1LF10')},
+        112: {None: _v('A1LC2')},
+        128: {None: _v('A1LC1')},
+        129: {None: _v('A1LF11')},
+        144: {None: _v('A1LF15')},
+        160: {None: _v('A1LF13')},
+        176: {None: _v('A1LF25')},
+        208: {None: _v('A1CZ1')},
+        **{pm: {None: _v('A1PA120 DIGITAL')} for pm in range(17, 32) if pm != 23},
+    },
+    # ── HID T2 LCD (case 2) — 0x0416:0x5302 ─────────────────────────────
+    (0x0416, 0x5302): {
+        36:  {None: _v('A1AS120 VISION')},
+        49:  {None: _v('A1FROZEN WARFRAME')},
+        50:  {None: _v('A1FROZEN WARFRAME')},
+        51:  {None: _v('A1FROZEN WARFRAME')},
+        52:  {None: _v('A1BA120 VISION')},
+        53:  {1: _v('A1LCO3'), None: _v('A1LF20')},   # 2.1.8: +sub1
+        54:  {2: _v('A1LC13'), None: _v('A1LC5'),    # 2.1.6: +sub2
+              3: _v('A1CORE VISION'), 4: _v('A1CORE VISION')},  # 2.1.8: +sub3/4
+        58:  {0: _named('A1FROZEN WARFRAME SE', 'Frozen Warframe SE'),  # #295 #228 #150
+              None: _v('A1LM26')},
+        59:  {0: _v('A1LC7'), 1: _v('A1LC7'),
+              4: _v('A1LC18'),                      # 2.1.8: +sub4
+              None: _v('A1LC9')},                   # 2.1.6: new pm
+        60:  {None: _v('A1LC15')},                                 # 2.1.6: new pm
+        100: {None: _v('A1FROZEN WARFRAME PRO')},
+        101: {None: _v('A1ELITE VISION')},
+        128: {None: _v('A1LM24')},
+    },
+    # ── Bulk USBLCDNEW (case 257) + SCSI thermalright (case 257 in C#) ─
+    # All share the _BULK_VARIANTS PM table — same dispatcher branch in C#.
+    (0x87AD, 0x70DB): _BULK_VARIANTS,
+    (0x87CD, 0x70DB): _BULK_VARIANTS,
+    (0x0402, 0x3922): _BULK_VARIANTS,
+    # LY (Trofeo Vision) panels are device mode 2 in the C# too: Form1's
+    # USBLCDNEW arm calls ``FormCZTVInit(72, 2, …)`` and then
+    # ``RGB_ADD_Device(pm, sub)`` → ADDUserButton(257, …), the same PM table,
+    # whatever the wire.  They were left out, so no LY panel had a per-model
+    # button or name — an 11.3" unit introduced itself as "9.16" (#289).
+    (0x0416, 0x5408): _BULK_VARIANTS,
+    (0x0416, 0x5409): _BULK_VARIANTS,
+    # 0416:5406 (Elite Vision 360) has no PM table — a fixed 320x320 RGB565
+    # canvas, handshaked as a HidLcd type-3 (F5) panel. (#212)
+}
+
+
+def _resolve_variant(
+    table: dict[int, dict[int | None, VariantOverride]],
+    key: int,
+    sub: int,
+) -> VariantOverride | None:
+    """Look up a VariantOverride by (PM key, SUB), preferring exact match."""
+    log.debug("_resolve_variant: table=%s key=%s", table, key)
+    match table.get(key):
+        case None:
+            return None
+        case sub_map if sub in sub_map:
+            return sub_map[sub]
+        case sub_map:
+            return sub_map.get(None)
+
+
+def get_variant_override(
+    vid: int, pid: int, key: int, sub: int = 0,
+) -> VariantOverride | None:
+    """Resolve full VariantOverride record for a handshake fingerprint.
+
+    Args:
+        vid: USB Vendor ID — scopes the lookup to one chipset family.
+        pid: USB Product ID — scopes within the vendor.
+        key: PM byte from handshake (or FBL fallback when PM=0).
+        sub: SUB byte from handshake.
+
+    Returns the override or ``None`` if no entry matches; callers
+    should leave the registry-default values in place when ``None``.
+    """
+    log.info("get_variant_override: vid=%04x pid=%04x key=%d sub=%d",
+             vid, pid, key, sub)
+    family = _VARIANT_REGISTRY.get((vid, pid))
+    if family is None:
+        return None
+    return _resolve_variant(family, key, sub)
+
+
+def covers_several_coolers(vid: int, pid: int) -> bool:
+    """True when one USB id names several coolers, told apart only by handshake.
+
+    Then a name read off the catalog is a guess: ``trcc device list`` never
+    handshakes, so for these ids it must say which cooler it cannot know
+    (#176, #272) instead of printing one cooler's name as fact.
+    """
+    shared = (vid, pid) in _VARIANT_REGISTRY
+    log.debug("covers_several_coolers: %04x:%04x -> %s", vid, pid, shared)
+    return shared
+
+
+def get_button_image(
+    vid: int, pid: int, key: int, sub: int = 0,
+) -> str | None:
+    """Resolve device button image from (VID, PID, PM, SUB)."""
+    log.info("get_button_image: vid=%04x pid=%04x key=%d sub=%d",
+             vid, pid, key, sub)
+    override = get_variant_override(vid, pid, key, sub)
+    return override.button_image if override is not None else None
+
+
+__all__ = [
+    "VariantOverride",
+    "covers_several_coolers",
+    "get_button_image",
+    "get_variant_override",
+]

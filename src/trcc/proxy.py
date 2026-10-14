@@ -1,0 +1,575 @@
+"""AppProxy — client-side drop-in for ``App`` that talks to the daemon.
+
+UIs hold a ``CommandBus`` and never distinguish; by default the
+``_boot.trcc()`` factory hands them an ``AppProxy`` to the shared App.  It
+is the ``CommandBus`` port and nothing more: ``dispatch(cmd) -> Result``
+serializes the Command, sends it over the Unix socket, and reconstructs the
+typed Result; ``remote`` says so; ``on_app_gone`` watches for the App
+stopping or dying.
+
+``events`` is the one attribute beyond dispatching, and it has to be: both
+Qt skins build a ``BusBridge(app.events)`` at construction, so without it a
+GUI cannot run as a daemon client at all — which is what kept
+``TRCC_DAEMON=1`` off by default and the bus optional.  The proxy answers it
+with a LOCAL ``EventBus`` fed by the daemon's stream, so every existing
+subscriber works unchanged and nothing in ``ui/`` needs to know.
+
+Other ``App`` attributes (``platform`` / ``settings`` / ``devices`` /
+``display``) are not exposed by the proxy.  UIs that need state should
+dispatch a Command (``DiscoverDevices`` / ``GetPlatformInfo`` /
+``ReadSensors``) — that's the API contract the shared App honors.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import socket
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import TypeVar, cast
+
+from . import frame_share, ipc
+from .core.commands import Command, DiscoverDevices
+from .core.errors import DaemonUnavailableError, RemoteCommandError
+from .core.events import AppStopping, Event, EventBus, FrameSent
+from .core.logs import current_origin, per_frame, sink_for
+from .core.ports import CommandBus
+from .core.results import Result
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+R = TypeVar("R", bound=Result)
+
+
+def _with_absolute_paths(cmd: Command[R]) -> Command[R]:
+    """*cmd* with every relative ``Path`` field made absolute HERE, in the caller.
+
+    The App resolves a relative path against ITS working directory, which is
+    not the user's: ``trcc report -o rel.txt`` run elsewhere wrote the file into
+    the App's directory and said "Wrote debug report to rel.txt" (measured).
+    22 of 139 Commands carry a Path field; resolving at the one boundary where
+    caller and App differ covers all of them, and every Command added later.
+    """
+    assert dataclasses.is_dataclass(cmd) and not isinstance(cmd, type)
+    changes: dict[str, object] = {}
+    for f in dataclasses.fields(cmd):
+        value = getattr(cmd, f.name)
+        fixed = (value.absolute() if isinstance(value, Path) and not value.is_absolute()
+                 else type(value)(p.absolute() if isinstance(p, Path)
+                                  and not p.is_absolute() else p for p in value)
+                 if isinstance(value, (tuple, list)) else value)
+        if fixed != value:
+            changes[f.name] = fixed
+    if not changes:
+        return cmd
+    log.info("_with_absolute_paths: %s %s", type(cmd).__name__, changes)
+    return cast("Command[R]", dataclasses.replace(cmd, **changes))
+
+
+#: The App's picture of each frame -- the costly event to carry -- and
+#: ``AppStopping``, so the frames stream knows when not to reopen.
+_FRAME_EVENTS = [FrameSent.__name__, AppStopping.__name__]
+#: Every other event the App publishes, derived from the registry so a new
+#: event type cannot be left off by hand.
+_MAIN_EVENTS = [name for name in ipc.EVENT_TYPES
+                if name not in (Event.__name__, FrameSent.__name__)]
+
+
+class _EventStream:
+    """One subscription to the App's events: its types, socket and reader.
+
+    ``open`` is True from the subscribe ack until the reader ends;
+    ``stopping`` and ``wake`` let ``AppProxy._stop`` end this one stream
+    without closing the client.
+    """
+
+    def __init__(self, name: str, types: list[str],
+                 shared_frames: bool = False) -> None:
+        log.debug("_EventStream: %s, %d type(s), shared frames %s", name,
+                  len(types), shared_frames)
+        self.name, self.types = name, types
+        self.shared_frames = shared_frames
+        self.sock: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.open = False
+        self.stopping = False
+        self.wake = threading.Event()
+
+
+class _ProxyBus(EventBus):
+    """The local bus a remote window subscribes to.
+
+    It tells its proxy when the first ``FrameSent`` listener arrives and when
+    the last one leaves, so the App sends pictures only while someone here
+    will show them.
+    """
+
+    def __init__(self, on_frames: Callable[[bool], None]) -> None:
+        super().__init__()
+        log.debug("_ProxyBus.__init__")
+        self._on_frames = on_frames
+
+    def subscribe(self, event_type: type[Event], handler: Callable[[Event], None]) -> None:
+        log.debug("_ProxyBus.subscribe: %s", event_type.__name__)
+        super().subscribe(event_type, handler)
+        if event_type is FrameSent and self.subscriber_count(FrameSent) == 1:
+            self._on_frames(True)
+
+    def unsubscribe(self, event_type: type[Event],
+                    handler: Callable[[Event], None]) -> None:
+        log.debug("_ProxyBus.unsubscribe: %s", event_type.__name__)
+        before = self.subscriber_count(event_type)
+        super().unsubscribe(event_type, handler)
+        if (event_type is FrameSent and before == 1
+                and self.subscriber_count(FrameSent) == 0):
+            self._on_frames(False)
+
+
+class AppProxy(CommandBus):
+    """Forwards every ``dispatch(cmd)`` call to a running daemon.
+
+    Construction is cheap (no socket connection until the first
+    dispatch) so import-time use of ``_boot.trcc()`` doesn't pay
+    a round-trip per invocation.
+    """
+
+    def __init__(self, *, timeout: float = 30.0) -> None:
+        log.debug("__init__")
+        self._timeout = timeout
+        self._events: EventBus | None = None
+        # Everything but frames, for the client's life; frames on demand.
+        self._main = _EventStream("main", _MAIN_EVENTS)
+        self._frames: _EventStream | None = None
+        # Opened on the first shared frame (``trcc.frame_share``).
+        self._frame_reader: frame_share.FrameReader | None = None
+        # Set by ``close``.  Distinguishes a deliberate shutdown from a daemon
+        # that died: the first is routine, the second is the thing a user
+        # needs told about, and logging both the same way buries it.
+        self._closing = False
+        # Set by ``close`` so a reader waiting to reopen a dropped stream
+        # wakes at once instead of finishing its wait.
+        self._wake = threading.Event()
+        # The lifecycle watch (``on_app_gone``): its own stream and thread.
+        self._watcher: threading.Thread | None = None
+        self._watch_sock: socket.socket | None = None
+
+    def dispatch(self, cmd: Command[R]) -> R:
+        """Serialize *cmd*, round-trip through the daemon, return the Result.
+
+        Three outcomes, three shapes — chosen from measurement, not taste:
+
+        * the Command ran → its typed Result, exactly as in-process;
+        * the Command RAISED daemon-side → :class:`RemoteCommandError`.
+          In-process a raising Command propagates, and this restores that.
+          Before the marker existed the client got a base ``Result`` and then
+          ``AttributeError: 'Result' object has no attribute 'devices'`` on
+          first field access — the failure was never survivable, only
+          illegible;
+        * the daemon is gone → :class:`DaemonUnavailableError`.
+
+        Why the last two RAISE rather than return ``Result(ok=False)``:
+        ``DiscoverResult(ok=False)`` carries ``products=[]``, and **198 of 492
+        dispatch sites never check ``.ok``** — so a Result would quietly render
+        "no devices" on a screen whose daemon just died.  Neither is a new
+        failure: a dead daemon already raised ``ConnectionRefusedError``.  Both
+        now raise something with a NAME.
+        """
+        envelope = ipc.encode_command(_with_absolute_paths(cmd))
+        # Which UI asked, so the DAEMON's log names the client, not itself.
+        # Older daemons ignore the key (``decode_command`` reads only
+        # ``command`` + ``kwargs``).
+        envelope["origin"] = current_origin()
+        try:
+            # A Command waiting on the person (a password prompt) answers
+            # when they do; the App's death still ends the wait at once.
+            timeout = None if cmd.WAITS_ON_USER else self._timeout
+            response = ipc.one_shot_request(envelope, timeout=timeout)
+        except OSError as e:
+            log.warning("AppProxy.dispatch: %s unreachable (%s: %s)",
+                        type(cmd).__name__, type(e).__name__, e)
+            raise DaemonUnavailableError(
+                f"the TRCC daemon is not reachable ({type(e).__name__}: {e}); "
+                f"{type(cmd).__name__} was not run",
+            ) from e
+        if (remote := response.get(ipc._ERROR_KEY)) is not None:
+            log.warning("AppProxy.dispatch: %s raised daemon-side: %s",
+                        type(cmd).__name__, remote)
+            raise RemoteCommandError(f"{type(cmd).__name__}: {remote}")
+        result = ipc.decode_result(response)
+        # The client's chokepoint, so it follows the Command's own frequency
+        # exactly as ``App.dispatch`` does: a per-frame Query must not write a
+        # record per frame here either.
+        sink_for(cmd.LOG_LEVEL, log, frame_log).debug(
+            "AppProxy.dispatch: %s -> %s", type(cmd).__name__,
+            type(result).__name__)
+        return result  # type: ignore[return-value]   # caller's TypeVar binds the subclass
+
+    @property
+    def remote(self) -> bool:
+        """True: the daemon runs the Commands (the ``CommandBus`` port)."""
+        log.debug("AppProxy.remote: the daemon runs the Commands")
+        return True
+
+    # ── The observe half ────────────────────────────────────────────────
+    #
+    # Two subscriptions, not one.  ``FrameSent`` carries the panel's picture,
+    # which the App JPEG-encodes for every subscriber that takes it -- about a
+    # fifth of a core at video rate.  Subscribing to everything made a window
+    # pay that from launch to exit, hidden in the tray included (measured
+    # 2026-10-10: the App at 26-27% with the window hidden, 8% with none).  So
+    # frames ride a stream of their own, open only while something in this
+    # process listens for them; everything else rides the main one.
+
+    @property
+    def events(self) -> EventBus:
+        """A local bus carrying the daemon's events.
+
+        Lazily opens the stream on first access, so a CLI one-shot that never
+        observes anything pays nothing.  Subscribers registered here receive
+        real reconstructed ``Event`` instances — ``BusBridge`` subscribes BY
+        TYPE, so decoding to the concrete class (not a dict) is what makes the
+        Qt skins work untouched.  Frames arrive only while someone here
+        subscribes to ``FrameSent``.
+        """
+        if self._events is None:
+            log.info("AppProxy.events: opening the daemon event stream")
+            self._events = _ProxyBus(self._frames_wanted)
+            self._start(self._main, self._events)
+        return self._events
+
+    def _frames_wanted(self, wanted: bool) -> None:
+        """The first ``FrameSent`` listener arrived, or the last one left."""
+        log.info("AppProxy._frames_wanted: %s", wanted)
+        bus = self._events
+        if wanted and bus is not None:
+            self._frames = _EventStream(
+                "frames", _FRAME_EVENTS,
+                shared_frames=frame_share.shared_frames_available())
+            self._start(self._frames, bus)
+        elif not wanted:
+            self._stop(self._frames)
+            self._frames = None
+
+    def _start(self, stream: _EventStream, bus: EventBus) -> None:
+        """Spawn the background reader that feeds *bus* from *stream*."""
+        log.info("AppProxy._start: %s stream reader", stream.name)
+        stream.thread = threading.Thread(
+            target=self._read_events, args=(stream, bus), daemon=True,
+            name=f"trcc-proxy-{stream.name}",
+        )
+        stream.thread.start()
+
+    def _stop(self, stream: _EventStream | None) -> None:
+        """End *stream*: wake its reader, shut its socket, wait for the thread."""
+        if stream is None:
+            return
+        log.info("AppProxy._stop: %s stream", stream.name)
+        stream.stopping = True
+        stream.wake.set()
+        if stream.sock is not None:
+            try:
+                stream.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                log.debug("AppProxy._stop: %s shutdown failed", stream.name,
+                          exc_info=True)
+        thread = stream.thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                log.warning("AppProxy._stop: %s did not stop within 2s",
+                            thread.name)
+
+    #: Wait before reopening a stream the App dropped; doubled after each
+    #: reopened stream that delivered nothing, up to the cap.
+    _REOPEN_FIRST_S = 0.2
+    _REOPEN_MAX_S = 10.0
+
+    def _ended(self, stream: _EventStream) -> bool:
+        """Whether *stream* should stop rather than read or reopen."""
+        frame_log.debug("_ended: %s closing=%s stopping=%s", stream.name,
+                        self._closing, stream.stopping)
+        return self._closing or stream.stopping
+
+    def _read_events(self, stream: _EventStream, bus: EventBus) -> None:
+        """Read *stream*, republishing onto the local bus, until it is stopped.
+
+        The App drops a subscriber that cannot take a line within half a
+        second (``ipc._SUBSCRIBER_SEND_TIMEOUT_S``).  A window that stalled
+        once -- a modal dialog holding the GIL did it (#301) -- used to stay
+        dropped: no frames, no state, for good, while the panel played on.
+        So a stream that ends while the App has not said it is stopping is
+        reopened, with a backoff.  What the App published in the gap is lost.
+
+        EOF for good is SURFACED, not swallowed: a GUI whose daemon died
+        would otherwise sit there looking connected while every panel silently
+        stopped updating.  The warning names the count so a report shows how
+        far it got.
+        """
+        try:
+            sock = ipc.open_event_stream(types=stream.types,
+                                         timeout=self._timeout,
+                                         shared_frames=stream.shared_frames)
+        except (OSError, ConnectionError) as e:
+            log.warning("AppProxy._read_events: cannot open the %s stream "
+                        "(%s: %s) — this client will receive no events",
+                        stream.name, type(e).__name__, e)
+            return
+        seen, delay = 0, self._REOPEN_FIRST_S
+        while True:
+            read, stopping = self._read_stream(stream, sock, bus)
+            seen += read
+            if self._ended(stream) or stopping:
+                break
+            delay = (self._REOPEN_FIRST_S if read
+                     else min(delay * 2, self._REOPEN_MAX_S))
+            log.warning("AppProxy._read_events: the App dropped this client's "
+                        "%s stream after %d event(s) — reopening in %.1f s; "
+                        "what it sent meanwhile is lost", stream.name, read,
+                        delay)
+            if (self._wake.wait(delay) or stream.wake.is_set()
+                    or self._ended(stream)):
+                break
+            try:
+                sock = ipc.open_event_stream(
+                    types=stream.types, timeout=self._timeout,
+                    shared_frames=stream.shared_frames)
+            except (OSError, ConnectionError) as e:
+                log.warning("AppProxy._read_events: cannot reopen the %s "
+                            "stream (%s: %s) — the App is gone", stream.name,
+                            type(e).__name__, e)
+                break
+        self._end_stream(stream, seen)
+
+    def _read_stream(self, stream: _EventStream, sock: socket.socket,
+                     bus: EventBus) -> tuple[int, bool]:
+        """One stream until it ends: (events read, whether the App said it stops)."""
+        log.info("AppProxy._read_stream: observing the App (%s)", stream.name)
+        stream.sock = sock
+        stream.open = True
+        seen, stopping = 0, False
+        try:
+            # Published first, checked second: ``_stop`` sets ``stopping``
+            # before it reads ``stream.sock``, so either it shuts this socket
+            # or this sees it stopping.  A reopen it raced had no socket to shut.
+            if self._ended(stream):
+                log.info("AppProxy._read_stream: stopping — dropping the "
+                         "%s stream just opened", stream.name)
+                sock.close()
+                return seen, stopping
+            with sock, sock.makefile("rb") as reader:
+                for line in reader:
+                    if not line.strip():
+                        continue
+                    try:
+                        event = ipc.decode_event(json.loads(line.decode()))
+                    except (ValueError, KeyError) as e:
+                        log.warning("AppProxy._read_events: undecodable event "
+                                    "dropped (%s: %s)", type(e).__name__, e)
+                        continue
+                    seen += 1
+                    stopping = stopping or isinstance(event, AppStopping)
+                    # AppStopping is only how this stream learns to stop: the
+                    # main stream carries it to the bus for everyone.
+                    if isinstance(event, AppStopping) and stream is not self._main:
+                        continue
+                    if isinstance(event, FrameSent) and event.shared_seq:
+                        framed = self._with_pixels(event)
+                        if framed is None:      # overwritten or gone: skip it
+                            continue
+                        event = framed
+                    # Its own bus, not ``self._events``: ``close`` clears that,
+                    # and a line can still arrive after it has.
+                    bus.publish(event)
+        except OSError as e:
+            if not self._ended(stream):
+                log.warning("AppProxy._read_events: %s stream failed after %d "
+                            "event(s) — %s: %s", stream.name, seen,
+                            type(e).__name__, e)
+        finally:
+            stream.sock = None
+        return seen, stopping
+
+    def _with_pixels(self, event: FrameSent) -> FrameSent | None:
+        """*event* with the pixels its slot of the shared frame file holds."""
+        if self._frame_reader is None:
+            self._frame_reader = frame_share.FrameReader(
+                ipc.runtime_dir() / "trcc" / "frames")
+        width, height, stride = event.shared_shape
+        pixels = self._frame_reader.read(event.key, event.shared_seq, width,
+                                         height, stride)
+        frame_log.debug("AppProxy._with_pixels: %s seq=%d %s", event.key,
+                        event.shared_seq, "read" if pixels else "dropped")
+        return None if pixels is None else dataclasses.replace(
+            event, pixels=pixels)
+
+    def _end_stream(self, stream: _EventStream, seen: int) -> None:
+        """Say how observing ended, then drop the flag."""
+        if self._ended(stream):
+            log.info("AppProxy._read_events: %s stream closed on request "
+                     "after %d event(s)", stream.name, seen)
+        else:
+            log.warning("AppProxy._read_events: %s event stream CLOSED after "
+                        "%d event(s); this client is no longer observing",
+                        stream.name, seen)
+        # Last, so whoever sees False can rely on the line above having
+        # been written.  It was first, and a test that waited for False
+        # then read the log lost the race under load.
+        stream.open = False
+
+    # ── Whether the App is still there ───────────────────────────────────
+
+    def on_app_gone(self, stopped: Callable[[], None],
+                    lost: Callable[[], None]) -> None:
+        """Watch the App on a stream of its own that carries only ``AppStopping``.
+
+        Its own, not :attr:`events`: that one carries every event, and
+        subscribing to it makes the App JPEG-encode each frame for this client
+        -- about 2% of a core that ``trcc api`` would pay only to learn the App
+        quit.  This one is silent until the App's last line.
+        """
+        log.info("AppProxy.on_app_gone: watching the App on a lifecycle stream")
+        self._watcher = threading.Thread(
+            target=self._watch_app, args=(stopped, lost), daemon=True,
+            name="trcc-proxy-lifecycle",
+        )
+        self._watcher.start()
+
+    def _watch_app(self, stopped: Callable[[], None],
+                   lost: Callable[[], None]) -> None:
+        """Wait for the stream to end, then say which way it ended."""
+        said_stop = False
+        try:
+            sock = ipc.open_event_stream([AppStopping.__name__],
+                                         timeout=self._timeout)
+        except (OSError, ConnectionError) as e:
+            log.error("AppProxy._watch_app: the App is not there to watch "
+                      "(%s: %s)", type(e).__name__, e)
+            lost()
+            return
+        self._watch_sock = sock
+        try:
+            with sock, sock.makefile("rb") as reader:
+                for line in reader:
+                    if line.strip() and isinstance(
+                            ipc.decode_event(json.loads(line.decode())),
+                            AppStopping):
+                        said_stop = True
+                        break
+        except (OSError, ValueError, KeyError) as e:
+            log.debug("AppProxy._watch_app: stream read ended — %s: %s",
+                      type(e).__name__, e)
+        finally:
+            self._watch_sock = None
+        if self._closing:
+            log.info("AppProxy._watch_app: this client closed — not the App")
+        elif said_stop:
+            log.info("AppProxy._watch_app: the App is stopping on purpose")
+            stopped()
+        else:
+            log.error("AppProxy._watch_app: the App went away without "
+                      "stopping — it crashed or was killed hard")
+            lost()
+
+    # ── Session lifecycle — the daemon owns it, this client does not ────
+    #
+    # These three exist so ``run_gui`` / ``run_qtgui`` are IDENTICAL in both
+    # modes.  The alternative is a UI asking "am I remote?", which is the
+    # environment sniffing the architecture forbids and which ``AppProxy``
+    # exists to make unnecessary.  Same interface, transport-appropriate
+    # meaning — the Adapter pattern doing its job.
+    #
+    # They are deliberately NOT silent.  A no-op that logs nothing is
+    # indistinguishable from a call that failed, and "the GUI came up but no
+    # device connected" is exactly the report these would otherwise produce.
+
+    def start_session(
+        self, on_progress: Callable[[str], None] | None = None,
+    ) -> None:
+        """No-op: the daemon brought the session up before this client existed.
+
+        Coldplug and the live loops belong to whoever owns USB.  A client
+        starting a second metrics loop would poll the sensors twice and
+        publish two ``SensorsUpdated`` streams for one machine.
+        """
+        log.info("AppProxy.start_session: the daemon owns the session — "
+                 "not starting coldplug or loops in this client")
+        if on_progress is not None:
+            # A splash worker waits on this callback; leaving it un-called
+            # hangs the splash forever.
+            on_progress("Connected to the TRCC daemon")
+
+    def close(self) -> None:
+        """Release THIS client's resources, and only this client's.
+
+        A no-op for the daemon's devices: ``run_gui``'s ``finally`` calls this
+        unconditionally, and in daemon mode disconnecting here would tear down
+        the panels of every OTHER client — and of the daemon itself — because
+        one window was closed.
+
+        But the event stream IS this client's, and it must be closed.  The
+        reader is a thread blocked on a socket read; without this, every
+        window that opens and closes leaks a thread and a file descriptor for
+        the life of the process.  ``shutdown`` is what breaks the blocking
+        read — closing the socket alone does not wake the reader.
+        """
+        log.info("AppProxy.close: leaving the daemon's devices attached; "
+                 "closing this client's event stream")
+        self._closing = True
+        self._wake.set()
+        self._stop(self._main)
+        self._stop(self._frames)
+        if self._watch_sock is not None:
+            try:
+                self._watch_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                log.debug("AppProxy.close: lifecycle shutdown failed",
+                          exc_info=True)
+        watcher = self._watcher
+        if (watcher is not None and watcher.is_alive()
+                and watcher is not threading.current_thread()):
+            watcher.join(timeout=2.0)
+            if watcher.is_alive():
+                log.warning("AppProxy.close: %s did not stop within 2s",
+                            watcher.name)
+        self._main = _EventStream("main", _MAIN_EVENTS)
+        self._frames = None
+        if self._frame_reader is not None:
+            self._frame_reader.close()
+            self._frame_reader = None
+        self._watcher = None
+        self._events = None
+        self._closing = False
+        self._wake.clear()
+
+    def discover_and_connect(
+        self, on_progress: Callable[[str], None] | None = None,
+    ) -> None:
+        """Report what the daemon already has attached.
+
+        The coldplug itself is the daemon's; running it here would race two
+        processes for the same USB handles.  Dispatching ``DiscoverDevices``
+        gives the splash something true to say without touching hardware.
+        """
+        log.info("AppProxy.discover_and_connect: querying the daemon's fleet")
+        if on_progress is not None:
+            on_progress("Asking the daemon which devices are attached…")
+        result = self.dispatch(DiscoverDevices())
+        count = len(getattr(result, "devices", ()) or ())
+        log.info("AppProxy.discover_and_connect: daemon reports %d device(s)",
+                 count)
+        if on_progress is not None:
+            on_progress(f"{count} device(s) attached")
+
+    # ── Attributes that a real App exposes but the proxy can't ──────────
+
+    def __getattr__(self, name: str) -> object:
+        log.debug("__getattr__: name=%s", name)
+        raise AttributeError(
+            f"AppProxy has no attribute {name!r} — the shared App is reached "
+            "through dispatch(cmd) and events; ask it with a Query"
+        )

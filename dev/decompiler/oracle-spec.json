@@ -1,0 +1,403 @@
+{
+  "_README": [
+    "HAND-MINED FACTS LIVE HERE. Regenerating this file DESTROYS them.",
+    "extract_device_spec.py reads TRCC.exe's decompile only. The bulk / hid3 / ly rows below were mined by hand from a SECOND binary, USBLCDNEW.dll (~/Downloads/TRCC_2.1.6_USBLCDNEW_decompiled/Examples/DCReadWriteAsync.cs), which that script never opens.",
+    "Re-running it demotes those three wires to NOT_IN_THIS_DECOMPILE / NEEDS_REVIEW and drops handshake_init, length_field, header, packet_pad, zlp_on_512_multiple and valid_identity. Measured 2026-09-17, by doing it.",
+    "Most of those are NOT recoverable by a miner: header {ly:64, ly1:20} is the SOURCE OFFSET in `Array.Copy(array2, 64 + ...)`, not a byte literal \u2014 a literal-miner emits 16 for both wires and is confidently wrong.",
+    "If you regenerate: diff against git HEAD and restore these rows, or `git checkout` the file."
+  ],
+  "decompile": "TRCC_2.1.6_decompiled",
+  "frame_headers": [
+    {
+      "encoder": "ImageToJpg",
+      "condition": "myDevicePingMu == 100",
+      "header_len": 20,
+      "magic": [
+        218,
+        219,
+        220,
+        221
+      ],
+      "declared_w": 480,
+      "declared_h": 480,
+      "length_slot": "16:20"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "else_default",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 480,
+      "declared_h": 480,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is320x320",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 320,
+      "declared_h": 320,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is640x480",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 640,
+      "declared_h": 480,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is640x172",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 640,
+      "declared_h": 172,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is240x240",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 240,
+      "declared_h": 240,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is1600x720",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 1600,
+      "declared_h": 720,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is800x480",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 800,
+      "declared_h": 480,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is854x480",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 854,
+      "declared_h": 480,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is960x540",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 960,
+      "declared_h": 540,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is960x320",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 960,
+      "declared_h": 320,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is1920x462 || is1920x440",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 1920,
+      "declared_h": 462,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "mySubMode <= 2",
+      "header_len": 20,
+      "magic": [
+        218,
+        219,
+        220,
+        221
+      ],
+      "declared_w": 1280,
+      "declared_h": 480,
+      "length_slot": "16:20"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "else_default",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 1920,
+      "declared_h": 462,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "is360x360",
+      "header_len": 20,
+      "magic": [
+        218,
+        219,
+        220,
+        221
+      ],
+      "declared_w": 360,
+      "declared_h": 360,
+      "length_slot": "16:20"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "myDevicePingMu == 5",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 320,
+      "declared_h": 240,
+      "length_slot": "60:64"
+    },
+    {
+      "encoder": "ImageToJpg",
+      "condition": "else_default",
+      "header_len": 20,
+      "magic": [
+        218,
+        219,
+        220,
+        221
+      ],
+      "declared_w": 240,
+      "declared_h": 320,
+      "length_slot": "16:20"
+    },
+    {
+      "encoder": "ImageTo565",
+      "condition": "myDeviceMode == 3",
+      "header_len": 20,
+      "magic": [
+        218,
+        219,
+        220,
+        221
+      ],
+      "declared_w": 240,
+      "declared_h": 320,
+      "length_slot": "16:20"
+    },
+    {
+      "encoder": "ImageTo565",
+      "condition": "myDeviceMode == 4",
+      "header_len": 64,
+      "magic": [
+        18,
+        52,
+        86,
+        120
+      ],
+      "declared_w": 320,
+      "declared_h": 320,
+      "length_slot": "60:64"
+    }
+  ],
+  "markers": [
+    {
+      "encoder": "ImageToJpg",
+      "condition": "else_default",
+      "bytes": [
+        0,
+        0,
+        0,
+        30
+      ]
+    },
+    {
+      "encoder": "ImageTo565",
+      "condition": "myDeviceMode == 1",
+      "bytes": [
+        0,
+        1,
+        1,
+        30
+      ]
+    },
+    {
+      "encoder": "ImageTo565",
+      "condition": "myDeviceMode == 3",
+      "bytes": [
+        0,
+        1,
+        1,
+        30
+      ]
+    },
+    {
+      "encoder": "ImageTo565",
+      "condition": "myDeviceMode == 4",
+      "bytes": [
+        0,
+        0,
+        0,
+        30
+      ]
+    }
+  ],
+  "families": {
+    "hid2": {
+      "wire": "hid",
+      "note": "0416:5302 DA-magic; frames from FormCZTV ImageTo565/Jpg | USBLCDNEW.dll DCReadWriteAsync.cs:491 ThreadSendDeviceDataH is the wire half for 0x0416:0x5302: OUT 0x02, 20-byte header, length LE at [16..19] plus 20 ROUNDED UP to a 512 multiple. Record carries shm[2]==54 -> Form1.cs:1114 branch: PM=shm[1], SUB=shm[0].",
+      "handshake_init": {
+        "len": 20,
+        "magic": [
+          218,
+          219,
+          220,
+          221
+        ]
+      },
+      "delivery_chunk": 512,
+      "status": "MINED"
+    },
+    "hid3": {
+      "wire": "hid",
+      "status": "MINED",
+      "note": "USBLCDNEW.dll DCReadWriteAsync.cs:663 ThreadSendDeviceDataALi drives the F5 protocol for 0x0416:0x5406 and 0418:5303/4. 1040-byte request (F5 00 01 00 BC FF B6 C8 + 1024 zeros); frame = 16-byte F5 01 header with length LE at [12..15] + payload, one write. Identity resp[0] in {54,101,102}; payload 153600 when 54 else 204800. Record -> Form1.cs:1079 branch: PM=shm[0]=resp[0]-1, SUB=shm[5]=resp[1].",
+      "valid_identity": [
+        54,
+        101,
+        102
+      ],
+      "length_field": [
+        12,
+        15
+      ],
+      "header": 16
+    },
+    "led": {
+      "wire": "led",
+      "note": "colour/segment; SendHidVal perceptual *0.4 \u2014 mine separately",
+      "status": "NEEDS_REVIEW"
+    },
+    "scsi": {
+      "wire": "scsi",
+      "note": "NOT decompilable: the SCSI wire lives in USBLCD.exe / USBLCDNEW.exe, both NATIVE (no CLR directory). Needs disassembly, not decompilation. The managed component USBLCDNEW.dll contains no SCSI path.",
+      "status": "NOT_IN_THIS_DECOMPILE"
+    },
+    "bulk": {
+      "wire": "bulk",
+      "status": "MINED",
+      "note": "USBLCDNEW.dll DCReadWriteAsync.cs:271 ThreadSendDeviceData. VID/PID 0x87AD:0x70DB, OUT 0x01 IN 0x81. 64-byte handshake 12 34 56 78 with 01 at [56]; frame length LE at [60..63] plus 64, one transfer, ZLP when total % 512 == 0. Record -> Form1.cs:1044 branch: PM=shm[4]=resp[24], SUB=shm[1]=resp[36].",
+      "handshake_init": {
+        "len": 64,
+        "magic": [
+          18,
+          52,
+          86,
+          120
+        ]
+      },
+      "length_field": [
+        60,
+        63
+      ],
+      "header": 64,
+      "zlp_on_512_multiple": true
+    },
+    "ly": {
+      "wire": "ly",
+      "status": "MINED",
+      "note": "USBLCDNEW.dll DCReadWriteAsync.cs:859 ThreadSendDeviceDataLY (0x0416:0x5408, OUT 0x09) and :1121 LY1 (0x5409, OUT 0x02). PM=shm[4], SUB=shm[1] via Form1.cs:1044. LY: PM=64+resp[20] (resp[20]<=3 clamped to 1), SUB=1+resp[22]. LY1: PM=49+resp[20], SUB=resp[22]. LY pads the PACKET COUNT to a multiple of 4 then writes 4096 at a time; LY1's '% 1' padding is vendor dead code and never fires.",
+      "header": {
+        "ly": 64,
+        "ly1": 20
+      },
+      "packet_pad": {
+        "ly": 4,
+        "ly1": 1
+      }
+    }
+  },
+  "coverage": {
+    "hid2": "MINED",
+    "hid3": "MINED",
+    "led": "NEEDS_REVIEW",
+    "scsi": "NOT_IN_THIS_DECOMPILE",
+    "bulk": "MINED",
+    "ly": "MINED"
+  }
+}

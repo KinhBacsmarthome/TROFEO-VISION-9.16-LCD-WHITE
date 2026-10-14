@@ -1,0 +1,383 @@
+"""BulkLcd handshake-derived geometry + JPEG/RGB565 dispatch tests.
+
+USBLCDNew protocol: PM byte at ``resp[24]``, SUB at ``resp[36]``.
+- Resolution comes from ``pm_to_fbl`` + ``get_profile`` (mirrors legacy
+  ``_bulk_resolution``).
+- JPEG vs RGB565 is the Bulk-specific override — every PM uses JPEG
+  (cmd=2) except PM=32 which forces RGB565 (cmd=3). This override is
+  layered on top of the FBL profile.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+from trcc.adapters.device.bulk_lcd import BulkLcd
+from trcc.core.models import Kind, ProductInfo, Wire
+
+from .conftest import FakeBulkTransport
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dev" / "decompiler"))
+
+from formcztv_init import (  # pyright: ignore[reportMissingImports]
+    form_cztv_init,
+)
+
+# ── Synthetic handshake response ──────────────────────────────────────
+
+
+def _bulk_response(pm: int, sub: int = 0, *, size: int = 1024) -> bytes:
+    """Build a Bulk handshake response with given PM/SUB bytes.
+
+    Validator requires len >= 41 and resp[24] != 0; PM lives at resp[24],
+    SUB at resp[36].
+    """
+    resp = bytearray(size)
+    resp[24] = pm
+    resp[36] = sub
+    return bytes(resp)
+
+
+def _make_bulk(transport: FakeBulkTransport, *,
+               vid: int = 0x87AD, pid: int = 0x70DB,
+               native_resolution: tuple[int, int] = (480, 480)) -> BulkLcd:
+    info = ProductInfo(
+        vid=vid, pid=pid,
+        vendor="ChiZhu Tech", product="GrandVision 360 AIO",
+        wire=Wire.BULK, kind=Kind.LCD,
+        device_type=4, fbl=72, native_resolution=native_resolution,
+        orientations=(0, 90, 180, 270),
+    )
+    return BulkLcd(info, transport)
+
+
+# ── PM byte derives resolution ───────────────────────────────────────
+
+
+@pytest.mark.parametrize("pm,expected_resolution,expected_fbl", [
+    # PM=5 → FBL=50 → 320×240 landscape
+    (5,  (320, 240), 50),
+    # PM=7 → FBL=64 → 640×480
+    (7,  (640, 480), 64),
+    # PM=32 → FBL=100 → 320×320 (the RGB565 override case)
+    (32, (320, 320), 100),
+    # PM=64 → FBL=114 → 1600×720 widescreen
+    (64, (1600, 720), 114),
+    # Widescreen 224-family — the C# FormCZTVInit m==2 sub-branches.
+    (9,  (854, 480), 224),   # pm 9  → is854x480
+    (10, (960, 540), 224),   # pm 10 → is960x540
+    (12, (800, 480), 224),   # pm 12 → is800x480
+    (65, (1920, 462), 192),  # pm 65 → is1920x462
+    # PMs the bulk wire used to keep on the 480x480 base because its own
+    # allow-list was short; they resolve as the C#'s ladder does now
+    # (``in_pm_ladder`` asks the override tables themselves).  pm 50 → SPI
+    # mode 3 + fbl 50, pm 13 → is960x320, pm 63 → is1600x720.
+    (50, (320, 240), 50),
+    (13, (960, 320), 224),
+    (63, (1600, 720), 114),
+    # PM unknown to the bulk FBL table → C# FormCZTVInit (myDeviceMode==2)
+    # default FBL=72 (480×480).  NOT the PM echoed as a bogus FBL. (#169)
+    (200, (480, 480), 72),
+])
+def test_handshake_derives_resolution_from_pm(
+    fake_bulk: FakeBulkTransport,
+    pm: int, expected_resolution: tuple[int, int], expected_fbl: int,
+) -> None:
+    fake_bulk.read_script.append(_bulk_response(pm))
+    device = _make_bulk(fake_bulk)
+
+    result = device.connect()
+
+    assert result.resolution == expected_resolution, (
+        f"PM {pm}: expected {expected_resolution}, got {result.resolution}"
+    )
+    assert result.fbl == expected_fbl
+    assert result.pm_byte == pm
+    assert device._profile is not None
+    assert device._profile.resolution == expected_resolution
+
+
+@pytest.mark.parametrize("pm,sub", [
+    (1, 0), (1, 1), (1, 47), (2, 0), (4, 0), (200, 0), (255, 9),
+])
+def test_unknown_bulk_pm_defaults_to_480(
+    fake_bulk: FakeBulkTransport, pm: int, sub: int,
+) -> None:
+    """A PM (or PM=1 SUB) the C# FormCZTVInit table doesn't recognise stays
+    on the 480×480 base FBL=72 — never the 320×320 that pm_to_fbl's PM-echo
+    fallback would have produced. Mirrors the official app's default. (#169)"""
+    fake_bulk.read_script.append(_bulk_response(pm, sub))
+    device = _make_bulk(fake_bulk)
+
+    result = device.connect()
+
+    assert result.resolution == (480, 480), (
+        f"PM={pm} SUB={sub}: expected 480×480 default, got {result.resolution}"
+    )
+    assert result.fbl == 72
+
+
+@pytest.mark.parametrize("pm,sub,expected", [
+    (1, 48, (1600, 720)),   # known SUB override survives the guard
+    (1, 49, (1920, 462)),
+])
+def test_pm1_known_sub_still_overrides(
+    fake_bulk: FakeBulkTransport, pm: int, sub: int,
+    expected: tuple[int, int],
+) -> None:
+    """PM=1 with SUB 48/49 must still resolve its widescreen override — the
+    unknown-PM guard only catches the unrecognised SUBs. (#169)"""
+    fake_bulk.read_script.append(_bulk_response(pm, sub))
+    device = _make_bulk(fake_bulk)
+
+    assert device.connect().resolution == expected
+
+
+@pytest.mark.parametrize("pm", range(1, 71))
+def test_bulk_resolution_matches_formcztvinit_over_full_pm_space(
+    fake_bulk: FakeBulkTransport, pm: int,
+) -> None:
+    """The wall: EVERY bulk PM resolves exactly as the C# FormCZTVInit(72,2,pm,0).
+
+    The expectation is the emulator (``dev/decompiler/formcztv_init.py``), a
+    transcription of the C# — it used to be a hand table here, a third copy of
+    the ladder that pinned the same short allow-list the code had.
+
+    The bulk path is 100% FormCZTVInit (the C# passes the PM straight in), so
+    it's fully bench-decidable — every bulk panel the C# supports resolves
+    correctly before anyone plugs one in.  This sweep is the guard against a
+    poll-byte PM echoing past ``in_pm_ladder`` (the #176 root cause). (#176)
+    """
+    fake_bulk.read_script.append(_bulk_response(pm))
+    result = _make_bulk(fake_bulk).connect()
+    st = form_cztv_init(72, m=2, pm=pm)
+    if not st.models_geometry:
+        # pm 50 alone: the C# sets no resolution flag, so its 240x320 is the
+        # header constant, not a panel size.  Ours is the FBL 50 profile.
+        assert pm == 50, f"PM={pm}: the C# resolves no panel"
+        return
+    assert result.resolution == st.resolution, (
+        f"PM={pm}: bulk resolved {result.resolution}, C# FormCZTVInit says "
+        f"{st.resolution}"
+    )
+
+
+@pytest.mark.parametrize("pm,expected_baseline", [
+    (6, 180),   # FW360 Ultra mounts 180° rotated — needs a device baseline (#137)
+    (1, 0),     # other PMs carry no hardware-mount baseline
+    (5, 0),
+    (64, 0),
+])
+def test_pm_resolves_encode_baseline(
+    fake_bulk: FakeBulkTransport, pm: int, expected_baseline: int,
+) -> None:
+    """PM=6 (FW360, 480×480) resolves a 180° device-only encode baseline so the
+    wire frame is pre-rotated to read upright on the glass; every other PM
+    resolves 0 (no change). (#137)"""
+    fake_bulk.read_script.append(_bulk_response(pm))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+
+    assert device.profile is not None
+    assert device.profile.encode_baseline == expected_baseline
+
+
+# ── Bulk-specific JPEG/RGB565 override ───────────────────────────────
+
+
+@pytest.mark.parametrize("pm", [32, 50])
+def test_pm_32_uses_rgb565_overriding_profile_jpeg(
+    fake_bulk: FakeBulkTransport, pm: int,
+) -> None:
+    """The PMs the C# moves off mode 2 encode RGB565: pm 32 (mode 4), pm 50 (mode 3)."""
+    fake_bulk.read_script.append(_bulk_response(pm=pm))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+
+    assert device._profile is not None
+    assert device._profile.jpeg is False, f"PM={pm} must produce profile.jpeg=False"
+
+
+@pytest.mark.parametrize("pm", [5, 7, 9, 10, 64, 65, 100, 200])
+def test_non_pm32_uses_jpeg(
+    fake_bulk: FakeBulkTransport, pm: int,
+) -> None:
+    """Every PM the C# keeps in mode 2 uses JPEG. Spans known + unknown PMs."""
+    fake_bulk.read_script.append(_bulk_response(pm=pm))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+
+    assert device._profile is not None
+    assert device._profile.jpeg is True, f"PM {pm} must produce profile.jpeg=True"
+
+
+# ── Frame send uses profile resolution + cmd byte ────────────────────
+
+
+def test_send_jpeg_uses_cmd_2_with_profile_resolution(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """Frame header: cmd=2 (JPEG) + width/height from the cached profile."""
+    fake_bulk.read_script.append(_bulk_response(pm=5))   # → FBL=50, 320×240
+    device = _make_bulk(fake_bulk)
+    device.connect()
+    fake_bulk.writes.clear()
+
+    payload = b"\xff\xd8" + b"\x00" * 100
+    ok = device.send(payload)
+
+    assert ok is True
+    # First write contains the 64-byte header + start of payload
+    _ep, data = fake_bulk.writes[0]
+    import struct
+    cmd_word = struct.unpack("<I", data[4:8])[0]
+    width = struct.unpack("<I", data[8:12])[0]
+    height = struct.unpack("<I", data[12:16])[0]
+    assert cmd_word == 2, "JPEG mode must use cmd=2"
+    assert (width, height) == (320, 240), \
+        "Header carries profile.resolution, not registry static"
+
+
+def test_send_pm32_uses_cmd_3_rgb565(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """PM=32 sends with cmd=3 (RGB565 override) + profile-derived (320, 320)."""
+    fake_bulk.read_script.append(_bulk_response(pm=32))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+    fake_bulk.writes.clear()
+
+    ok = device.send(b"\x00" * 100)
+
+    assert ok is True
+    _ep, data = fake_bulk.writes[0]
+    import struct
+    cmd_word = struct.unpack("<I", data[4:8])[0]
+    width = struct.unpack("<I", data[8:12])[0]
+    height = struct.unpack("<I", data[12:16])[0]
+    assert cmd_word == 3, "PM=32 must use cmd=3 (RGB565)"
+    assert (width, height) == (320, 320)
+
+
+# ── Frame magic + structure intact ───────────────────────────────────
+
+
+def test_send_frame_header_starts_with_handshake_magic(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """First 4 header bytes = 12 34 56 78 (USBLCDNew magic, shared with handshake)."""
+    fake_bulk.read_script.append(_bulk_response(pm=5))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+    fake_bulk.writes.clear()
+
+    device.send(b"\xff\xd8" + b"\x00" * 100)
+
+    _ep, data = fake_bulk.writes[0]
+    assert data[0:4] == bytes([0x12, 0x34, 0x56, 0x78])
+
+
+# ── Disconnect clears profile ────────────────────────────────────────
+
+
+def test_disconnect_clears_profile(fake_bulk: FakeBulkTransport) -> None:
+    fake_bulk.read_script.append(_bulk_response(pm=5))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+    assert device._profile is not None
+
+    device.disconnect()
+
+    assert device._profile is None
+    assert device._handshake is None
+
+
+# ── Public profile property ──────────────────────────────────────────
+
+
+def test_profile_property_exposes_cached_profile(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    fake_bulk.read_script.append(_bulk_response(pm=5))
+    device = _make_bulk(fake_bulk)
+    device.connect()
+
+    assert device.profile is device._profile
+    assert device.profile is not None
+    assert device.profile.resolution == (320, 240)
+    assert device.profile.jpeg is True
+
+
+def test_profile_property_is_none_pre_handshake(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    device = _make_bulk(fake_bulk)
+    assert device.profile is None
+
+
+# ── Send before handshake raises ─────────────────────────────────────
+
+
+def test_send_before_handshake_raises_transport_error(
+    fake_bulk: FakeBulkTransport,
+) -> None:
+    """send() must refuse when no profile is cached (transport-open guard)."""
+    fake_bulk.open()
+    device = _make_bulk(fake_bulk)
+    # transport is "open" via the fake, but profile is None — guard kicks in
+
+    from trcc.core.errors import TransportError
+    with pytest.raises(TransportError):
+        device.send(b"\xff\xd8" + b"\x00" * 100)
+
+
+# ── A short write must not read as success (#284) ────────────────────────────
+
+
+class _ShortWriteTransport(FakeBulkTransport):
+    """A transport that accepts only part of each chunk, without raising.
+
+    This is what a real bulk endpoint does under some failure modes: libusb
+    reports the count it managed and returns normally.  The port contract
+    says ``write`` returns bytes transferred; the question is whether anyone
+    reads it.
+    """
+
+    def write(self, endpoint: int, data, timeout_ms: int = 100) -> int:
+        super().write(endpoint, data, timeout_ms)
+        n = len(bytes(data))
+        return n if n == 0 else n - 1       # one byte short, never zero
+
+
+def test_a_short_bulk_write_is_reported_as_failure() -> None:
+    """``_write_frame`` returned True unconditionally, discarding the count.
+
+    So a partial transfer looked exactly like a full one, and the CLI printed
+    ``Sent N bytes`` computed from the PAYLOAD — what we meant to send, not
+    what moved.  A user then sees every command succeed and a screen that
+    never changes, which is indistinguishable from dead hardware (#284).
+    """
+    transport = _ShortWriteTransport()
+    transport.read_script.append(_bulk_response(11, 5))
+    device = _make_bulk(transport)
+    device.connect()
+    assert device.send(b"\x00" * 4096) is False, (
+        "a short bulk write was reported as a successful send — the caller "
+        "cannot tell a partial transfer from a dead panel"
+    )
+
+
+def test_a_full_bulk_write_still_succeeds() -> None:
+    """The guard must not fail an honest transport.
+
+    ``<`` not ``!=``, copying HidLcd: a transport may legitimately report MORE
+    than the chunk (Windows HID prepends a Report ID, #240), and over-count is
+    not a short write.
+    """
+    transport = FakeBulkTransport()
+    transport.read_script.append(_bulk_response(11, 5))
+    device = _make_bulk(transport)
+    device.connect()
+    assert device.send(b"\x00" * 4096) is True

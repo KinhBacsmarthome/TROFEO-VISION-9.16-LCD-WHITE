@@ -1,0 +1,31 @@
+[
+  {
+    "name": "SCSI 320x320 — vid:pid only; geometry comes free from the registry",
+    "vid": "0402",
+    "pid": "3922"
+  },
+  {
+    "name": "HID Type 2 240x320 — also vid:pid only; ANY registered device works",
+    "vid": "0416",
+    "pid": "5302"
+  },
+  {
+    "name": "Bulk 1600x720 Levita Vision (#224) — sub=3 FIRES a mount-rotation arm: base 180 becomes 0. No fbl: a bulk reply carries only PM+SUB, the FBL is derived",
+    "vid": "87ad",
+    "pid": "70db",
+    "pm": 64,
+    "sub": 3
+  },
+  {
+    "name": "LY 1920x462 — verbatim reply: exactly what -vvv traced off the wire, our model NOT consulted",
+    "vid": "0416",
+    "pid": "5408",
+    "reply": "03ff0000000000000100000000000000000000000100000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+    "name": "LED controller (AX120 Digital) — style resolved from PM",
+    "vid": "0416",
+    "pid": "8001",
+    "pm": 1
+  }
+]

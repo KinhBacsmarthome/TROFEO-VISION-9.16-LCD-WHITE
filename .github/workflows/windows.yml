@@ -1,0 +1,229 @@
+name: Windows Installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    # A ceiling, not a target: ~2-3x the slowest run measured 2026-10-01, and
+    # above that day's slow-mirror outlier.  Without one a hang holds the
+    # runner for GitHub's 6-hour default.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install ".[nvidia,windows]"
+
+      # Use 7-Zip pre-installed on the runner — no download needed, no network flakiness
+      - name: Prepare 7-Zip for bundling
+        run: |
+          New-Item -ItemType Directory -Force -Path 7z-standalone | Out-Null
+          Copy-Item "C:\Program Files\7-Zip\7z.exe" -Destination 7z-standalone\7za.exe -Force
+          Copy-Item "C:\Program Files\7-Zip\7z.dll" -Destination 7z-standalone\7za.dll -Force
+
+      # Download ffmpeg essentials (LGPL) for video playback — C# app bundles it too
+      - name: Download ffmpeg
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-tmp
+          $ffmpegExe = Get-ChildItem -Path ffmpeg-tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          Copy-Item $ffmpegExe.FullName -Destination ffmpeg.exe -Force
+
+      # Ensure libusb DLL is available (pyusb loads via ctypes, PyInstaller misses it)
+      - name: Download libusb
+        run: |
+          pip install libusb-package
+          $libusb = python -c "import libusb_package; print(libusb_package.get_library_path())"
+          echo "LIBUSB_PATH=$libusb" >> $env:GITHUB_OUTPUT
+        id: libusb
+
+      # LibreHardwareMonitor — bundled subprocess for sensor reads via WMI.
+      # MPL-2.0, redistributable. Pinned to v0.9.6 (Feb 2026 stable, net472).
+      # The .NET 4.7.2 runtime is on every Windows 10+ install by default.
+      - name: Download LibreHardwareMonitor
+        run: |
+          $url = "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/v0.9.6/LibreHardwareMonitor.zip"
+          Invoke-WebRequest -Uri $url -OutFile lhm.zip
+          New-Item -ItemType Directory -Force -Path lhm-extracted | Out-Null
+          Expand-Archive -Path lhm.zip -DestinationPath lhm-extracted -Force
+          Write-Host "LHM extracted contents:"
+          Get-ChildItem lhm-extracted -Recurse | Select-Object FullName, Length
+
+      # Build CLI exe (with console) and GUI exe (without console)
+      - name: Build CLI with PyInstaller
+        run: |
+          pyinstaller `
+            --name trcc `
+            --onedir `
+            --console `
+            --uac-admin `
+            --icon src/trcc/assets/icons/app.ico `
+            --add-data "src/trcc/assets;trcc/assets" `
+            --add-data "src/trcc/ui/gui/assets;trcc/ui/gui/assets" `
+            --hidden-import PySide6.QtSvg `
+            --hidden-import pynvml `
+            --hidden-import wmi `
+            --hidden-import soundcard `
+            --collect-submodules trcc `
+            --noconfirm `
+            src/trcc/__main__.py
+
+      - name: Build GUI with PyInstaller
+        run: |
+          pyinstaller `
+            --name trcc-gui `
+            --onedir `
+            --windowed `
+            --uac-admin `
+            --icon src/trcc/assets/icons/app.ico `
+            --add-data "src/trcc/assets;trcc/assets" `
+            --add-data "src/trcc/ui/gui/assets;trcc/ui/gui/assets" `
+            --hidden-import PySide6.QtSvg `
+            --hidden-import pynvml `
+            --hidden-import wmi `
+            --hidden-import soundcard `
+            --collect-submodules trcc `
+            --noconfirm `
+            src/trcc/__main__.py
+          # Merge GUI exe into CLI dist folder (share the runtime)
+          Copy-Item -Path dist/trcc-gui/trcc-gui.exe -Destination dist/trcc/ -Force
+          # Bundle 7z for theme extraction (LGPL, redistributable)
+          Copy-Item -Path 7z-standalone/7za.exe -Destination dist/trcc/7z.exe -Force
+          Copy-Item -Path 7z-standalone/7za.dll -Destination dist/trcc/7z.dll -Force
+          # Bundle ffmpeg for video playback (LGPL, like C# app)
+          Copy-Item -Path ffmpeg.exe -Destination dist/trcc/ffmpeg.exe -Force
+          # Bundle libusb (pyusb loads via ctypes, PyInstaller misses it)
+          if ("${{ steps.libusb.outputs.LIBUSB_PATH }}") {
+            Copy-Item -Path "${{ steps.libusb.outputs.LIBUSB_PATH }}" -Destination dist/trcc/ -Force
+          }
+          # Bundle LibreHardwareMonitor — TRCC launches it as a subprocess and
+          # reads sensors via the root\LibreHardwareMonitor WMI namespace.
+          New-Item -ItemType Directory -Force -Path dist/trcc/lhm | Out-Null
+          Copy-Item -Path lhm-extracted/* -Destination dist/trcc/lhm/ -Recurse -Force
+          # Pre-seed config so first launch starts minimized to tray (no window flicker).
+          Copy-Item -Path src/trcc/assets/LibreHardwareMonitor.config -Destination dist/trcc/lhm/LibreHardwareMonitor.config -Force
+
+      - name: Log build environment
+        run: |
+          Write-Host "=== Windows Build Environment ==="
+          Write-Host "OS: $([System.Environment]::OSVersion)"
+          Write-Host "Python: $(python --version)"
+          Write-Host "PyInstaller: $(python -c 'import PyInstaller; print(PyInstaller.__version__)')"
+          Write-Host "PySide6: $(python -c 'import PySide6; print(PySide6.__version__)')"
+          Write-Host "Working dir: $(Get-Location)"
+
+      - name: Verify bundled dependencies
+        run: |
+          Write-Host "=== Bundle Contents ==="
+          Write-Host "--- dist/trcc/ (top-level) ---"
+          Get-ChildItem "dist/trcc/*.exe" | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB, 1)) MB)" }
+          Get-ChildItem "dist/trcc/*.dll" | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1KB, 0)) KB)" }
+          Write-Host "--- Total files ---"
+          $total = (Get-ChildItem "dist/trcc" -Recurse | Measure-Object).Count
+          $size = (Get-ChildItem "dist/trcc" -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host "  $total files, $([math]::Round($size, 1)) MB total"
+          Write-Host ""
+          Write-Host "=== Verification ==="
+          $missing = @()
+          if (-not (Test-Path "dist/trcc/trcc.exe")) { $missing += "trcc.exe" }
+          if (-not (Test-Path "dist/trcc/trcc-gui.exe")) { $missing += "trcc-gui.exe" }
+          if (-not (Test-Path "dist/trcc/7z.exe")) { $missing += "7z.exe" }
+          if (-not (Test-Path "dist/trcc/7z.dll")) { $missing += "7z.dll" }
+          if (-not (Test-Path "dist/trcc/ffmpeg.exe")) { $missing += "ffmpeg.exe" }
+          $libusb = Get-ChildItem "dist/trcc/libusb*" -ErrorAction SilentlyContinue
+          if (-not $libusb) { $missing += "libusb-1.0.dll" }
+          if (-not (Test-Path "dist/trcc/lhm/LibreHardwareMonitor.exe")) { $missing += "lhm/LibreHardwareMonitor.exe" }
+          if (-not (Test-Path "dist/trcc/lhm/LibreHardwareMonitor.config")) { $missing += "lhm/LibreHardwareMonitor.config" }
+          if ($missing.Count -gt 0) {
+            Write-Error "FAILED — Missing: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "PASSED — trcc.exe, trcc-gui.exe, 7z.exe, ffmpeg.exe, libusb, LibreHardwareMonitor OK"
+
+      - name: Smoke-run the frozen CLI
+        # The checks above prove files exist, not that the frozen program
+        # starts: #166, #187 and #188 were all launch crashes of a bundle that
+        # passed them.  The integrity level is logged because trcc.exe carries
+        # --uac-admin, which fails with error 740 on a non-elevated runner.
+        run: |
+          whoami /groups | Select-String "Mandatory Label"
+          $out = & dist\trcc\trcc.exe --version 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch "trcc \d+\.\d+\.\d+") {
+            Write-Error "FAILED — the frozen trcc.exe did not run (exit $LASTEXITCODE)"
+            exit 1
+          }
+          Write-Host "PASSED — the frozen trcc.exe runs"
+
+      - name: Smoke-draw TRCC Pipes in the frozen app
+        # TRCC Pipes draws with OpenGL.  This runner has no graphics card --
+        # Windows offers only its own OpenGL 1.1 ("GDI Generic"), which TRCC
+        # refuses -- so the tile draws only if WglSurface.open finds the
+        # software OpenGL Qt ships (opengl32sw.dll) beside PySide6 in the
+        # bundle.  That is the case of every VM, Remote Desktop session and
+        # box without its graphics driver.  Drawing a gallery tile needs no
+        # sound card and no panel.
+        timeout-minutes: 5
+        run: |
+          $tile = Join-Path $env:RUNNER_TEMP "pipes.png"
+          $out = & dist\trcc\trcc.exe display visual-tile trcc-pipes -o $tile --size 64 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tile)) {
+            Get-ChildItem "dist/trcc/_internal/PySide6/opengl32sw.dll" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  bundled: $($_.FullName)" }
+            Write-Error "FAILED — the frozen app could not draw TRCC Pipes (exit $LASTEXITCODE)"
+            exit 1
+          }
+          Write-Host "PASSED — the frozen app draws TRCC Pipes without a graphics card"
+
+      - name: Extract version
+        id: version
+        run: |
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Create Inno Setup installer
+        uses: Minionguyjpro/Inno-Setup-Action@v1.2.9
+        with:
+          path: installer/trcc.iss
+          options: /DAPP_VERSION=${{ steps.version.outputs.VERSION }}
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: trcc-windows-installer
+          path: installer/Output/trcc-${{ steps.version.outputs.VERSION }}-setup.exe
+
+      - name: Create fixed-name alias for stable download URL
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          Copy-Item "installer/Output/trcc-${{ steps.version.outputs.VERSION }}-setup.exe" `
+            "installer/Output/trcc-latest-setup.exe"
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.ref_name }} `
+            "installer/Output/trcc-${{ steps.version.outputs.VERSION }}-setup.exe" `
+            "installer/Output/trcc-latest-setup.exe" `
+            --clobber

@@ -1,0 +1,118 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Virtual environment
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.code-workspace
+pyrightconfig_strict.json
+
+# AI tooling
+CLAUDE.md
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Image editor project files
+*.xcf
+
+# FFmpeg temp
+.video_temp/
+
+# Logs
+*.log
+
+# ──────────────────────────────────────────────
+# Theme & Web archives: .7z files ARE tracked.
+# Extracted dirs are regenerated at runtime via on-demand download.
+# ──────────────────────────────────────────────
+
+# Extracted theme dirs (from theme*.7z archives)
+src/trcc/data/theme*/Theme[1-5]/
+src/trcc/data/theme*/Custom_*/
+src/trcc/data/theme*/[0-9]*/
+src/trcc/data/theme*/Theme.zt
+src/trcc/data/theme*/Theme.dc
+src/trcc/data/theme*/01.png
+
+# Extracted Web dirs (from *.7z and zt*.7z archives)
+src/trcc/data/web/[0-9]*/
+src/trcc/data/web/zt*/[0-9]*/
+src/trcc/data/web/**/*.mp4
+src/trcc/data/web/**/*.png
+
+# Keep all .7z archives tracked
+!src/trcc/data/theme*.7z
+!src/trcc/data/web/*.7z
+
+# Runtime data
+src/trcc/data/web_cache/
+src/trcc/data/themes/
+src/trcc/data/images/
+src/trcc/data/settings.json
+src/trcc/data/ui_*.json
+
+# ──────────────────────────────────────────────
+# Dev / reference files
+# ──────────────────────────────────────────────
+# dev/ is SHARED contributor tooling — track it ALL by default so a new dev
+# script is never silently hidden behind a whitelist.  Ignore ONLY the runtime
+# artifacts the mock writes (dev/.trcc*, bytecode) and each developer's LOCAL
+# fleet config (devices.json — seed it from the committed devices.json.example).
+/dev/.trcc/
+/dev/.trcc-user/
+/dev/__pycache__/
+/dev/devices.json
+# decompile-miner: track the tool SOURCE, never its inputs/outputs — Windows
+# TRCC binaries are copyrighted (never commit an .exe/.dll), and Ghidra dumps +
+# mined tables are large, derived artifacts.
+/dev/decompiler/**/*.exe
+/dev/decompiler/**/*.dll
+/dev/decompiler/ghidra_projects/
+/dev/decompiler/out/
+/dev_*
+# Dev scripts at root
+/test_*.py
+/probe_*.py
+/*.sh
+!install.sh
+
+# Dev tooling (root-level scratch only — dev/tools/ is tracked source)
+/tools/
+
+# Drafted issue replies awaiting review before posting
+/ISSUE_REPLIES.md
+
+# Large binary docs
+doc/*.pdf
+
+# C# audit docs (reference only, not for distribution)
+doc/audit/
+
+# Panel pixel-gate snapshots (dev/tools/panel_snapshot.py scratch)
+dev/.panel_snapshots/
+dev/.wire_baselines/

@@ -1,0 +1,330 @@
+"""FastAPI app factory.
+
+build_app() returns a FastAPI instance with the TRCC App stored on
+`app.state.trcc`.  Every router reads it via `request.app.state.trcc`
+and dispatches Commands.  One App per FastAPI process.
+
+Auth model (port of legacy ``ui/api/__init__.py``):
+  * Module-level ``_api_token`` — set via ``configure_auth(token)``.
+    When None, no auth enforcement (loopback dev mode).  When set,
+    every request must carry a matching ``X-API-Token`` header.
+  * Module-level ``_pairing_code`` — 6-char code shown in the
+    terminal at server start; remote devices ``POST /pair?code=...``
+    to exchange it for the persistent ``_api_token``.
+  * ``/health`` and ``/pair`` are exempt from auth so a fresh remote
+    can pair without already knowing the token.
+  * Request-logging middleware logs method + path + status + latency
+    on every call.
+"""
+from __future__ import annotations
+
+import hmac
+import logging
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from ...__version__ import __version__
+from ...core.commands import GetPaths
+from ...core.logs import per_frame
+from ...core.ports import CommandBus
+
+if TYPE_CHECKING:
+    from ...core.ports import Platform
+    from ...core.results import ApiTlsResult
+from . import config, devices, display, events, led, system, theme
+from . import trcc as _trcc_router
+from ._shared import is_loopback_client
+
+if TYPE_CHECKING:
+    from starlette.routing import BaseRoute
+
+#: Every router the API includes, in order -- the ONE list.  ``build_app``
+#: includes it and :func:`api_routes` walks it.  ``events`` is the observe half:
+#: dispatch and read were always here, the bus was not.
+ROUTERS = (
+    devices.router, display.router, display.meta_router, led.router,
+    led.meta_router, system.router, config.router, theme.router,
+    _trcc_router.router, events.router,
+)
+
+
+def api_routes(api: FastAPI) -> list[BaseRoute]:
+    """Every route *api* serves, on any FastAPI version.
+
+    FastAPI 0.141 stopped copying an included router's routes into
+    ``app.routes``; it keeps one placeholder per router instead, with no path.
+    ``trcc system list-endpoints`` walked that list and reported 7 of 140
+    endpoints, and the API reference lost the same routes.  Reading the
+    routers we included is version-proof -- an older FastAPI that still copies
+    them is de-duplicated, so nothing is listed twice.
+    """
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    routes: list[BaseRoute] = []
+    for route in [*api.routes, *(r for router in ROUTERS for r in router.routes)]:
+        path = getattr(route, "path", None)
+        if path is None:
+            continue
+        key = (type(route).__name__, path,
+               tuple(sorted(getattr(route, "methods", None) or ())))
+        if key not in seen:
+            seen.add(key)
+            routes.append(route)
+    log.debug("api_routes: %d route(s)", len(routes))
+    return routes
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+# ── Token + pairing state ────────────────────────────────────────────
+
+_api_token: str | None = None
+_pairing_code: str | None = None
+_AUTH_EXEMPT: frozenset[str] = frozenset({"/health", "/pair", "/", "/docs",
+                                          "/openapi.json", "/redoc"})
+
+
+def configure_auth(token: str | None) -> None:
+    """Set the persistent API token (or clear it with ``None``).
+
+    Called by the CLI ``serve`` command at server start.  Once set,
+    every request to a non-exempt path must include the matching
+    ``X-API-Token`` header or the middleware returns 401.
+    """
+    global _api_token
+    _api_token = token
+    log.info(
+        "configure_auth: token %s",
+        "set (auth enforced)" if token else "cleared (no auth)",
+    )
+
+
+def set_pairing_code(code: str | None) -> None:
+    """Set the ephemeral 6-char pairing code shown in the terminal.
+
+    Remote devices POST it to ``/pair`` to receive the persistent
+    ``_api_token``.  When None, pairing is disabled and ``/pair``
+    returns 503 — useful when the operator already provisioned the
+    token out-of-band.
+    """
+    global _pairing_code
+    _pairing_code = code
+    log.info("set_pairing_code: %s",
+             "set" if code else "cleared (pairing disabled)")
+
+
+def build_app(trcc: CommandBus | None = None, *, serve: bool = True) -> FastAPI:
+    """Build the FastAPI app.  Creates a default App if none passed.
+
+    ``serve=False`` builds the routes and nothing else -- no App, no static
+    mount -- for a caller that only lists them (``trcc system list-endpoints``,
+    which used to find or START the shared App to print a list).
+    """
+    log.info("build_app: trcc=%s serve=%s", trcc is not None, serve)
+    if trcc is None and serve:
+        # Build through the canonical factory so the API server becomes
+        # a daemon client when TRCC_DAEMON=1 instead of fighting
+        # the daemon for USB (audit bug B4).
+        from ..._boot import trcc as build_trcc
+        from ...adapters.render.qt import QtRenderer
+        trcc = build_trcc(renderer=QtRenderer())
+
+    api = FastAPI(
+        title="TRCC API",
+        description="REST API for Thermalright LCD/LED cooler control.",
+        version=__version__,
+    )
+    api.state.trcc = trcc
+
+    # ── Request logging — every call gets one line ──────────────────
+    # INFO, except a route that declares itself per-frame (a poller, like
+    # ``/tick``) — the way a Command declares LOG_LEVEL.  At INFO a 1 Hz poller
+    # rotated the diagnosis out of the file within hours; a FAILED dispatch
+    # still logs a WARNING from the bus.
+    @api.middleware("http")
+    async def log_requests(request: Request, call_next):  # type: ignore[no-untyped-def]
+        start = time.monotonic()
+        response = await call_next(request)
+        ms = (time.monotonic() - start) * 1000
+        line = ("API %s %s → %d (%.0fms)", request.method, request.url.path,
+                response.status_code, ms)
+        if getattr(request.state, "per_frame", False):
+            frame_log.debug(*line)
+        else:
+            log.info(*line)
+        return response
+
+    # ── Token-auth middleware ───────────────────────────────────────
+    # When ``_api_token`` is set, every non-exempt path requires a
+    # matching ``X-API-Token`` header (hmac compare so a wrong-length token
+    # doesn't time-leak).  When it is None the API is unauth'd loopback —
+    # which a web page in the user's own browser can reach, so only a
+    # loopback Host with no foreign Origin gets through (``is_loopback_client``).
+    # WebSockets bypass HTTP middleware; ``admit_ws`` applies the same rule.
+    @api.middleware("http")
+    async def check_token(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if _api_token and request.url.path not in _AUTH_EXEMPT:
+            header_token = request.headers.get("X-API-Token", "")
+            if not hmac.compare_digest(header_token, _api_token):
+                log.warning(
+                    "API auth: rejected %s %s (token mismatch)",
+                    request.method, request.url.path,
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid token"},
+                )
+        elif not _api_token and not is_loopback_client(
+                request.url.hostname, request.headers.get("origin")):
+            log.warning("API auth: refused %s %s from host=%s origin=%s "
+                        "(token-less server, not a loopback client)",
+                        request.method, request.url.path,
+                        request.headers.get("host"),
+                        request.headers.get("origin"))
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Refused: not a loopback client"},
+            )
+        return await call_next(request)
+
+    # ── Health endpoint — exempt from auth ──────────────────────────
+    @api.get("/health", tags=["meta"])
+    def health() -> dict:
+        """Liveness probe — always reachable, no auth required."""
+        log.debug("health")
+        return {"status": "ok", "version": __version__}
+
+    # ── Pairing endpoint — exempt from auth ─────────────────────────
+    @api.post("/pair", tags=["meta"], response_model=None)
+    def pair_device(code: str) -> dict | JSONResponse:
+        """Exchange the terminal pairing code for the persistent API token.
+
+        Remote devices receive the code out-of-band (operator types
+        it into the remote app), POST it here, and store the returned
+        ``token`` for all future requests as the ``X-API-Token`` header.
+        """
+        if not _pairing_code:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail":
+                    "Pairing not available "
+                    "(server started without a pairing code)",
+                },
+            )
+        if not hmac.compare_digest(code.upper(), _pairing_code.upper()):
+            log.warning("API pair: rejected (wrong code)")
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Invalid pairing code"},
+            )
+        if not _api_token:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "No API token configured"},
+            )
+        log.info("API pair: remote device paired successfully")
+        return {"success": True, "token": _api_token}
+
+    for router in ROUTERS:
+        api.include_router(router)
+
+    # ── Static serving for cloud previews ───────────────────────────
+    # Mount data/web so the /theme/web gallery's preview_url
+    # (/static/web/{w}{h}/<id>.png — and masks under zt{w}{h}/) resolve.
+    # Created if absent so the mount succeeds before the first
+    # /theme/init download; StaticFiles serves whatever lands there.
+    if trcc is None:
+        log.info("static: routes only — /static/web not mounted")
+    else:
+        try:
+            data_dir = trcc.dispatch(GetPaths()).data_dir
+            if not data_dir:
+                raise RuntimeError("GetPaths returned no data_dir")
+            web_root = Path(data_dir) / "web"
+            web_root.mkdir(parents=True, exist_ok=True)
+            api.mount(
+                "/static/web", StaticFiles(directory=str(web_root)), name="static-web",
+            )
+            log.info("static: mounted /static/web → %s", web_root)
+        except (OSError, AttributeError, RuntimeError) as e:
+            # RuntimeError is the no-data_dir case raised just above; it was
+            # not caught, so it crashed the API at startup instead of skipping.
+            log.warning("static: /static/web mount skipped — %s", e)
+
+    @api.get("/", tags=["meta"])
+    def root() -> dict:
+        log.debug("root")
+        return {
+            "name": "TRCC API",
+            "version": __version__,
+            "endpoints": [
+                "GET  /devices",
+                "POST /devices/{key}/connect",
+                "POST /devices/{key}/disconnect",
+                "POST /devices/{key}/display/orientation",
+                "POST /devices/{key}/display/brightness",
+                "POST /devices/{key}/display/theme",
+                "POST /devices/{key}/display/color",
+                "POST /devices/{key}/display/fit-mode",
+                "POST /devices/{key}/display/overlay",
+                "POST /devices/{key}/display/split-mode",
+                "POST /devices/{key}/display/mask",
+                "POST /devices/{key}/display/mask-position",
+                "POST /devices/{key}/display/mask-visible",
+                "POST /devices/{key}/display/play-video",
+                "POST /devices/{key}/display/stop-video",
+                "POST /devices/{key}/display/tick",
+                "POST /devices/{key}/led/colors",
+                "POST /devices/{key}/led/render",
+                "GET  /system/info",
+                "GET  /system/sensors",
+                "POST /system/setup",
+                "POST /config/temp-unit",
+                "POST /config/language",
+                "POST /config/gpu",
+                "POST /config/refresh-interval",
+                "POST /theme/save",
+                "POST /theme/export",
+                "POST /theme/import",
+            ],
+        }
+
+    return api
+
+
+def run(platform: Platform | None = None, *,
+        host: str = "127.0.0.1", port: int = 8080,
+        tls: ApiTlsResult | None = None) -> int:
+    """Serve the REST API from an injected ``Platform`` (blocking).  Exit code.
+
+    A thin alias over the UI bus: the API is one face of the one app, so its
+    launch sequence is ``UserInterface.start`` like every other face.  Kept as
+    a function because ``dev/mock_api.py``, the CLI and the tests call it.
+
+    Two things worth knowing about what the bus changed here:
+
+    * It runs a session like every UI -- coldplug, hotplug, the live loops
+      and the connect prime -- ending the #148 exception.
+    * ``App.close()`` now runs when serving ends, which it never did before.
+      That is the intended direction: a panel left mid-stream holds its last
+      frame and reads "USB communication lost" (#143).  Under
+      ``TRCC_DAEMON=1`` the App is an ``AppProxy``, whose ``close`` releases
+      only this client's event stream and leaves the daemon's devices alone.
+    """
+    log.info("api run: delegating to the UI bus (host=%s port=%d tls=%s)",
+             host, port, tls is not None)
+    from .._uis import ApiUI
+    return ApiUI(host=host, port=port, tls=tls).start(platform)
+
+
+def serve(host: str = "127.0.0.1", port: int = 8080,
+          tls: ApiTlsResult | None = None) -> None:
+    """Back-compat entry — serve on the host platform (blocking)."""
+    log.debug("serve: host=%s port=%s tls=%s", host, port, tls is not None)
+    run(host=host, port=port, tls=tls)

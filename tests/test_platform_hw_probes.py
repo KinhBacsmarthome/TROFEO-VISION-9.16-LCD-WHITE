@@ -1,0 +1,481 @@
+"""macOS + BSD hardware-probe parsing tests.
+
+Exercises ``_macos_memory_info`` / ``_macos_disk_info`` /
+``_bsd_memory_info`` / ``_bsd_disk_info`` from the Linux dev box by
+injecting canned profiler/sysctl/geom output through their DI seams.
+"""
+from __future__ import annotations
+
+import pytest
+
+# ── macOS memory ──────────────────────────────────────────────────────
+
+
+def _apple_silicon_profiler_payload() -> dict:
+    return {
+        "SPMemoryDataType": [
+            {
+                "dimm_manufacturer": "Apple",
+                "dimm_part_number": "Unified",
+                "dimm_type": "LPDDR5",
+                "dimm_speed": "6400 MHz",
+                "dimm_size": "16 GB",
+                "dimm_form_factor": "Unified",
+                "_name": "Apple Silicon",
+            },
+        ],
+    }
+
+
+def _intel_mac_profiler_payload() -> dict:
+    return {
+        "SPMemoryDataType": [
+            {
+                "_name": "BANK 0/DIMM0",
+                "_items": [
+                    {
+                        "dimm_manufacturer": "Samsung",
+                        "dimm_part_number": "M471A1K43DB1-CTD",
+                        "dimm_type": "DDR4",
+                        "dimm_speed": "2667 MHz",
+                        "dimm_size": "8 GB",
+                        "dimm_form_factor": "SODIMM",
+                        "_name": "BANK 0/DIMM0",
+                    },
+                    {
+                        "dimm_manufacturer": "Samsung",
+                        "dimm_part_number": "M471A1K43DB1-CTD",
+                        "dimm_type": "DDR4",
+                        "dimm_speed": "2667 MHz",
+                        "dimm_size": "8 GB",
+                        "dimm_form_factor": "SODIMM",
+                        "_name": "BANK 0/DIMM1",
+                    },
+                ],
+            },
+        ],
+    }
+
+
+def test_macos_memory_apple_silicon_unified_slot() -> None:
+    from trcc.adapters.system.macos import _macos_memory_info
+
+    payload = _apple_silicon_profiler_payload()
+    slots = _macos_memory_info(runner=lambda _: payload)
+    assert len(slots) == 1
+    assert slots[0]["manufacturer"] == "Apple"
+    assert slots[0]["type"] == "LPDDR5"
+    assert slots[0]["size"] == "16 GB"
+    assert slots[0]["form_factor"] == "Unified"
+
+
+def test_macos_memory_intel_mac_two_dimms() -> None:
+    from trcc.adapters.system.macos import _macos_memory_info
+
+    payload = _intel_mac_profiler_payload()
+    slots = _macos_memory_info(runner=lambda _: payload)
+    assert len(slots) == 2
+    assert all(s["type"] == "DDR4" for s in slots)
+    assert {s["locator"] for s in slots} == {"BANK 0/DIMM0", "BANK 0/DIMM1"}
+
+
+def test_macos_memory_falls_back_to_psutil_when_profiler_empty() -> None:
+    """No SPMemoryDataType entries → single ``Total`` row from psutil."""
+    from trcc.adapters.system.macos import _macos_memory_info
+
+    slots = _macos_memory_info(runner=lambda _: {})
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+    assert slots[0]["size"].endswith(" GB")
+
+
+def test_macos_memory_skips_dimm_without_size() -> None:
+    """Empty-slot DIMMs (no `dimm_size`) shouldn't render as empty rows."""
+    from trcc.adapters.system.macos import _macos_memory_info
+
+    payload = {
+        "SPMemoryDataType": [
+            {"dimm_size": "", "_name": "Empty Slot"},
+        ],
+    }
+    slots = _macos_memory_info(runner=lambda _: payload)
+    # falls through to psutil
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+
+
+def test_macos_memory_handles_malformed_payload() -> None:
+    """Non-dict items shouldn't crash; treated as no data → psutil fallback."""
+    from trcc.adapters.system.macos import _macos_memory_info
+
+    payload = {"SPMemoryDataType": [None, "not-a-dict", 42]}
+    slots = _macos_memory_info(runner=lambda _: payload)
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+
+
+# ── macOS disks ──────────────────────────────────────────────────────
+
+
+def _macbook_storage_payload() -> dict:
+    return {
+        "SPStorageDataType": [
+            {
+                "bsd_name": "disk0",
+                "size_in_bytes": str(512 * 1024 ** 3),
+                "smart_status": "Verified",
+                "physical_drive": {
+                    "device_name": "APPLE SSD AP0512",
+                    "medium_type": "Solid State",
+                },
+            },
+            {
+                "bsd_name": "disk2",
+                "size_in_bytes": str(2 * 1024 ** 4),
+                "smart_status": "Verified",
+                "physical_drive": {
+                    "device_name": "External HDD",
+                    "medium_type": "Rotational",
+                },
+            },
+        ],
+    }
+
+
+def test_macos_disk_parses_ssd_and_hdd() -> None:
+    from trcc.adapters.system.macos import _macos_disk_info
+
+    payload = _macbook_storage_payload()
+    disks = _macos_disk_info(runner=lambda _: payload)
+    assert len(disks) == 2
+    by_name = {d["name"]: d for d in disks}
+    assert by_name["disk0"]["type"] == "SSD"
+    assert by_name["disk0"]["size"] == "512 GB"
+    assert by_name["disk2"]["type"] == "HDD"
+    assert by_name["disk2"]["size"] == "2.0 TB"
+
+
+def test_macos_disk_defaults_to_ssd_for_unknown_medium() -> None:
+    """Modern Macs are SSD-only — unknown medium_type → SSD."""
+    from trcc.adapters.system.macos import _macos_disk_info
+
+    payload = {
+        "SPStorageDataType": [
+            {
+                "bsd_name": "disk0",
+                "size_in_bytes": "0",
+                "physical_drive": {"device_name": "?", "medium_type": ""},
+            },
+        ],
+    }
+    disks = _macos_disk_info(runner=lambda _: payload)
+    assert disks[0]["type"] == "SSD"
+
+
+def test_macos_disk_skips_entries_without_name_or_model() -> None:
+    from trcc.adapters.system.macos import _macos_disk_info
+
+    payload = {
+        "SPStorageDataType": [
+            {"bsd_name": "", "physical_drive": {}},
+            {"bsd_name": "disk1", "physical_drive": {"device_name": "Drive"}},
+        ],
+    }
+    disks = _macos_disk_info(runner=lambda _: payload)
+    assert [d["name"] for d in disks] == ["disk1"]
+
+
+def test_macos_disk_empty_on_missing_data() -> None:
+    from trcc.adapters.system.macos import _macos_disk_info
+
+    assert _macos_disk_info(runner=lambda _: {}) == []
+
+
+# ── BSD memory ───────────────────────────────────────────────────────
+
+
+def test_bsd_memory_total_from_hw_physmem() -> None:
+    from trcc.adapters.system.bsd import _bsd_memory_info
+
+    total = 16 * 1024 ** 3
+    slots = _bsd_memory_info(runner=lambda _: str(total))
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+    assert slots[0]["size"] == "16 GB"
+
+
+def test_bsd_memory_falls_back_to_psutil_when_sysctl_fails() -> None:
+    from trcc.adapters.system.bsd import _bsd_memory_info
+
+    slots = _bsd_memory_info(runner=lambda _: None)
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+    assert slots[0]["size"].endswith(" GB")
+
+
+def test_bsd_memory_falls_back_on_garbage_physmem() -> None:
+    from trcc.adapters.system.bsd import _bsd_memory_info
+
+    slots = _bsd_memory_info(runner=lambda _: "not_a_number")
+    assert len(slots) == 1
+    assert slots[0]["locator"] == "Total"
+
+
+# ── BSD disks ────────────────────────────────────────────────────────
+
+
+_GEOM_OUTPUT = """\
+Geom name: ada0
+Providers:
+1. Name: ada0
+   Mediasize: 500107862016 (466G)
+   Sectorsize: 512
+   descr: Samsung SSD 850 EVO 500GB
+   ident: S2RBNX0J123456
+   rotationrate: 0
+   fwsectors: 63
+   fwheads: 16
+Geom name: ada1
+Providers:
+1. Name: ada1
+   Mediasize: 2000398934016 (1.8T)
+   descr: WDC WD20EZRZ-00Z5HB0
+   rotationrate: 5400
+"""
+
+
+def test_bsd_disk_parses_geom_output() -> None:
+    from trcc.adapters.system.bsd import _bsd_disk_info
+
+    disks = _bsd_disk_info(runner=lambda: _GEOM_OUTPUT)
+    assert len(disks) == 2
+    by_name = {d["name"]: d for d in disks}
+    assert by_name["ada0"]["model"] == "Samsung SSD 850 EVO 500GB"
+    assert by_name["ada0"]["type"] == "SSD"
+    assert by_name["ada0"]["size"] == "466G"
+    assert by_name["ada1"]["type"] == "HDD"
+    assert by_name["ada1"]["size"] == "1.8T"
+
+
+def test_bsd_disk_empty_when_geom_unavailable() -> None:
+    """OpenBSD / NetBSD don't ship geom — runner returns "" → no disks."""
+    from trcc.adapters.system.bsd import _bsd_disk_info
+
+    assert _bsd_disk_info(runner=lambda: "") == []
+
+
+def test_bsd_disk_defaults_unknown_health() -> None:
+    from trcc.adapters.system.bsd import _bsd_disk_info
+
+    minimal = "Geom name: ada0\n   descr: Test\n"
+    disks = _bsd_disk_info(runner=lambda: minimal)
+    assert disks[0]["health"] == "Unknown"
+
+
+# ── Linux DDR5 SPD timings enrichment ─────────────────────────────────
+
+
+def test_enrich_with_spd_timings_adds_timing_keys(monkeypatch) -> None:
+    from trcc.adapters.system import linux, spd
+
+    timings = spd.SpdTimings(
+        dram_type="DDR5", mhz=2404, mts=4808,
+        tcas=40, trcd=40, trp=40, tras=77, trc=117, trfc=709,
+    )
+    monkeypatch.setattr(spd, "read_spd_timings", lambda: timings)
+
+    slots = [{"size": "16 GiB", "speed": "4800 MT/s"}]
+    linux._enrich_with_spd_timings(slots)
+
+    assert slots[0]["tcas"] == "40"
+    assert slots[0]["tras"] == "77"
+    assert slots[0]["trfc"] == "709"
+    assert slots[0]["size"] == "16 GiB"   # untouched
+
+
+def test_enrich_with_spd_timings_leaves_slots_when_no_spd(monkeypatch) -> None:
+    from trcc.adapters.system import linux, spd
+
+    monkeypatch.setattr(spd, "read_spd_timings", lambda: None)
+
+    slots = [{"size": "16 GiB"}]
+    linux._enrich_with_spd_timings(slots)
+
+    assert slots == [{"size": "16 GiB"}]   # no timing keys added
+
+
+def test_enrich_with_spd_timings_noop_on_empty_slots(monkeypatch) -> None:
+    from trcc.adapters.system import linux, spd
+
+    def _boom() -> None:
+        raise AssertionError("must not probe SPD when there are no slots")
+
+    monkeypatch.setattr(spd, "read_spd_timings", _boom)
+
+    slots: list[dict[str, str]] = []
+    linux._enrich_with_spd_timings(slots)   # returns early, no SPD read
+
+    assert slots == []
+
+
+@pytest.mark.parametrize("mediasize,expected", [
+    # geom's own parenthesised form wins when present — the only case the
+    # suite covered before 2026-09-10.
+    ("500107862016 (466G)", "466G"),
+    # Everything below is the byte-count fallback, which had NO coverage at
+    # all.  These are CHARACTERISATION: measured against the implementation
+    # before it was reshaped, so the refactor has something to be judged by.
+    ("2000398934016", "1.8 TB"),
+    ("500107862016", "466 GB"),
+    ("500107862016 bytes", "466 GB"),      # trailing words ignored
+    # Under 1 GB the original set nothing at all, so the field defaults to "".
+    # Odd, and preserved deliberately: changing it is a behaviour change on a
+    # platform nobody here can test.
+    ("12345", ""),
+    ("garbage", "garbage"),                # unparseable -> passed through
+])
+def test_bsd_disk_size_formats(mediasize: str, expected: str) -> None:
+    """Every branch of the Mediasize parse, pinned.
+
+    This branch was nested five deep inside an if/elif chain (the whole
+    function measured depth 9, the worst in the tree) precisely because
+    nothing exercised it.
+    """
+    from trcc.adapters.system.bsd import _bsd_disk_info
+
+    out = _bsd_disk_info(runner=lambda: f"Geom name: ada0\n   Mediasize: {mediasize}\n")
+    assert out[0]["size"] == expected
+
+
+# ── Linux DRAM slots from dmidecode ────────────────────────────────────────
+
+_DMIDECODE_MEMORY = """\
+# dmidecode 3.5
+Handle 0x0030, DMI type 17, 92 bytes
+Memory Device
+\tArray Handle: 0x002F
+\tSize: 16 GB
+\tForm Factor: DIMM
+\tLocator: DIMM 0
+\tType: DDR5
+\tSpeed: 6000 MT/s
+\tManufacturer: G.Skill
+\tPart Number: F5-6000J3038F16G
+\tRank: 1
+\tConfigured Memory Speed: 4800 MT/s
+
+Handle 0x0031, DMI type 17, 92 bytes
+Memory Device
+\tArray Handle: 0x002F
+\tSize: No Module Installed
+\tForm Factor: Unknown
+\tLocator: DIMM 1
+\tType: Unknown
+
+Handle 0x0032, DMI type 17, 92 bytes
+Memory Device
+\tArray Handle: 0x002F
+\tSize: 16 GB
+\tLocator: DIMM 2
+\tType: DDR5
+\tSpeed: 6000 MT/s
+\tManufacturer: G.Skill
+"""
+
+
+def _memory_info(output: str, returncode: int = 0, monkeypatch=None):
+    """Run the real prober against scripted `dmidecode` output."""
+    import subprocess
+    import types
+    from unittest.mock import patch
+
+    from trcc.adapters.system import linux
+
+    fake = types.SimpleNamespace(returncode=returncode, stdout=output, stderr="")
+    # As root, so dmidecode itself runs whatever this host has installed: a
+    # user goes through the packaged trcc-dmi helper, and without it reads
+    # nothing at all.
+    with patch.object(subprocess, "run", return_value=fake), \
+         patch.object(linux.os, "geteuid", lambda: 0), \
+         patch.object(linux, "_enrich_with_spd_timings", lambda s: None), \
+         patch.object(linux, "_enrich_with_live_imc_timings", lambda s: None):
+        return linux._linux_memory_info()
+
+
+def test_linux_memory_reports_only_populated_slots() -> None:
+    """A board with an empty slot must report the sticks, not the sockets.
+
+    dmidecode emits a `Memory Device` block per SOCKET; an empty one says
+    `Size: No Module Installed`.  Counting those would tell a user with two
+    sticks in four slots that they have four.
+    """
+    slots = _memory_info(_DMIDECODE_MEMORY)
+
+    assert [s["locator"] for s in slots] == ["DIMM 0", "DIMM 2"]
+    first = slots[0]
+    assert first["type"] == "DDR5"
+    # The fixture is a real G.Skill F5-6000 kit with XMP OFF: rated 6000,
+    # `Configured Memory Speed: 4800`.  It is genuinely RUNNING at 4800, and
+    # that is what we report now (#279).  This asserted the 6000 nameplate
+    # until 2026-09-15 -- the same wrong half a reporter hit from the other
+    # direction, with 8000 sticks showing 4800.
+    assert first["speed"] == "4800 MT/s"
+    assert first["configured_memory_speed"] == "4800 MT/s"
+    assert first["part_number"] == "F5-6000J3038F16G"
+    # `Array Handle` is not in _DMI_MEMORY_FIELDS and must be dropped.
+    assert "array_handle" not in first
+
+
+@pytest.mark.parametrize("output,returncode", [
+    ("", 0),                       # dmidecode present, said nothing
+    (_DMIDECODE_MEMORY, 1),        # dmidecode refused (not root)
+], ids=["no-output", "nonzero-exit"])
+def test_linux_memory_falls_back_to_psutil(output: str, returncode: int) -> None:
+    """Without dmidecode there is still a total to show — one synthetic slot.
+
+    The size is this machine's real total, so only the SHAPE is asserted.
+    """
+    slots = _memory_info(output, returncode)
+
+    assert len(slots) == 1
+    assert slots[0]["type"] == slots[0]["manufacturer"] == "Unknown"
+    assert slots[0]["size"].endswith(" GB")
+
+
+# ── The speed the controller RUNS, not the nameplate (#279) ──────────────────
+
+
+def test_the_configured_speed_wins_over_the_nameplate() -> None:
+    """DDR5 at XMP must report its real rate, not its JEDEC nameplate.
+
+    ``dmidecode`` Type 17 carries both and we displayed the wrong one: a
+    reporter with 8000 MT/s DDR5, verified with their own ``dmidecode -t17``,
+    saw 4800 (#279).  4800 is what EVERY DDR5 stick's SPD says, by spec, so the
+    panel was showing a number that is true about the part and useless about
+    the machine.
+    """
+    from trcc.adapters.system.linux import _prefer_configured_speed
+
+    slots = [{"locator": "DIMM_A1", "speed": "4800 MT/s",
+              "configured_memory_speed": "8000 MT/s"}]
+    _prefer_configured_speed(slots)
+    assert slots[0]["speed"] == "8000 MT/s"
+
+
+@pytest.mark.parametrize("configured", ["4800 MT/s", "Unknown", "", None])
+def test_the_nameplate_stands_when_there_is_nothing_better(
+    configured: str | None,
+) -> None:
+    """Fall back, never blank.
+
+    A JEDEC machine reports the same number twice; an older ``dmidecode`` omits
+    the field; some boards answer ``Unknown``.  None of those may lose the
+    speed we already had -- that would trade a wrong number for no number.
+    """
+    from trcc.adapters.system.linux import _prefer_configured_speed
+
+    slot: dict[str, str] = {"locator": "DIMM_A1", "speed": "4800 MT/s"}
+    if configured is not None:
+        slot["configured_memory_speed"] = configured
+    _prefer_configured_speed([slot])
+    assert slot["speed"] == "4800 MT/s"

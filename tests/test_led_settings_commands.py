@@ -1,0 +1,461 @@
+"""LED setter Commands + Settings persistence — end-to-end through App."""
+from __future__ import annotations
+
+import copy
+import dataclasses
+from pathlib import Path
+
+import pytest
+
+from trcc.app import App
+from trcc.core.commands import (
+    EnableLedTestMode,
+    SelectZone,
+    SetClockFormat,
+    SetLedBrightness,
+    SetLedColor,
+    SetLedLoadSource,
+    SetLedMode,
+    SetLedTempSource,
+    SetLedZoneBrightness,
+    SetLedZoneColor,
+    SetLedZoneMode,
+    SetLedZoneSync,
+    SetLedZoneSyncInterval,
+    SetLedZoneSyncZones,
+    SetMemoryRatio,
+    SetWeekStart,
+    ToggleLed,
+)
+from trcc.core.led_models import LEDMode
+from trcc.services.settings import Settings
+
+from .conftest import FakePaths, FakePlatform
+
+_KEY = "0416:8001"
+
+
+def _app(tmp_path: Path) -> App:
+    return App(platform=FakePlatform(tmp_path))
+
+
+
+def test_the_led_clock_draws_in_the_coolers_own_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FormLED keeps its own isTimer24 (FormLED.cs:945, drawn at :3938).
+
+    The render read the LCD overlay's ``time_format`` instead: the cooler's
+    own 12/24h button stored ``clock_24h`` and changed nothing, while the
+    LCD's ``SetTimeFormat`` changed the LED clock.  Both halves are pinned.
+    """
+    import trcc.services.led_segment as segment
+    from tests.mock_platform import MockPlatform
+    from trcc.adapters.render.qt import QtRenderer
+    from trcc.core.commands import ConnectDevice, RenderLed, SetTimeFormat
+
+    drawn: list[bool] = []
+    real = segment.compute_mask
+
+    def _spy(*args, **kwargs):
+        drawn.append(kwargs["is_24h"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(segment, "compute_mask", _spy)
+    app = App(MockPlatform([{"type": "led", "vid": "0416", "pid": "8001",
+                             "pm": 1}], tmp_path), renderer=QtRenderer())
+    assert app.dispatch(ConnectDevice(key=_KEY)).ok
+
+    assert app.dispatch(SetClockFormat(key=_KEY, is_24h=False)).ok
+    assert app.dispatch(SetTimeFormat(fmt="24h")).ok        # the LCD's, not this
+    drawn.clear()
+    assert app.dispatch(RenderLed(key=_KEY)).ok
+
+    assert drawn and drawn[-1] is False, (
+        f"the LED clock drew {drawn} after its own button chose 12h")
+
+# ── Mode ─────────────────────────────────────────────────────────────
+
+
+def test_set_mode_updates_persists_resets_phase(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    # Seed a non-zero phase so we can prove reset
+    app.led_runtime.setdefault(_KEY, _new_runtime_with_timer(42))
+
+    result = app.dispatch(SetLedMode(key=_KEY, mode=LEDMode.RAINBOW))
+
+    assert result.ok is True
+    assert "RAINBOW" in result.message
+    # Settings persisted
+    assert app.settings.for_led(_KEY).mode is LEDMode.RAINBOW
+    # Every phase resets so the new mode's animation starts fresh — all three,
+    # not one shared counter (see LedRuntimeState).
+    runtime = app.led_runtime[_KEY]
+    assert (runtime.breathe_phase, runtime.colorful_phase,
+            runtime.rainbow_phase) == (0, 0, 0)
+
+
+# ── Color ────────────────────────────────────────────────────────────
+
+
+def test_set_color_persists(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedColor(key=_KEY, color=(10, 20, 30)))
+    assert result.ok is True
+    assert app.settings.for_led(_KEY).color == (10, 20, 30)
+
+
+def test_set_color_rejects_out_of_range_channel(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedColor(key=_KEY, color=(300, 0, 0)))
+    assert result.ok is False
+    assert "out of range" in result.message
+    # Color did not change
+    assert app.settings.for_led(_KEY).color == (255, 0, 0)
+
+
+# ── Brightness ───────────────────────────────────────────────────────
+
+
+def test_set_brightness_persists(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedBrightness(key=_KEY, percent=33))
+    assert result.ok is True
+    assert app.settings.for_led(_KEY).brightness == 33
+
+
+def test_set_brightness_rejects_out_of_range(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedBrightness(key=_KEY, percent=150))
+    assert result.ok is False
+    assert "out of range" in result.message
+    # Original default unchanged
+    assert app.settings.for_led(_KEY).brightness == 65
+
+
+# ── Test mode ────────────────────────────────────────────────────────
+
+
+def test_enable_test_mode_persists_and_resets_counters(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    app.led_runtime.setdefault(_KEY, _new_runtime_with_test(timer=5, color=2))
+
+    result = app.dispatch(EnableLedTestMode(key=_KEY, enabled=True))
+
+    assert result.ok is True
+    assert app.settings.for_led(_KEY).test_mode is True
+    assert app.led_runtime[_KEY].test_timer == 0
+    assert app.led_runtime[_KEY].test_color == 0
+
+
+# ── Sensor sources ───────────────────────────────────────────────────
+
+
+def test_set_temp_source_persists(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedTempSource(key=_KEY, source="gpu"))
+    assert result.ok is True
+    assert app.settings.for_led(_KEY).temp_source == "gpu"
+
+
+def test_set_temp_source_rejects_invalid(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedTempSource(key=_KEY, source="ram"))
+    assert result.ok is False
+    assert "ram" in result.message
+    # Unchanged
+    assert app.settings.for_led(_KEY).temp_source == "cpu"
+
+
+def test_set_load_source_persists(tmp_path: Path) -> None:
+    app = _app(tmp_path)
+    result = app.dispatch(SetLedLoadSource(key=_KEY, source="gpu"))
+    assert result.ok is True
+    assert app.settings.for_led(_KEY).load_source == "gpu"
+
+
+# ── Cross-Settings round-trip (save + reload) ───────────────────────
+
+
+def test_led_settings_persist_across_reload(tmp_path: Path) -> None:
+    """Writing through Commands + creating a fresh Settings = same values back."""
+    platform = FakePlatform(tmp_path)
+    app = App(platform=platform)
+    app.dispatch(SetLedMode(key=_KEY, mode=LEDMode.COLORFUL))
+    app.dispatch(SetLedColor(key=_KEY, color=(7, 14, 21)))
+    app.dispatch(SetLedBrightness(key=_KEY, percent=42))
+    app.dispatch(SetLedTempSource(key=_KEY, source="gpu"))
+
+    # Fresh Settings reads from the same config dir
+    reloaded = Settings(FakePaths(tmp_path))
+    led = reloaded.for_led(_KEY)
+    assert led.mode is LEDMode.COLORFUL
+    assert led.color == (7, 14, 21)
+    assert led.brightness == 42
+    assert led.temp_source == "gpu"
+
+
+# ── The LED gate: settings-only Commands refuse a non-LED device (#252) ─
+#
+# Aiming an LED Command at an LCD used to answer "LED color set to #ffffff"
+# with exit 0 and stash LED settings under that LCD's key.  Only the two
+# wire-touching Commands ever checked; these are the settings half.
+#
+# The gate's three-way answer is what makes it safe: the tests ABOVE drive
+# these same Commands against an LED key with nothing attached, so a blunt
+# "not attached -> refuse" would break that real pre-attach flow.
+
+
+_LCD_KEY = "0402:3922"        # Frozen Warframe, SCSI — Kind.LCD in the registry
+_UNKNOWN_KEY = "dead:beef"    # matches no registry row
+
+
+# Every settings-only LED Command + the minimum kwargs to construct it.
+# Parametrizing over the whole set is the point: the bug was 19 Commands
+# missing one check, so a table that grows with the module is the only
+# shape that catches the twentieth.
+_GATED: list = [
+    (SetLedMode, {"mode": LEDMode.RAINBOW}),
+    (SetLedColor, {"color": (1, 2, 3)}),
+    (SetLedBrightness, {"percent": 42}),
+    (EnableLedTestMode, {"enabled": True}),
+    (SetLedTempSource, {"source": "gpu"}),
+    (SetLedLoadSource, {"source": "gpu"}),
+    (ToggleLed, {"on": False}),
+    (SetLedZoneColor, {"zone": 0, "color": (1, 2, 3)}),
+    (SetLedZoneMode, {"zone": 0, "mode": LEDMode.RAINBOW}),
+    (SetLedZoneBrightness, {"zone": 0, "percent": 42}),
+    (SetLedZoneSync, {"enabled": True}),
+    (SetLedZoneSyncInterval, {"ticks": 9}),
+    (SetLedZoneSyncZones, {"zones": (True, False)}),
+    (SelectZone, {"zone": 0}),
+    (SetClockFormat, {"is_24h": False}),
+    (SetWeekStart, {"sunday_first": True}),
+    (SetMemoryRatio, {"ratio": 2}),
+]
+
+_GATED_IDS = [cmd.__name__ for cmd, _ in _GATED]
+
+
+def test_gate_covers_every_settings_only_led_command() -> None:
+    """The table above must list every ungated settings-only LED Command.
+
+    Guards the table against the module growing past it — a new setter that
+    forgets the gate is exactly the #252 bug returning, and it would slip
+    through a table someone forgot to extend.
+    """
+    import inspect
+
+    import trcc.core.commands.led as led_module
+    from trcc.core.commands._base import Command
+
+    expected = set()
+    for obj in vars(led_module).values():
+        if (inspect.isclass(obj) and issubclass(obj, Command)
+                and obj is not Command
+                and obj.__module__ == led_module.__name__):
+            source = inspect.getsource(obj)
+            fields = {f.name for f in dataclasses.fields(obj)}
+            # Settings-only == has a device key, writes Settings, no wire.
+            # SetLedColors / RenderLed keep their own is_led check;
+            # LedSnapshot only reads.
+            if ("key" in fields and "app.settings.set_" in source
+                    and "app.send(" not in source):
+                expected.add(obj.__name__)
+
+    assert expected == set(_GATED_IDS), (
+        "settings-only LED Commands not covered by the #252 gate table: "
+        f"{sorted(expected - set(_GATED_IDS))}"
+    )
+
+
+@pytest.mark.parametrize(("command", "kwargs"), _GATED, ids=_GATED_IDS)
+def test_gated_command_refuses_an_attached_lcd(
+    tmp_path: Path, command, kwargs,
+) -> None:
+    """Attached LCD: the device object answers, and nothing is written."""
+    app = _app(tmp_path)
+    app.attach(0x0402, 0x3922)
+    before = copy.deepcopy(app.settings.for_led(_LCD_KEY))
+
+    result = app.dispatch(command(key=_LCD_KEY, **kwargs))
+
+    assert result.ok is False
+    assert result.message == f"{_LCD_KEY} is not an LED device"
+    assert app.settings.for_led(_LCD_KEY) == before, (
+        "refused command still mutated the LCD's LED settings"
+    )
+
+
+@pytest.mark.parametrize(("command", "kwargs"), _GATED, ids=_GATED_IDS)
+def test_gated_command_refuses_an_unplugged_lcd(
+    tmp_path: Path, command, kwargs,
+) -> None:
+    """Nothing attached: the VID/PID registry still knows it is an LCD."""
+    app = _app(tmp_path)
+    result = app.dispatch(command(key=_LCD_KEY, **kwargs))
+    assert result.ok is False
+    assert result.message == f"{_LCD_KEY} is not an LED device"
+
+
+@pytest.mark.parametrize(("command", "kwargs"), _GATED, ids=_GATED_IDS)
+def test_gated_command_allows_an_unknown_key(
+    tmp_path: Path, command, kwargs,
+) -> None:
+    """Unknown VID/PID is allowed — we cannot prove it is not an LED.
+
+    Refusing here would block configuring a device the registry has not
+    learned yet, to guard against a key nobody has.  The gate answers
+    "no" only when it can point at evidence.
+    """
+    app = _app(tmp_path)
+    result = app.dispatch(command(key=_UNKNOWN_KEY, **kwargs))
+    assert "is not an LED device" not in result.message
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+
+def _new_runtime_with_timer(rgb_timer: int):
+    from trcc.core.led_models import LedRuntimeState
+    return LedRuntimeState(breathe_phase=rgb_timer, colorful_phase=rgb_timer,
+                           rainbow_phase=rgb_timer)
+
+
+def _new_runtime_with_test(*, timer: int, color: int):
+    from trcc.core.led_models import LedRuntimeState
+    return LedRuntimeState(test_timer=timer, test_color=color)
+
+
+# ── LedSnapshot's segment count is the panel's, not a settings list's ─────
+
+
+def _first_pm_per_style() -> list[int]:
+    from trcc.core.led_protocol import _PM_REGISTRY
+
+    first: dict[object, int] = {}
+    for pm, entry in sorted(_PM_REGISTRY.items()):
+        first.setdefault(entry.style, pm)
+    return list(first.values())
+
+
+@pytest.mark.parametrize("pm", _first_pm_per_style())
+def test_a_fresh_leds_snapshot_counts_its_panels_segments(
+    fake_platform: FakePlatform, pm: int,
+) -> None:
+    """``segment_count`` was the length of a clicked-segment list (since
+    deleted) that nothing filled, so `trcc led snapshot` and `led-debug` said
+    "segments 0" for every fresh device.  It is the style's display now --
+    the source ListLedStyles already used."""
+    from trcc.core.commands import LedSnapshot
+    from trcc.services.led_segment import get_display
+
+    from .conftest import _CliRenderer
+    from .test_render_led import _LED_KEY, _attach_and_connect
+
+    app = App(fake_platform, renderer=_CliRenderer())  # type: ignore[arg-type]
+    _attach_and_connect(app, fake_platform, pm=pm)
+    style = app.get(_LED_KEY).led_handshake.style  # type: ignore[attr-defined]
+    display = get_display(style)
+
+    snap = app.dispatch(LedSnapshot(key=_LED_KEY))
+
+    assert snap.segment_count == (display.mask_size if display else 0)
+
+
+def test_an_unattached_leds_snapshot_counts_no_segments(tmp_path: Path) -> None:
+    from trcc.core.commands import LedSnapshot
+
+    assert _app(tmp_path).dispatch(LedSnapshot(key="0416:8001")).segment_count == 0
+
+
+# ── LedSnapshot carries per-zone state, not just a zone COUNT ─────────────
+#
+# ``zone_count`` said how many zones exist with no way to ask what any of
+# them IS, so the gui kept reading ``settings.for_led`` directly — an
+# AttributeError under TRCC_DAEMON=1, where a UI holds an AppProxy.
+
+
+def test_led_snapshot_reports_each_zones_own_state(tmp_path: Path) -> None:
+    """The snapshot round-trips per-zone mode / color / brightness / on."""
+    from trcc.core.commands import LedSnapshot, SetLedZoneColor, SetLedZoneMode
+    from trcc.core.led_models import LEDMode
+
+    app = _app(tmp_path)
+    key = "0416:1234"
+    # Zones must exist before one can be written — the setters range-check.
+    app.settings.set_led_zone_count(key, 2)
+    app.dispatch(SetLedZoneMode(key=key, zone=0, mode=LEDMode.BREATHING))
+    app.dispatch(SetLedZoneColor(key=key, zone=0, color=(10, 20, 30)))
+
+    snap = app.dispatch(LedSnapshot(key=key))
+
+    assert snap.ok is True
+    assert len(snap.zones) == snap.zone_count
+    assert snap.zones, "zone written but the snapshot reported none"
+    # Spelled by NAME, matching LedSnapshotResult.mode — one fact, one spelling.
+    assert snap.zones[0].mode == LEDMode.BREATHING.name
+    assert LEDMode[snap.zones[0].mode] is LEDMode.BREATHING
+    assert snap.zones[0].color == (10, 20, 30)
+
+
+def test_led_snapshot_reports_the_carousel_mask(tmp_path: Path) -> None:
+    """``zone_sync_zones`` is the carousel's source of truth — page styles
+    never populate ``zones``, so the mask has to ride separately."""
+    from trcc.core.commands import LedSnapshot, SetLedZoneSyncZones
+
+    app = _app(tmp_path)
+    key = "0416:1234"
+    app.dispatch(SetLedZoneSyncZones(key=key, zones=[True, False, True]))
+
+    snap = app.dispatch(LedSnapshot(key=key))
+
+    assert snap.zone_sync_zones == (True, False, True)
+    assert isinstance(snap.zone_sync_zones, tuple), "a frozen Result holds tuples"
+
+
+def test_a_saved_segment_mask_from_an_older_version_is_dropped() -> None:
+    """``segment_on`` was a setting until 2026-10-07 (it reached neither the
+    render nor the wire).  An older trcc.json still carries it; loading must
+    not choke on it, and the next save leaves it out."""
+    import dataclasses
+
+    from trcc.services.settings import _led_settings_from_dict
+
+    loaded = _led_settings_from_dict({"segment_on": [True, False], "mode": 2})
+
+    assert "segment_on" not in dataclasses.asdict(loaded)
+
+
+def test_the_carousel_interval_counts_like_the_csharp() -> None:
+    """``ValCount >= 6 * textBoxTimer`` per 150 ms tick (FormLED.cs:3489).
+
+    The gui converted at 1000/150 = 6.67 ticks per unit and the default was
+    13 where the C#'s "2" is 12.  A stored 13 still reads back as 2.
+    MUTATION CHECK: set ``ZONE_SYNC_TICKS_PER_UNIT`` to 1000/150 → fails.
+    """
+    from trcc.core.led_models import (
+        LedDeviceSettings,
+        zone_sync_ticks,
+        zone_sync_units,
+    )
+
+    assert (zone_sync_ticks(2), zone_sync_ticks(10)) == (12, 60)
+    assert LedDeviceSettings().zone_sync_interval_ticks == 12
+    assert (zone_sync_units(12), zone_sync_units(13), zone_sync_units(1)) == (2, 2, 1)
+
+
+def test_the_gui_sends_the_carousel_interval_in_csharp_ticks() -> None:
+    """The gui's box shows the C# unit; 2 in it is 12 ticks, not 13.
+
+    MUTATION CHECK: put back ``int(secs * 1000 / 150)`` → this fails.
+    """
+    from types import SimpleNamespace
+
+    from trcc.ui.gui.led_handler import LEDHandler
+
+    sent: list = []
+    fake = SimpleNamespace(_device_key="0416:8001", _dispatch=sent.append)
+    LEDHandler._on_carousel_interval_changed(fake, 2)  # type: ignore[arg-type]
+
+    assert sent == [SetLedZoneSyncInterval(key="0416:8001", ticks=12)]

@@ -1,0 +1,334 @@
+"""DeviceSender + SendScheduler — the per-device send worker (foundation incr 1).
+
+Policy is tested deterministically through ``SyncSendScheduler`` (a controlled
+clock, no sleeps); one thread test proves the single-consumer serialization
+that the whole design rests on.  See ``doc/SEND_FOUNDATION.md``.
+"""
+from __future__ import annotations
+
+import threading
+import time
+
+import pytest
+
+from trcc.adapters.infra.send_scheduler import (
+    SyncSendScheduler,
+    ThreadSendScheduler,
+)
+from trcc.services.device_sender import DeviceSender
+
+
+class FakeDevice:
+    """Minimal device double — records sends, detects concurrent entry."""
+
+    def __init__(self, key: str = "dead:beef") -> None:
+        self.key = key
+        self.is_connected = True
+        self.sent: list[bytes] = []
+        self.fail = False
+        self._in_send = 0
+        self.max_concurrent = 0
+        self._lk = threading.Lock()
+
+    def send(self, payload: bytes) -> bool:
+        with self._lk:
+            self._in_send += 1
+            self.max_concurrent = max(self.max_concurrent, self._in_send)
+        try:
+            if self.fail:
+                return False
+            self.sent.append(payload)
+            return True
+        finally:
+            with self._lk:
+                self._in_send -= 1
+
+
+# ── Policy (deterministic, no threads) ───────────────────────────────────
+
+
+def test_submit_writes_latest_on_run_once() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sender.submit(b"A")
+    sender.run_once(0.0)
+    assert dev.sent == [b"A"]
+    assert sender.last() == b"A"
+
+
+def test_latest_wins_coalescing() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sender.submit(b"A")
+    sender.submit(b"B")          # no run_once between — A is superseded
+    sender.run_once(0.0)
+    assert dev.sent == [b"B"]
+
+
+def test_volatile_keepalive_resends_when_idle() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=True, keepalive_interval=0.150)
+    sender.submit(b"F")
+    sender.run_once(0.0)         # initial frame at t=0
+    sender.run_once(0.0)         # idle 0s → no resend
+    sender.run_once(0.150)       # idle 150ms → resend
+    sender.run_once(0.300)       # → resend again
+    assert dev.sent == [b"F", b"F", b"F"]
+
+
+def test_volatile_keepalive_resets_on_new_frame() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=True, keepalive_interval=0.150)
+    sender.submit(b"F1")
+    sender.run_once(0.0)
+    sender.submit(b"F2")
+    sender.run_once(0.100)       # new frame (idle gate bypassed by pending)
+    sender.run_once(0.200)       # 100ms since F2 → not yet
+    sender.run_once(0.250)       # 150ms since F2 → keepalive F2
+    assert dev.sent == [b"F1", b"F2", b"F2"]
+
+
+def test_nonvolatile_never_keepalives() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sender.submit(b"F")
+    sender.run_once(0.0)
+    for t in (0.150, 10.0, 100.0):
+        sender.run_once(t)
+    assert dev.sent == [b"F"]
+
+
+def test_no_frame_no_last_does_nothing() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=True)
+    sender.run_once(0.0)
+    sender.run_once(0.5)
+    assert dev.sent == []
+
+
+def test_failed_send_not_cached_as_last() -> None:
+    dev = FakeDevice()
+    dev.fail = True
+    sender = DeviceSender(dev, volatile=True)
+    sender.submit(b"F")
+    sender.run_once(0.0)
+    assert sender.last() is None
+    sender.run_once(0.5)         # nothing to keepalive (no successful last)
+    assert dev.sent == []
+
+
+def test_run_once_returns_keepalive_interval_for_volatile() -> None:
+    assert DeviceSender(
+        FakeDevice(), volatile=True, keepalive_interval=0.2,
+    ).run_once(0.0) == 0.2
+
+
+def test_run_once_returns_long_idle_for_nonvolatile() -> None:
+    assert DeviceSender(FakeDevice(), volatile=False).run_once(0.0) >= 60.0
+
+
+# ── SyncSendScheduler registry ───────────────────────────────────────────
+
+
+def test_sync_scheduler_drives_and_removes() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sched = SyncSendScheduler()
+    sched.add(sender)
+    sender.submit(b"X")
+    sched.tick(0.0)
+    assert dev.sent == [b"X"]
+    sched.remove(sender.key)
+    sender.submit(b"Y")
+    sched.tick(1.0)
+    assert dev.sent == [b"X"]     # removed → no longer driven
+
+
+def test_a_waiting_send_under_the_sync_scheduler_is_served_at_once() -> None:
+    """No worker thread exists, so the waiter runs the write itself: the
+    device's real answer, now -- not ``False`` after the whole timeout.
+    Before, every ``App.close`` in the suite sat out 5 s per connected device
+    blanking it (2026-10-10: ~20 tests at 5.2 s, teardowns at 10.0 s).
+
+    MUTATION CHECK: drop ``task.runs_on_caller()`` from
+    ``SyncSendScheduler.add`` -- the send times out and this fails.
+    """
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    SyncSendScheduler().add(sender)
+    started = time.monotonic()
+    assert sender.submit(b"X", wait=True, timeout=2.0) is True
+    dev.fail = True
+    assert sender.submit(b"Y", wait=True, timeout=2.0) is False   # its answer
+    assert time.monotonic() - started < 1.0
+    assert dev.sent == [b"X"]
+
+
+def test_a_waiting_send_under_the_sync_scheduler_raises_the_wire_error() -> None:
+    class Boom(FakeDevice):
+        def send(self, payload: bytes) -> bool:
+            raise RuntimeError("wire boom")
+
+    sender = DeviceSender(Boom(), volatile=False)
+    SyncSendScheduler().add(sender)
+    with pytest.raises(RuntimeError, match="wire boom"):
+        sender.submit(b"X", wait=True, timeout=2.0)
+
+
+# ── ThreadSendScheduler: the single-consumer guarantee ───────────────────
+
+
+def test_thread_scheduler_serializes_concurrent_producers() -> None:
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=True, keepalive_interval=0.01)
+    sched = ThreadSendScheduler()
+    sched.add(sender)
+    try:
+        def hammer(tag: str) -> None:
+            for i in range(200):
+                sender.submit(f"{tag}-{i}".encode())
+
+        producers = [threading.Thread(target=hammer, args=(t,))
+                     for t in ("a", "b", "c", "d")]
+        for p in producers:
+            p.start()
+        for p in producers:
+            p.join()
+        time.sleep(0.1)           # let the single consumer drain + keepalive
+    finally:
+        sched.shutdown()
+    # The whole design rests on this: one scheduler thread per task ⇒ the
+    # device write is never re-entered, no matter how many producers submit.
+    assert dev.max_concurrent == 1
+    assert len(dev.sent) >= 1
+
+
+def test_submit_wait_returns_device_result() -> None:
+    # wait=True needs a running scheduler thread to process + report back.
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sched = ThreadSendScheduler()
+    sched.add(sender)
+    try:
+        assert sender.submit(b"X", wait=True, timeout=2.0) is True
+        assert dev.sent == [b"X"]
+        dev.fail = True
+        assert sender.submit(b"Y", wait=True, timeout=2.0) is False
+    finally:
+        sched.shutdown()
+
+
+def test_submit_wait_propagates_device_exception() -> None:
+    # A wire exception must reach the wait=True caller's thread so the
+    # dispatching Command's `except TransportError` keeps working unchanged.
+    class Boom(FakeDevice):
+        def send(self, payload: bytes) -> bool:
+            raise RuntimeError("wire boom")
+
+    sender = DeviceSender(Boom(), volatile=False)
+    sched = ThreadSendScheduler()
+    sched.add(sender)
+    try:
+        with pytest.raises(RuntimeError, match="wire boom"):
+            sender.submit(b"X", wait=True, timeout=2.0)
+    finally:
+        sched.shutdown()
+
+
+def test_fire_and_forget_failure_calls_on_failure() -> None:
+    # No waiter to raise to (wait=False), so the failure routes to on_failure.
+    dev = FakeDevice()
+    dev.fail = True
+    calls: list[tuple[str, BaseException | None]] = []
+
+    def on_fail(key: str, exc: BaseException | None) -> None:
+        calls.append((key, exc))
+
+    sender = DeviceSender(dev, volatile=True, on_failure=on_fail)
+    sender.submit(b"F")          # wait=False
+    sender.run_once(0.0)         # device.send returns False → on_failure(None)
+    assert calls == [("dead:beef", None)]
+
+
+def test_keepalive_failure_routes_to_on_failure() -> None:
+    dev = FakeDevice()
+    calls: list[tuple[str, BaseException | None]] = []
+
+    def on_fail(key: str, exc: BaseException | None) -> None:
+        calls.append((key, exc))
+
+    sender = DeviceSender(dev, volatile=True, keepalive_interval=0.1,
+                          on_failure=on_fail)
+    sender.submit(b"F")
+    sender.run_once(0.0)         # cache the frame OK
+    dev.fail = True
+    sender.run_once(0.1)         # keepalive resend fails → on_failure
+    assert calls == [("dead:beef", None)]
+
+
+def test_exclusive_blocks_worker_writes() -> None:
+    # A multi-frame upload (boot anim) holds the wire exclusively; the
+    # keepalive worker must not interleave a write into it.
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=True, keepalive_interval=0.005)
+    sched = ThreadSendScheduler()
+    sched.add(sender)
+    try:
+        sender.submit(b"F")          # establish a frame to keepalive
+        time.sleep(0.03)             # let the worker start keepaliving
+        with sender.exclusive():
+            for i in range(30):      # simulate the upload's direct wire writes
+                dev.send(f"boot-{i}".encode())
+        assert dev.max_concurrent == 1
+    finally:
+        sched.shutdown()
+
+
+def test_thread_scheduler_shutdown_is_prompt_for_idle_nonvolatile() -> None:
+    # Non-volatile task waits ~forever; wake() must let shutdown join fast.
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+    sched = ThreadSendScheduler()
+    sched.add(sender)
+    start = time.monotonic()
+    sched.shutdown()
+    assert time.monotonic() - start < 1.0
+
+
+def test_a_failing_run_is_reported_once_then_again_after_a_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A dead panel fails every frame; the log hears about the run, not each one.
+
+    MUTATION CHECK: drop the ``_failing`` guard in ``_fail`` and the three
+    failures in a row log three warnings.
+    """
+    import logging
+
+    dev = FakeDevice()
+    sender = DeviceSender(dev, volatile=False)
+
+    def frame(now: float) -> None:
+        sender.submit(b"F")
+        sender.run_once(now)
+
+    def warnings() -> list[str]:
+        return [r.getMessage() for r in caplog.records
+                if r.levelno == logging.WARNING
+                and r.name == "trcc.services.device_sender"]
+
+    with caplog.at_level(logging.INFO):
+        dev.fail = True
+        for now in (1.0, 2.0, 3.0):
+            frame(now)
+        assert warnings() == [
+            "DeviceSender dead:beef: device.send returned False (frame)",
+            "DeviceSender dead:beef: frame write returned False",
+        ]
+        dev.fail = False
+        frame(4.0)
+        dev.fail = True
+        frame(5.0)
+
+    assert len(warnings()) == 4, "a new run after a success is reported again"
+    assert "DeviceSender dead:beef: writing again (frame)" in caplog.messages

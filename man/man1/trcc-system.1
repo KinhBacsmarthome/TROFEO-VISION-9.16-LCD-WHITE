@@ -1,0 +1,688 @@
+.TH "TRCC\-SYSTEM" "1" "" "trcc\-linux 9.10.9" "TRCC Manual"
+.SH NAME
+trcc\-system \- System\-level operations (setup, sensors, info)
+.SH SYNOPSIS
+\fBtrcc system\fR \fISUBCOMMAND\fR [\fIARGS\fR]...
+.SH DESCRIPTION
+System\-level operations (setup, sensors, info).
+.SH SUBCOMMANDS
+.SS aura\-leds
+.PP
+\fBtrcc system aura\-leds\fR \fIHEADER\fR \fILEDS\fR
+.PP
+Say how many LEDs an ASUS Aura ARGB header drives. The board cannot tell: the header's data line runs one way. The board is read again after, so the new count is listed.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBHEADER\fR
+The ARGB header, from 1 (see trcc system rgb).
+.TP
+\fBLEDS\fR
+How many LEDs it drives.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS autostart
+.PP
+Manage auto\-launch\-on\-login (XDG .desktop on Linux).
+.SS autostart disable
+.PP
+\fBtrcc system autostart disable\fR
+.PP
+Remove the autostart entry.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS autostart enable
+.PP
+\fBtrcc system autostart enable\fR [\fIOPTIONS\fR]
+.PP
+Install the autostart entry (per\-user, no sudo required). All four UIs can start at login; without \-\-target the entry launches the gui, which is what it always did.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-target, \-t \fITARGET\fR\fR
+Which UI starts with the computer (api, daemon, gui, qtgui). Default: gui.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS autostart refresh
+.PP
+\fBtrcc system autostart refresh\fR
+.PP
+Re\-render an existing entry so it picks up a new launch path. The repair for a moved install (#201): an entry written by an older install keeps its old Exec= forever. Does NOT enable autostart  \-  with no entry installed it reports so and changes nothing.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS autostart status
+.PP
+\fBtrcc system autostart status\fR
+.PP
+Show whether auto\-launch\-on\-login is enabled.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS check\-update
+.PP
+\fBtrcc system check\-update\fR
+.PP
+Ask GitHub Releases whether a newer version is available.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard
+.PP
+\fBtrcc system dashboard\fR [\fIOPTIONS\fR]
+.PP
+Print the sensor\-dashboard layout  \-  panels, rows and their bindings. The grid the GUI's System Info screen edits, stored at <config_dir>/system_config.json. Unbound rows render as \-\- in the GUI and are shown here as <unbound>: the row's target sensor does not exist on this machine (no DDR5 SPD temp, no SMART disk temp, fewer fan headers than slots). Reading is non\-destructive  \-  auto\-mapping is recomputed every time and NOT written back, so the layout heals itself when hardware changes. Pass \-\-save\-auto\-map to freeze what you see.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-save\-auto\-map\fR
+Persist the auto\-mapped bindings instead of only showing them.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-add
+.PP
+\fBtrcc system dashboard\-add\fR [\fIOPTIONS\fR]
+.PP
+Add an empty custom panel to the sensor dashboard. Four unbound rows, ready for dashboard\-bind. What a new panel IS lives on the model, so this, the GUI and qtgui all add the same thing.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-name \fINAME\fR\fR
+Panel name.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-bind
+.PP
+\fBtrcc system dashboard\-bind\fR \fIINDEX\fR \fIROW\fR \fISENSOR_ID\fR
+.PP
+Bind one dashboard row to a sensor. The sensor must exist on this machine  \-  the GUIs bind by picking from a list and cannot name one that does not, so neither can this. The unit comes from the sensor rather than the caller, for the same reason.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.TP
+\fBROW\fR
+Row within the panel (0\-based).
+.TP
+\fBSENSOR_ID\fR
+Sensor id from list\-sensors.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-delete
+.PP
+\fBtrcc system dashboard\-delete\fR \fIINDEX\fR
+.PP
+Delete a panel from the sensor dashboard. Deleting the only panel is refused  \-  an empty layout would make the next read fall back to defaults, a wipe dressed up as a write.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS dashboard\-rename
+.PP
+\fBtrcc system dashboard\-rename\fR \fIINDEX\fR \fINAME\fR
+.PP
+Rename a sensor\-dashboard panel.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBINDEX\fR
+Panel index from dashboard.
+.TP
+\fBNAME\fR
+The new panel name.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS debug\-report
+.PP
+\fBtrcc system debug\-report\fR [\fIOPTIONS\fR]
+.PP
+Generate a debug report bundle for GitHub issues.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-output, \-o \fIOUTPUT\fR\fR
+Write the report to this path instead of stdout. Recommended when filing a GitHub issue  \-  attach the file.
+.TP
+\fB\-\-log\-lines \fILOG_LINES\fR\fR
+How many trailing log lines to include (default 1000).
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS doctor
+.PP
+\fBtrcc system doctor\fR
+.PP
+Run health checks  \-  exits 1 on any FAIL. The reporter\-friendly summary tells you what's wrong + how to fix it. For a copy\-paste GitHub\-issue dump, use system debug\-report instead.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS download
+.PP
+\fBtrcc system download\fR \fIWIDTH\fR \fIHEIGHT\fR
+.PP
+Pre\-fetch the theme + cloud + mask archives for a resolution. DiscoverDevices runs this implicitly the first time a device of a given resolution attaches. Call it directly to populate the local cache while you have network  \-  handy for headless setups that'll later run offline. Idempotent.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBWIDTH\fR
+Display width (px), e.g. 320
+.TP
+\fBHEIGHT\fR
+Display height (px), e.g. 320
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS first\-run\-status
+.PP
+\fBtrcc system first\-run\-status\fR
+.PP
+Show whether trcc has been set up on this machine yet.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS follow
+.PP
+\fBtrcc system follow\fR [\fIMODE\fR] [\fIOPTIONS\fR]
+.PP
+Make other RGB follow the LED cooler's colours \-\- or an LCD's picture (#160). 'openrgb': TRCC connects to OpenRGB's SDK server \-\- start it in OpenRGB's SDK Server tab \-\- and sends the cooler's colours to every OpenRGB device, in OpenRGB's direct mode. 'ram': TRCC sends them to Corsair RGB memory itself, with no OpenRGB \-\- close OpenRGB first, so the two never drive the same sticks. 'off' stops.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBMODE\fR
+\&'off', 'openrgb', 'ram' or 'status'
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-host \fIHOST\fR\fR
+OpenRGB's SDK server (default: the saved one, 127.0.0.1 at first).
+.TP
+\fB\-\-port \fIPORT\fR\fR
+Its port (default: the saved one, 6742 at first).
+.TP
+\fB\-\-source \fISOURCE\fR\fR
+The device that leads: an LCD's key (e.g. 0402:3922) to follow its picture, or '' for the first LED cooler. Default: the saved one.
+.TP
+\fB\-\-mapping \fIMAPPING\fR\fR
+An LCD's picture on the followers: 'halves' (left to the first, right to the second) or 'single' (one colour each). Default: the saved one.
+.TP
+\fB\-\-colors \fICOLORS\fR\fR
+How a region of an LCD's picture becomes a light's colour: 'vivid' (its brightest pixels \-\- small bright details show) or 'smooth' (its average \-\- steadier). Default: the saved one, vivid at first.
+.TP
+\fB\-\-target \fITARGET\fR\fR
+A light that follows (a stick's 'i2c\-3/0x19', an OpenRGB device's name); repeat for more. '\-\-target all' for every one. Default: the saved ones.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS hdd\-enabled
+.PP
+\fBtrcc system hdd\-enabled\fR \fISTATE\fR
+.PP
+Toggle inclusion of HDD metrics in sensor broadcasts.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBSTATE\fR
+\&'on' or 'off'
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS health
+.PP
+\fBtrcc system health\fR
+.PP
+Quick read\-only health report  \-  same checks as doctor, no exit code.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS hid\-debug
+.PP
+\fBtrcc system hid\-debug\fR \fIKEY\fR
+.PP
+Connect to *key* + print handshake details for a GitHub issue paste. Composes ConnectDevice (returns handshake bytes + parsed resolution / model id / serial) and LcdSnapshot to dump the persisted state. Output is plain text  \-  copy + paste\-friendly.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+Device key, e.g. 0402:3922
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS info
+.PP
+\fBtrcc system info\fR [\fIOPTIONS\fR]
+.PP
+Show current sensor metrics (CPU/GPU/fan/disk/net readings). Mirrors legacy trcc info  \-  dispatches ReadSensors and prints each reading. Use \-\-metric <prefix> to narrow the output; pass no args for everything. For paths / install info / permissions, see trcc system platform\-info.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-metric, \-m \fIMETRIC\fR\fR
+Filter readings whose sensor_id startswith this prefix (e.g. cpu, gpu, mem, disk, net, fan, time).
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS lang
+.PP
+\fBtrcc system lang\fR
+.PP
+Print the currently\-active UI language code. Read\-only  \-  for "what language is TRCC in right now?" without digging through snapshot. Use set\-language to change it.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS led\-debug
+.PP
+\fBtrcc system led\-debug\fR \fIKEY\fR [\fIOPTIONS\fR]
+.PP
+LED device handshake + zone/segment dump + optional test cycle. Composes ConnectDevice and LedSnapshot for a one\- shot diagnostic. Pass \-\-test\-colors to cycle the device's test pattern so you can confirm wire\-up visually.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBKEY\fR
+LED device key, e.g. 0416:8001
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-test\-colors\fR
+After handshake, enable the 4\-color test cycle (Ctrl\-C to stop).
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-disk\-sensors
+.PP
+\fBtrcc system list\-disk\-sensors\fR
+.PP
+List drive THERMAL sensors  \-  the list disk_temp comes from. Not the same as 'list\-disks', which enumerates mounted partitions and shares no key with this list. Pick one of these with 'trcc config disk'.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-disks
+.PP
+\fBtrcc system list\-disks\fR
+.PP
+List mounted partitions  \-  NOT the drive list disk_temp comes from.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-endpoints
+.PP
+\fBtrcc system list\-endpoints\fR
+.PP
+Enumerate every HTTP route the REST API exposes. Builds the FastAPI app (no uvicorn) and walks its router so the output reflects what trcc api / trcc serve would serve. Routes only, no App: build_app() bare found or STARTED the shared App \-\- USB and all \-\- to print a list.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-fans
+.PP
+\fBtrcc system list\-fans\fR
+.PP
+List fans the sensors aggregator exposes, with live readings. Read\-only diagnostic (#145/#207)  \-  snapshot() maps fans to theme slots automatically (GPU slot follows the picked GPU); this shows what the box exposes.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-fonts
+.PP
+\fBtrcc system list\-fonts\fR
+.PP
+List font families Qt can see.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-gpus
+.PP
+\fBtrcc system list\-gpus\fR
+.PP
+List GPUs exposed by the sensors aggregator.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-languages
+.PP
+\fBtrcc system list\-languages\fR
+.PP
+List every UI language the i18n table supports.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS list\-sensors
+.PP
+\fBtrcc system list\-sensors\fR
+.PP
+Print every sensor the platform enumerates  \-  descriptors only. Read\-only enumeration: no polling, no values. Pair with system sensors (or system info \-\-metric <prefix>) when you want the current readings instead.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS mark\-setup\-done
+.PP
+\fBtrcc system mark\-setup\-done\fR
+.PP
+Tell trcc the welcome flow has been completed.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS memory\-slots
+.PP
+\fBtrcc system memory\-slots\fR
+.PP
+List DRAM slots  \-  size/type/speed/manufacturer, plus timings on Linux. Timings (tCAS/tRCD/tRP/tRAS/tRC/tRFC) come from SPD + the live memory controller and are Linux\-only today; other platforms show NC. This is what the LC1\-style memory panel renders, and it is worth pasting into a bug report about that panel.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS paths
+.PP
+\fBtrcc system paths\fR [\fIOPTIONS\fR]
+.PP
+Show where this install keeps config, data, logs and user content. Answers "where did my theme go?" and "which log do I attach to an issue?" without the user guessing at ~/.trcc versus ~/.trcc\-user. With \-\-key the answer is that device's: the resolution comes from its handshake (oriented) and the theme/cloud dirs name its per\-SKU library, so the output points at the directories the app actually opens for it.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-resolution, \-r \fIRESOLUTION\fR\fR
+WxH (e.g. 854x480)  \-  also show the per\-resolution theme/mask dirs
+.TP
+\fB\-\-key, \-k \fIKEY\fR\fR
+Device key (e.g. 0402:3922)  \-  use that cooler's own artwork libraries, and its resolution when \-\-resolution is omitted
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS platform\-info
+.PP
+\fBtrcc system platform\-info\fR
+.PP
+Show platform info (distro, install method, config dir, permissions).
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS ram\-effect
+.PP
+\fBtrcc system ram\-effect\fR \fIEFFECT\fR [\fIOPTIONS\fR]
+.PP
+Save one of the memory's own effects on the sticks. The stick keeps it after TRCC closes and through a reboot. If the RAM was following a device, following turns off first.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBEFFECT\fR
+The effect to save on the RAM.
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-stick \fISTICK\fR\fR
+A stick by ref (see trcc system rgb); repeat for more. Default: every stick.
+.TP
+\fB\-\-speed \fISPEED\fR\fR
+(no description)
+.TP
+\fB\-\-direction \fIDIRECTION\fR\fR
+(no description)
+.TP
+\fB\-\-color \fICOLOR\fR\fR
+R,G,B; repeat for a second colour.
+.TP
+\fB\-\-random\fR
+Let the stick pick the colours.
+.TP
+\fB\-\-brightness \fIBRIGHTNESS\fR\fR
+(no description)
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS ram\-lighting
+.PP
+\fBtrcc system ram\-lighting\fR [\fIACTION\fR]
+.PP
+Let TRCC reach RGB memory's lighting \-\- opt\-in, asks for a password. RGB memory's lighting chips sit on the motherboard's SMBus, beside the chips that hold the memory's own settings. Linux can only open the whole bus, so enabling lets programs you run reach all of it, not just TRCC. Only the person logged in at this computer gets access, and only that bus. 'disable' removes it completely. It lasts across reboots. Your desktop asks for the password; the answer comes when you type it or close the prompt.
+.PP
+Arguments:
+.RS 4
+.TP
+\fBACTION\fR
+\&'enable', 'disable' or 'status'
+.RE
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS rgb
+.PP
+\fBtrcc system rgb\fR [\fIOPTIONS\fR]
+.PP
+The RGB lights TRCC can drive or hand colours to.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-scan\fR
+Look for the lights first: RGB memory on the SMBus, and OpenRGB's devices.
+.TP
+\fB\-\-host \fIHOST\fR\fR
+With \-\-scan: look for OpenRGB here, and save it (default: the saved one, 127.0.0.1 at first).
+.TP
+\fB\-\-port \fIPORT\fR\fR
+With \-\-scan: OpenRGB's port (default: the saved one, 6742 at first).
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS sensors
+.PP
+\fBtrcc system sensors\fR
+.PP
+Print current sensor readings.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS setup
+.PP
+\fBtrcc system setup\fR [\fIOPTIONS\fR]
+.PP
+Run the OS\-specific setup (udev rules on Linux, WinUSB guide on Windows). Applies by default  \-  this is the documented first\-run step, so making it refuse without a flag would put a wall in front of onboarding. \-\-dry\-run is the only way to not apply. \-\-yes used to mean the opposite of what it said. It was wired to the platform's interactive flag, where False meant "change nothing", so trcc system setup \-\-yes PREVIEWED the udev rules instead of writing them and then reported success  \-  and the user hit permission errors on a device the setup had told them was configured (#285). It is kept and now simply means "apply", which is what anyone passing it intended; there is no confirmation of our own to skip, and the sudo password prompt is not something a flag here can or should suppress.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-yes, \-y\fR
+Apply the changes without confirming
+.TP
+\fB\-\-dry\-run\fR
+Show what would be done, change nothing
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS snapshot
+.PP
+\fBtrcc system snapshot\fR [\fIOPTIONS\fR]
+.PP
+Print the AppSettings snapshot (language, GPU, refresh interval).
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-json\fR
+Emit JSON instead of human text.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SS upgrade
+.PP
+\fBtrcc system upgrade\fR [\fIOPTIONS\fR]
+.PP
+Print the command that upgrades this TRCC install.
+.PP
+Options:
+.RS 4
+.TP
+\fB\-\-yes, \-y\fR
+Accepted for older scripts; nothing is run.
+.TP
+\fB\-\-dry\-run\fR
+Accepted for older scripts; nothing is run.
+.TP
+\fB\-\-help\fR
+Show this command's help and exit.
+.RE
+.SH SEE ALSO
+\fBtrcc\fR(1)
+.SH REPORTING BUGS
+Report bugs at \fBhttps://github.com/Lexonight1/thermalright-trcc-linux/issues\fR \(em include the output of \fBtrcc report\fR.
+.SH AUTHOR
+TRCC Linux contributors. Unofficial community project, not affiliated with Thermalright.

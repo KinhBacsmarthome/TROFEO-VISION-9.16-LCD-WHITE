@@ -1,0 +1,67 @@
+# Send/Output Foundation — tracker
+
+The per-device send-worker (actor) that owns each device's USB wire. This file
+is the **scoreboard** for the work: every row stays here until it's `DONE` on a
+verified run. Deferrals are rows with a **trigger**, never a sentence in a chat
+that scrolls away. (Why this file exists: "not now" with no home becomes
+"never" — that's how the cutover dropped working capabilities.)
+
+## Why
+- Device sends are unserialized across two threads today (main: GUI/video;
+  `trcc-metrics` bg: `_DeviceRenderObserver` → `RenderAndSend` → `device.send`).
+  No lock on `Device.send` / `App.dispatch` / any adapter.
+- Bulk/LY firmware reverts to the logo after ~2-3 s without a fresh frame
+  (`KeepaliveService` + `KeepAliveLoop` exist but nothing auto-runs them; static
+  themes rely on the ~2 s metrics cadence — too slow).
+- Both are dropped legacy capabilities (audit: *async send-worker
+  `send_*_async`/`is_busy`/`stop_send_worker` MISSING*; *`_sending` concurrency
+  guard MISSING*).
+
+## Design (locked)
+Separate **policy** from **execution**, inject execution (the codebase's own
+idiom: `SlideshowService` = pure cursor, `make_timer`/`MetricsLoop` = driver).
+
+| Layer | Component | Depends on | Responsibility |
+|---|---|---|---|
+| core / port | `SendTask` ABC (`ports.py`) | — | unit of work the scheduler drives (`run_once(now)`, `wait`, `key`) |
+| core / port | `SendScheduler` ABC (`ports.py`) | `SendTask` | execution abstraction (`add`/`remove`/`shutdown`) |
+| services | `DeviceSender(SendTask)` (`services/device_sender.py`) | `Device` port | serialize writes · cache last · keepalive policy. Told `volatile=bool` (no Wire knowledge) |
+| adapters/infra | `ThreadSendScheduler`, `SyncSendScheduler` (`adapters/infra/send_scheduler.py`) | `SendTask` | thread-per-task / deterministic manual tick |
+| composition | `App` | both ports | sender registry, inject scheduler, lifecycle |
+
+Serialization is by construction: **one scheduler thread per task = single
+consumer of `device.send`** — no wire lock needed. The inbox lock only guards
+the latest-wins slot.
+
+## Phase 1 — the foundation (all of it; nothing here is deferred)
+
+| # | Increment | Status | Verify |
+|---|---|---|---|
+| 1 | `SendTask`+`SendScheduler` ports; `DeviceSender` (serialize·cache·keepalive, `volatile` flag); `ThreadSendScheduler`+`SyncSendScheduler`; unit tests (Sync, no sleeps) + a thread no-interleave test | **DONE** 2026-06-04 — `ports.py`, `services/device_sender.py`, `adapters/infra/send_scheduler.py`, `tests/test_device_sender.py` (12 tests); ruff/pyright clean, suite 1242 | ✓ |
+| 2 | `App.senders` registry + `App.send(key,payload,*,wait)` facade + lifecycle (create/start `ConnectDevice`; stop/drop `detach`/`close`); `ThreadSendScheduler` default-injected; `VOLATILE_FRAME_WIRES`+`Device.needs_keepalive`; `submit(wait=)` semantics (absorbed old #4) | **DONE** 2026-06-04 — `app.py`, `models.py`, `ports.py`, `commands/device.py`, `tests/test_app_senders.py`; suite 1246 | ✓ |
+| 3 | Reroute the 8 wire-write sites → `app.send` (**all `wait=True`** for now — preserves every caller's synchronous result + error handling via exception-propagating `submit`; no worse than today's sync latency). Writes now flow through the workers | **DONE** 2026-06-04 — 8 sites in `device.py`/`theme.py`/`led.py`/`system.py`; `submit` relays wire exceptions; LED test helper starts a sender; suite 1247 | ✓ |
+| 4 | ~~Actor submit semantics~~ — **folded into #2** (`submit(wait=)`) | **DONE** (in #2) | — |
+| 5 | Intrinsic keepalive verified end-to-end (volatile resend @150ms, reset on new frame) | **DONE** 2026-06-04 — `dev/smoke_keepalive.py`: Bulk +7 / SCSI +0; mock GUI headless no tracebacks | ✓ |
+| 6 | Absorb `KeepaliveService` into the sender (one owner of "last frame"); `KeepAliveLoop` + CLI `display keepalive` + API `/keepalive` become thin wrappers (`count>=1` confirms, `count=0` blocks); `keepalive.py` deleted | **DONE** 2026-06-04 — removed service + 4 `store` calls + `forget`; reworked `KeepAliveLoop`; suite 1244; smoke still Bulk +7 / SCSI +0 | ✓ |
+| 7 | Boot-anim (`send_boot_animation`, SCSI-only) holds the wire via `app.exclusive_wire(key)` context manager (no lambda — `DeviceSender.exclusive()` + `_wire_lock`). Screencast needed no change — it already sends per-frame through `app.send` | **DONE** 2026-06-04 — `device_sender.exclusive()`, `app.exclusive_wire`, boot-anim wrapped; `test_exclusive_blocks_worker_writes`; suite 1245 | ✓ |
+| 9 | Sender publishes on fire-and-forget failure: injected `on_failure` (named callback, no EventBus dep) → `App._on_sender_failure` publishes `ErrorOccurred` + `DeviceDisconnected` (for `DeviceDisconnectedError`), mirroring the Command `except`. Keepalive guarded on `is_connected` to stop the flood once recovery closes the device. (Per-frame retry + 3-strike `RecoveryTracker` already in the Device adapters.) | **DONE** 2026-06-04 — `device_sender` `on_failure`/`_fail`; `app._on_sender_failure`; 2 tests; suite 1247 | ✓ |
+| 8 | Per-tick `RenderAndSend` (metrics observer + video tick) → `app.send(wait=False)`: producers never block on USB; I/O leaves the producer thread. Failures surface via #9 | **DONE** 2026-06-04 — one line; suite 1247; keepalive smoke + mock GUI clean | ✓ |
+| 10 | Disconnect-during-send: `detach` calls `stop_sender` (scheduler joins the worker thread) **before** `device.disconnect()`, so an in-flight write completes before the transport closes — no race | **DONE** 2026-06-04 — ordering in `App.detach`; `test_detach_joins_worker_before_transport_close` (no post-detach writes) | ✓ |
+| 11 | Daemon + CLI + GUI all create senders via the `ConnectDevice` chokepoint (daemon: `start_hotplug` → `DeviceAttached` → `_on_device_attached` → `ConnectDevice` → `start_sender`); `App.close` shuts the scheduler. Uniform, no per-UI wiring | **DONE** 2026-06-04 — verified by design (single chokepoint) + daemon path read | ✓ |
+| 12 | `dev/smoke_keepalive.py` + send-touching tests updated (render_led helper, backend_finish, device_sender, app_senders) | **DONE** 2026-06-04 — suite 1248; no "no sender" warnings in logs | ✓ |
+
+**Phase 1 complete (12/12).** The freeze is fixed; the per-device send-worker actor owns every wire write, serializes by construction, keepalives volatile wires, surfaces failures, and runs uniformly across GUI/CLI/API/daemon.
+
+## Phase 2 — deferred, tracked (each has a trigger; do NOT drop)
+
+| Item | Why later | Re-entry trigger | Status |
+|---|---|---|---|
+| Unify background loops (metrics + slideshow + keepalive) under one shared scheduler (extract a generic `Pumpable`) | DRY refactor; unsafe while introducing the sender | Phase 1 merged + green on hardware | DEFERRED |
+| asyncio / pool execution model | blocking USB ⇒ thread-per-device is the honest fit now | only if profiling shows the thread model bottlenecks | DEFERRED |
+| `wait=False` on the video/metrics **hot path** (so per-frame producers never block on USB) | safe only once the metrics observer no longer needs the synchronous result on its own thread | after #8 (observer submits non-blocking) | DEFERRED |
+
+## Adjacent subsystems (separate work — listed so they're not lost)
+- Per-device json config persistence (background/mask per device) — maps to the cutover audit's per-device config rows.
+- HID/LY mock handshake scripting (`tests/mock_platform.py`).
+- Encode-rotation table (Tier-1 widescreen panels) — `memory/project_geometry_subsystem_and_mock.md` §1b.
+- The rest of the cutover audit backlog — `memory/project_full_cutover_audit.md`.

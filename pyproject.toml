@@ -1,0 +1,368 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trcc-linux"
+version = "9.10.9"
+description = "Linux implementation of Thermalright LCD Control Center"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+authors = [
+    { name = "TRCC Linux Contributors" }
+]
+keywords = ["thermalright", "lcd", "cooling", "hardware", "monitor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Monitoring",
+]
+
+dependencies = [
+    # PySide6 6.12.0 releases Py_None one time too many on every call that
+    # returns nothing (measured: -1 refcount per QImage.fill / setPixel /
+    # QPainter.setPen).  None is immortal from Python 3.12, so only 3.10 and
+    # 3.11 suffer -- and there the process aborts ("none_dealloc: deallocating
+    # None") after ~5000 such calls, i.e. seconds into rendering.  6.11.2 is
+    # clean on both.  Lift the cap once a 6.12.x is measured clean on 3.10.
+    "PySide6>=6.5.0,<6.12; python_version < '3.12'",
+    "PySide6>=6.5.0; python_version >= '3.12'",
+    "numpy>=1.24.0",
+    "psutil>=5.9.0",
+    "pyusb>=1.2.0",
+    # libusb-package bundles libusb-1.0.dll on Windows so pip-installed
+    # users get a working pyusb backend out of the box. Pyocd's canonical
+    # pattern (#131 — usb.core.NoBackendError on pip-install Windows).
+    # Pinned for Windows + Python <3.14 because upstream wheels only go
+    # to cp313 (verified PyPI 2026-05-14); pip install of trcc-linux on
+    # Python 3.14 Windows would otherwise fail at sdist build. Lift the
+    # python_version cap once libusb-package ships a cp314 wheel.
+    "libusb-package>=1.0.26.3; sys_platform == 'win32' and python_version < '3.14'",
+    "click>=7.0",
+    "typer>=0.9.0",
+    "fastapi>=0.100",
+    # The LAN API's opt-in TLS (`trcc api --tls`): a self-signed certificate
+    # made once and pinned by fingerprint.  Imported only under --tls.  Floor
+    # MEASURED, not guessed: the TLS tests pass on 3.4.8 (Ubuntu 22.04), 38.0.4
+    # (Debian 12), 41.0.7 (Ubuntu 24.04) and 50.
+    "cryptography>=3.4.8",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    "uvicorn[standard]>=0.20",
+    # >=0.0.18, not >=0.0.6, for two reasons measured together: 0.0.13
+    # renamed the import to ``python_multipart`` and FastAPI >=0.113 probes
+    # THAT name first, falling back to ``multipart.multipart`` — an import
+    # name an unrelated PyPI project also claims, so the old floor let a
+    # resolver produce a tree where FastAPI refuses every form route at
+    # import.  0.0.18 is the floor FastAPI's own "standard" extra pins.
+    "python-multipart>=0.0.18",
+    "prompt_toolkit>=3.0.0",
+    "sounddevice>=0.4.6",
+    "wmi>=1.5.1; sys_platform == 'win32'",
+    # Windows audio visuals: what is playing, by WASAPI loopback (ffmpeg has no
+    # WASAPI input).  BSD-3, pure Python over cffi (~44 KB), numpy already here.
+    "soundcard>=0.4.6; sys_platform == 'win32'",
+    # macOS audio visuals: what is playing, by a Core Audio tap (14.2+; no
+    # driver to install).  MIT; needs Python 3.11+, below that the gallery says so.
+    "catap>=0.6.0; sys_platform == 'darwin' and python_version >= '3.11'",
+    "certifi>=2023.7.22",
+    # Linux hotplug: live device attach/detach + boot-time coldplug.  Without
+    # it the udev monitor can't start, so a device plugged in after launch (or
+    # missed at the boot discover) never connects — hotplug silently no-ops.
+    # Core feature, not optional; the graceful-None fallback only covers exotic
+    # environments that strip libudev (#139).
+    "pyudev>=0.24.1; sys_platform == 'linux'",
+    # NVIDIA GPU temp/usage/clock via NVML.  Pure-Python (~53 KB), imports on
+    # any OS/hardware — nvmlInit() just no-ops without a card.  Core, not an
+    # extra, so `pip install trcc-linux` gets it out of the box: #161 was a
+    # pip-channel install where the card was present but the reader was never
+    # importable because the [nvidia] extra wasn't pulled.
+    "nvidia-ml-py>=11.0.0",
+    # HID output-report transport (hidapi/hidraw).  A core Linux dependency, not
+    # an extra: some firmware only accepts frames as HID output reports and
+    # ignores libusb bulk writes entirely — the Frozen Warframe SE bcdDevice
+    # 4.07 is blank without it (#228).  Off the Windows path (libusb serves the
+    # HID panels there); Linux selects it per-fingerprint via DeviceQuirks.
+    "hidapi>=0.14.0; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+# Promoted to a core dependency (see [project].dependencies).  Kept as an empty
+# alias so existing `pip install trcc-linux[nvidia]` invocations still resolve.
+nvidia = []
+wayland = [
+    "dbus-python>=1.3.0",
+    "PyGObject>=3.42.0",
+]
+windows = [
+    "wmi>=1.5.1; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+# Promoted to a core Linux dependency (see [project].dependencies).  Kept as an
+# empty alias so existing `pip install trcc-linux[hid]` invocations still resolve.
+hid = []
+remote = [
+    "qrcode>=7.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-qt>=4.0.0",
+    # REQUIRED, not optional: ``addopts`` carries ``-n auto``, so a pytest
+    # without xdist cannot start at all -- "unrecognized arguments: -n".  It
+    # was declared nowhere and worked only because every machine that had run
+    # the suite happened to have it installed already.  The first environment
+    # that did not was the Windows CI job, on its first ever run.
+    "pytest-xdist>=3.2",          # --dist worksteal arrived in 3.2
+    "ruff>=0.4.0",
+    # httpx2, not httpx: starlette.testclient does `try: import httpx2 / except:
+    # import httpx` + a DeprecationWarning. Pinning the old one made the suite
+    # emit that warning on every API test, and it becomes a hard failure when
+    # starlette drops the fallback. Nothing of ours imports httpx directly.
+    "httpx2>=2.0",
+    "types-qrcode>=7.0",
+]
+all = [
+    "trcc-linux[nvidia,wayland,hid,remote,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/Lexonight1/thermalright-trcc-linux"
+Documentation = "https://github.com/Lexonight1/thermalright-trcc-linux#readme"
+Repository = "https://github.com/Lexonight1/thermalright-trcc-linux"
+Issues = "https://github.com/Lexonight1/thermalright-trcc-linux/issues"
+
+[project.scripts]
+# `trcc` runs the new top-level (formerly `trcc.next`).  The legacy tree
+# was moved to the `legacy` branch.
+trcc = "trcc._entry:main"
+trcc-gui = "trcc.ui.cli.main:gui"
+
+[project.gui-scripts]
+trcc-lcd = "trcc.ui.cli.main:gui"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+]
+exclude = [
+    "**/*.7z",
+    "**/web_cache/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trcc"]
+exclude = [
+    "**/*.7z",
+    "**/web_cache/**",
+    # Theme/web data is downloaded on first run — never ship in wheel.
+    "**/data/Theme*/**",
+    "**/data/Web/**",
+]
+artifacts = [
+    # Only GUI assets — never data/ (themes are downloaded on first run).
+    "**/assets/**/*.png",
+    "**/assets/**/*.gif",
+    "**/assets/**/*.ttf",
+    "**/assets/**/*.otf",
+    "**/assets/**/*.TTC",
+    "**/assets/**/*.desktop",
+    "**/assets/**/*.service",
+    "**/assets/**/*.policy",
+    "**/assets/**/*.svg",
+    # Privileged helpers (no extension), the polkit policy's only targets —
+    # distro packages install them to /usr/bin; shipped here so they are in
+    # the sdist/wheel too.  trcc-imc: MCHBAR timings.  trcc-dmi: DRAM slots.
+    # trcc-ram-access: the opt-in RAM-lighting grant; -off: removing it.
+    "**/assets/trcc-imc",
+    "**/assets/trcc-dmi",
+    "**/assets/trcc-ram-access",
+    "**/assets/trcc-ram-access-off",
+    # SELinux policy source — `trcc system setup` builds + loads it on Fedora
+    # so source/pip installs can pass the USB/SCSI ioctls (packages ship the
+    # compiled .pp via the rpm).
+    "**/data/trcc_usb.te",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# --dist worksteal: an idle worker takes queued tests from a busy one.  The
+# default hands every worker its share up front, and the slow GUI tests left
+# one worker grinding while 15 sat idle.  Measured 2026-10-10 on the 3.12
+# venv, same 29,574 results either way: 211 s by default, 101 s stealing.
+addopts = "-v --tb=short -n auto --dist worksteal"
+# A test still running after this many seconds gets every thread's stack
+# printed, so a hang names itself.  Three CI runs (2026-10-09/10) sat silent
+# 21-25 minutes at 88-90% until the 45-minute job limit, with nothing in the
+# log to say which test; one hung the same way locally and took gdb to read.
+faulthandler_timeout = 300
+# pyusb 1.3.1 uses _pack_ in ctypes — deprecated in Python 3.14 (pyusb#535)
+# Remove once pyusb releases a fix with _layout_ = 'ms'
+# An unexplained warning is a defect nobody has read yet.  This was a COUNT in
+# the run summary until 2026-09-02 — "1 warning" that survived six clean runs,
+# appeared once, and turned out to be `configure_logging` leaking two file
+# descriptors on every reconfigure, surfacing whenever the GC happened to
+# finalise them.  A number you can scroll past is not a gate; an error is.
+# Filters apply in order and the LAST match wins, so the usb ignore below must
+# stay after "error".
+markers = [
+    "expects_logging_error: the test drives a handler into handleError on purpose; tests/conftest.py then REQUIRES one",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:usb.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# `preview` is required for PLW1514 (unspecified-encoding) — still a preview
+# rule.  `explicit-preview-rules = true` below keeps preview mode from selecting
+# the ~900 OTHER preview findings (E241, E302, …) by prefix — only preview rules
+# named in `select` activate.  It does NOT, however, stop preview from changing
+# the BEHAVIOUR of already-selected stable rules: enabling it surfaced exactly
+# one extra finding, a legitimate F401 (a deliberately-unused import that needed
+# the `# noqa` its sibling line already had), now annotated.  That is the trade:
+# a ruff upgrade could add another such finding, but it fails loudly in CI —
+# never silent — and is the price of gating the encoding class OS-independently.
+preview = true
+
+[tool.ruff.lint]
+# Opt in to preview rules ONE at a time; without this, `preview = true` would
+# enable every preview rule in the selected families.
+explicit-preview-rules = true
+select = [
+    "E",     # pycodestyle errors
+    "F",     # pyflakes
+    "W",     # pycodestyle warnings
+    "I",     # isort
+    "UP",    # pyupgrade (PEP 585, 604, 613, 695-compatible modernizations)
+    "B",     # flake8-bugbear (mutable defaults, unused loops, etc.)
+    "SIM",   # flake8-simplify
+    "PIE",   # flake8-pie (unnecessary placeholders, dict updates)
+    "RUF",   # ruff-native rules
+    "FA",    # flake8-future-annotations (require `from __future__ import annotations`)
+    "PTH",   # flake8-use-pathlib (prefer pathlib over os.path)
+    "TID251", # flake8-tidy-imports banned-api — UI cannot import past the Trcc seam (TID252 left off — relative imports are fine in this codebase)
+    "PLW1514", # unspecified-encoding — read_text/open without encoding= inherits the locale (cp1252 on Windows). Preview rule; see `preview`/`explicit-preview-rules` above. OS-independence: broke Windows CI 2026-09-12.
+]
+ignore = [
+    "E501",   # line length — wrapping not always clearer
+    "SIM108", # ternary not always clearer than if/else
+    "RUF012", # mutable class attrs (PySide6 signals trip this)
+    "RUF001", # ambiguous unicode in strings (°, ✓ are intentional)
+    "RUF002", # ambiguous unicode in docstrings (same)
+    "RUF003", # ambiguous unicode in comments (same)
+    "SIM105", # suppressible-exception — try/except None reads clearer than contextlib.suppress
+    "SIM102", # collapsible-if — nested ifs sometimes clearer when conditions are unrelated
+    "B008",   # function-call-in-default — typer.Argument / FastAPI Form / Depends require this pattern
+    "B027",   # empty-method-without-abstract — Template Method default no-op hooks (configure_dpi, auto_setup, …) are intentional
+]
+
+# Per-directory rules — legacy code lives under `src/trcc/legacy/` after
+# the cutover (formerly `src/trcc/{adapters,core,services,ui,...}`).
+# Retrofitting pathlib + SIM there is debt-thrown-out; PTH stays strict
+# on the new top-level (formerly `src/trcc/next/`).  Note: ruff uses
+# gitignore-style globs, so `*` matches across slashes.
+[tool.ruff.lint.per-file-ignores]
+# Top-level files (kept across the cutover — pre-import logging shim,
+# entry dispatcher, version, package init)
+"src/trcc/__init__.py" = ["PTH", "SIM115", "SIM117", "TID251"]
+"src/trcc/__main__.py" = ["PTH", "SIM115", "SIM117", "TID251"]
+"src/trcc/__version__.py" = ["PTH", "SIM115", "SIM117", "TID251"]
+"src/trcc/_entry.py" = ["PTH", "SIM115", "SIM117", "TID251"]
+# New top-level (former next/) — TID251 enforced in ui/, exempt for
+# non-UI trees that legitimately compose adapters.
+"src/trcc/adapters/**/*.py" = ["TID251"]
+"src/trcc/core/**/*.py" = ["TID251"]
+"src/trcc/services/**/*.py" = ["TID251"]
+"src/trcc/app.py" = ["TID251"]      # composition root wires adapters
+"src/trcc/_boot.py" = ["TID251"]    # composition root
+"src/trcc/proxy.py" = ["TID251"]    # daemon proxy boundary
+"src/trcc/ipc.py" = ["TID251"]      # daemon IPC server
+"src/trcc/daemon.py" = ["TID251"]   # daemon process entry
+"src/trcc/ui/**/*.py" = []   # ← TID251 ENFORCED here
+# Tests — same rationale as legacy src; the d4e1b287 ruff expansion
+# (UP/B/SIM/PIE/RUF/FA/PTH) and 8ef3264c PEP 585/604 sweep didn't touch
+# tests/.  Soft-gate covers the families that fire there:
+#   PTH  — os.path style throughout test setup/teardown
+#   UP   — Optional[X] / List[X] / typing.X patterns
+#   SIM115/117 — context-managed open + with-statement chaining
+#   PIE807/808 — minor stylistic
+#   RUF013/015/043/059 — implicit-optional, micro-iteration, pytest patterns
+#   B007/018/023 — unused loop vars + assertion-style expressions in tests
+"tests/**/*.py" = [
+    "PTH", "UP", "SIM115", "SIM117",
+    "PIE807", "PIE808",
+    "RUF013", "RUF015", "RUF043", "RUF059",
+    "B007", "B018", "B023",
+    "TID251",   # tests legitimately exercise adapters.device directly
+]
+# CI helper scripts (.github/scripts/) — tooling that runs in workflows,
+# not production code.  Same legacy rationale as tests/ — keeping them
+# strict-PTH-clean isn't worth blocking releases over.
+".github/scripts/**/*.py" = ["PTH", "SIM115"]
+# Dev smoke harnesses + mock-bootstrap: legitimately exercise adapters
+# directly (they ARE the test fixtures), and use sys.path.insert before
+# imports because they run as standalone scripts.
+"dev/**/*.py" = [
+    "PTH", "UP", "SIM115", "SIM117",
+    "E402",      # sys.path.insert(0, ...) before imports — required for standalone scripts
+    "I001",      # import order rearranged by sys.path mutation
+    "TID251",    # smoke harnesses exercise adapters directly, just like tests
+    "B007", "B018", "B023",
+    "PIE807", "PIE808",
+    "RUF013", "RUF015", "RUF043", "RUF059",
+]
+
+# UI layer cannot reach past the Trcc seam — every device action goes
+# through trcc.lcd / trcc.led / trcc.control_center / trcc.probe / etc.
+# Layers that legitimately compose adapters (core, services, install,
+# top-level _boot/_entry/__init__) get TID251 disabled below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"trcc.adapters.device".msg = "UI must talk to Trcc — use trcc.lcd / trcc.led / trcc.probe / trcc.handshake / trcc.cleanup. See trcc/core/trcc.py."
+
+[tool.coverage.run]
+source = ["trcc"]
+branch = true
+concurrency = ["multiprocessing", "thread"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+
+[tool.pyright]
+pythonVersion = "3.10"
+pythonPlatform = "Linux"
+include = ["src"]
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+reportMissingImports = "warning"
+reportOptionalMemberAccess = "error"
+reportAttributeAccessIssue = "error"
+reportArgumentType = "error"
+reportCallIssue = "error"
+reportOptionalIterable = "error"
+reportOptionalOperand = "error"

@@ -1,0 +1,327 @@
+"""ScsiLcd — Device implementation for SCSI-protocol LCD hardware.
+
+The physical device enumerates as USB mass-storage.  We talk to it via
+a `ScsiTransport` (kernel-native on Linux/Windows, userspace BOT on
+macOS/BSD) — the transport handles the wire framing, this class only
+knows the SCSI CDB vocabulary the device expects.
+"""
+from __future__ import annotations
+
+import dataclasses
+import logging
+import struct
+import time
+import zlib
+
+from ...core.errors import TransportError
+from ...core.logs import Blob, per_frame
+from ...core.models import HandshakeResult, Wire
+from ...core.ports import ScsiTransport
+from ...core.protocol import DeviceProfile, get_profile
+from ._base import BaseDevice
+
+log = logging.getLogger(__name__)
+frame_log = per_frame(__name__)
+
+
+# =========================================================================
+# SCSI protocol constants (USBLCD.exe decompiled C#)
+# =========================================================================
+
+# Handshake / init
+_BOOT_SIGNATURE = b'\xa1\xa2\xa3\xa4'
+_BOOT_WAIT_S = 3.0
+_BOOT_MAX_RETRIES = 5
+_POST_INIT_DELAY_S = 0.1
+
+_POLL_CMD = 0xF5
+_INIT_CMD = 0x1F5
+_POLL_SIZE = 0xE100
+
+# Frame chunking
+_FRAME_CMD_BASE = 0x101F5
+_CHUNK_SIZE_LARGE = 0x10000
+_CHUNK_SIZE_SMALL = 0xE100
+_SMALL_DISPLAY_PIXELS = 76800      # ≤320×240 uses the small chunk size
+
+# Timeouts
+_HANDSHAKE_TIMEOUT_MS = 10000
+_FRAME_TIMEOUT_MS = 5000
+
+# Boot animation — compressed multi-frame upload to device flash.
+# Command bytes from USBLCD.exe reverse engineering: first frame carries
+# the total frame count in CDB word2; carousel frames carry the index in
+# word2 and pack the dwell-byte into CDB cmd's high byte.
+_ANIM_FIRST_CMD = 0x000201F5
+_ANIM_CAROUSEL_CMD = 0x000301F5
+_ANIM_COMPRESS_LEVEL = 3       # zlib level — fast, matches the Windows app
+_ANIM_FIRST_DELAY_S = 0.5      # 500 ms settle after first-frame upload
+_ANIM_FRAME_DELAY_S = 0.01     # 10 ms pacing between carousel frames
+_ANIM_MAX_FRAMES = 249         # firmware rejects ≥ 250
+_ANIM_DELAY_MAX_BYTE = 250     # wire byte saturates at 250 (≈ 2.5 s)
+
+# Boot animation is only supported on these display geometries — the
+# firmware ignores the carousel upload otherwise.
+_BOOT_ANIM_RESOLUTIONS: frozenset[tuple[int, int]] = frozenset({
+    (240, 240), (240, 320), (320, 240), (320, 320),
+})
+
+
+# =========================================================================
+# ScsiLcd
+# =========================================================================
+
+
+#: Poll bytes whose RGB565 is big-endian on the SCSI wire ONLY.  FormCZTVInit
+#: sets SPI mode 2 for mode 1 + FBL 51 (FormCZTV.cs:1065), and USBLCD.exe
+#: copies the frame to the panel unswapped (its '3' class, USBLCD.exe.c).  NOT
+#: in FBL_PROFILES[51]: the HID wire's FBL 51 is little-endian on real glass
+#: (#65, #67).  On a SCSI FBL 51 panel big-endian IS the glass: @PourrezJ's
+#: 0402:3922 (320x240, SUB 0) showed a green theme pink until he swapped it
+#: to big-endian, the same change, made independently (#313).
+_SCSI_BIG_ENDIAN_FBLS: frozenset[int] = frozenset({51})
+
+
+def scsi_profile(fbl: int) -> DeviceProfile:
+    """The SCSI panel's profile for its poll byte -- ``get_profile`` plus the
+    SCSI-only byte order."""
+    profile = get_profile(fbl, fbl)
+    if fbl in _SCSI_BIG_ENDIAN_FBLS and not profile.big_endian:
+        profile = dataclasses.replace(profile, big_endian=True)
+    log.debug("scsi_profile: FBL %d -> %dx%d big_endian=%s", fbl,
+              *profile.resolution, profile.big_endian)
+    return profile
+
+class ScsiLcd(BaseDevice[ScsiTransport], wire=Wire.SCSI):
+    """SCSI LCD device.
+
+    connect():   poll (with boot-retry) + init handshake → FBL
+    send(data):  RGB565 frame in 16-byte-CDB chunked writes
+    disconnect(): close transport
+
+    ``self._profile`` (set below from the reported FBL) carries PM-derived
+    geometry + encoding flags, so ``send`` and the DisplayService pipeline
+    honor what the device actually claims — not the registry's static
+    ``native_resolution``.
+    """
+
+    # ── Device ABC ────────────────────────────────────────────────────
+
+    def _do_handshake(self) -> HandshakeResult:
+        """Poll (with boot-retry) + init, then resolve geometry from the FBL."""
+        # Step 1: Poll (data-in) with boot-state check
+        poll_cdb = self._build_cdb(_POLL_CMD, _POLL_SIZE)
+        log.debug("_do_handshake: poll CDB %s", poll_cdb.hex())
+        response = b""
+        for attempt in range(_BOOT_MAX_RETRIES):
+            response = self._transport.read_cdb(
+                poll_cdb, _POLL_SIZE, _HANDSHAKE_TIMEOUT_MS,
+            )
+            if len(response) >= 8 and response[4:8] == _BOOT_SIGNATURE:
+                log.info("Device %s still booting (attempt %d/%d), waiting %.0fs",
+                         self.info.key, attempt + 1, _BOOT_MAX_RETRIES, _BOOT_WAIT_S)
+                time.sleep(_BOOT_WAIT_S)
+            else:
+                break
+
+        self._trace_reply(response)
+        fbl = response[0] if response else (self.info.fbl or 100)
+        if not response:
+            # USBLCD.exe classifies no panel from an empty byte; we must draw
+            # something, so say what was assumed -- a 240x320 or 240x240 panel
+            # is driven at the wrong size by this guess (v9.10.6, #301).
+            log.warning("ScsiLcd %s: the poll returned no identity byte — "
+                        "assuming FBL %d; if the panel shows the picture at "
+                        "the wrong size, attach `trcc report`",
+                        self.info.key, fbl)
+        log.debug("SCSI poll byte[0] = %d (FBL)", fbl)
+
+        # Step 2: Init (data-out, 0xE100 zeros)
+        init_cdb = self._build_cdb(_INIT_CMD, _POLL_SIZE)
+        log.debug("_do_handshake: init CDB %s", init_cdb.hex())
+        self._transport.send_cdb(
+            init_cdb, b"\x00" * _POLL_SIZE, _HANDSHAKE_TIMEOUT_MS,
+        )
+
+        # Step 3: let the display controller settle
+        time.sleep(_POST_INIT_DELAY_S)
+
+        # Geometry comes from the FBL byte via get_profile — a device that
+        # reports e.g. FBL=102 surfaces its resolution from the profile,
+        # not the registry's static native_resolution. SCSI uses PM=FBL.
+        self._profile = scsi_profile(fbl)
+        return HandshakeResult(
+            resolution=self._profile.resolution,
+            model_id=fbl,
+            pm_byte=fbl,
+            sub_byte=0,
+            fbl=fbl,
+            raw_response=bytes(response),
+        )
+
+    def _handshake_detail(self, result: HandshakeResult) -> str:
+        """SCSI reports one byte — call it FBL, since PM *is* FBL here."""
+        log.debug("_handshake_detail: result=%s raw=%s",
+                  result, Blob(result.raw_response))
+        return f" (FBL {result.fbl})"
+
+    def _frame_size(self) -> tuple[int, int]:
+        """The resolution the device reported, or the registry default."""
+        frame_log.debug("_frame_size")
+        return (self._handshake.resolution if self._handshake
+                else self.info.native_resolution)
+
+    def _prepare_frame(self, payload: bytes) -> bytes:
+        """Pad the RGB565 payload out to the full frame the CDBs will ask for.
+
+        The chunk sizes are derived from the resolution, so a short payload
+        would leave the last CDB waiting for bytes that never arrive.
+        """
+        width, height = self._frame_size()
+        total = width * height * 2       # RGB565 = 2 bytes per pixel
+        if len(payload) >= total:
+            return payload
+        log.debug("ScsiLcd %s: payload %d < expected %d; padding with zeros",
+                  self.info.key, len(payload), total)
+        return payload + b"\x00" * (total - len(payload))
+
+    def _write_frame(self, frame: bytes) -> bool:
+        """Write the frame as 16-byte-CDB chunks sized by resolution class."""
+        chunks = self._frame_chunks(*self._frame_size())
+        frame_log.debug("ScsiLcd %s: sending %d bytes in %d chunk(s)",
+                  self.info.key, len(frame), len(chunks))
+        offset = 0
+        for cmd, size in chunks:
+            cdb = self._build_cdb(cmd, size)
+            ok = self._transport.send_cdb(
+                cdb, frame[offset:offset + size], _FRAME_TIMEOUT_MS,
+            )
+            if not ok:
+                log.warning(
+                    "ScsiLcd %s: chunk write failed at offset %d "
+                    "(cmd=0x%x size=%d)",
+                    self.info.key, offset, cmd, size,
+                )
+                return False
+            offset += size
+        return True
+
+    # ── Boot animation ────────────────────────────────────────────────
+
+    @property
+    def can_boot_animate(self) -> bool:
+        log.debug("can_boot_animate")
+        return True
+
+    def send_boot_animation(
+        self,
+        frames: list[bytes],
+        delays_ds: list[int],
+    ) -> int:
+        """Upload a multi-frame compressed boot animation to device flash.
+
+        ``frames`` are RGB565 byte buffers at the device's resolution
+        (caller is responsible for encoding).  ``delays_ds[i]`` is the
+        dwell time before frame ``i+1`` plays, in **deciseconds** (10ths
+        of a second) — matches the legacy USBLCD.exe UI unit.  Range on
+        the wire is 1 ds … 25 ds (firmware caps at 250).
+
+        Returns the number of frames successfully uploaded (0 on reject,
+        full count on success, partial count on mid-stream failure).
+        """
+        if not self._transport.is_open:
+            raise TransportError(
+                f"ScsiLcd {self.info.key} not connected — call connect() first"
+            )
+
+        resolution = (self._handshake.resolution if self._handshake
+                      else self.info.native_resolution)
+        if resolution not in _BOOT_ANIM_RESOLUTIONS:
+            log.warning("Boot animation not supported for %dx%d", *resolution)
+            return 0
+
+        count = len(frames)
+        if count == 0 or count >= _ANIM_MAX_FRAMES:
+            log.warning("Boot animation frame count %d out of range (1-%d)",
+                        count, _ANIM_MAX_FRAMES - 1)
+            return 0
+
+        # Phase 1: first frame — frame_count in word2, no delay byte.
+        compressed = zlib.compress(frames[0], _ANIM_COMPRESS_LEVEL)
+        cdb = self._build_anim_cdb(_ANIM_FIRST_CMD, count, len(compressed))
+        if not self._transport.send_cdb(cdb, compressed, _FRAME_TIMEOUT_MS):
+            log.error("Boot animation: first-frame write failed")
+            return 0
+        log.info("Boot animation: first frame sent (%d bytes compressed, %d total)",
+                 len(compressed), count)
+        time.sleep(_ANIM_FIRST_DELAY_S)
+
+        # Phase 2: carousel frames — index in word2, delay packed into
+        # the cmd's high byte (delays_ds * 10, saturated at 250).
+        for idx, frame in enumerate(frames):
+            compressed = zlib.compress(frame, _ANIM_COMPRESS_LEVEL)
+            delay_ds = delays_ds[idx] if idx < len(delays_ds) else 10
+            delay_byte = min(delay_ds * 10, _ANIM_DELAY_MAX_BYTE) & 0xFF
+            cmd = _ANIM_CAROUSEL_CMD | (delay_byte << 24)
+            cdb = self._build_anim_cdb(cmd, idx, len(compressed))
+            if not self._transport.send_cdb(cdb, compressed, _FRAME_TIMEOUT_MS):
+                log.error("Boot animation: carousel frame %d write failed", idx)
+                return idx  # partial — caller sees how far we got
+            time.sleep(_ANIM_FRAME_DELAY_S)
+
+        log.info("Boot animation: %d frames uploaded successfully", count)
+        return count
+
+    @staticmethod
+    def _build_anim_cdb(cmd: int, word2: int, compressed_size: int) -> bytes:
+        """16-byte CDB for compressed-animation commands (no CRC32 trailer).
+
+        Layout differs from the frame CDB:
+            [0:4]   cmd (carousel folds dwell-byte into bits [31:24])
+            [4:8]   zeros
+            [8:12]  word2 — frame_count for first, frame_index for carousel
+            [12:16] compressed_size
+        """
+        log.debug("_build_anim_cdb: cmd=%s word2=%s", cmd, word2)
+        return struct.pack("<IIII", cmd, 0, word2, compressed_size)
+
+    # ── SCSI framing ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_cdb(cmd: int, size: int) -> bytes:
+        """Build the 16-byte SCSI CDB: cmd(4) + zeros(8) + size(4), all LE.
+
+        There is no CRC.  This docstring said "cmd(4) + zeros(8) + size(4) +
+        crc32(4)" and the body computed one — then returned ``full[:16]``,
+        which is exactly the 16 bytes BEFORE it, so the checksum has never
+        reached the wire in any release.  MEASURED before removing: the
+        returned bytes are byte-identical with the crc32 gone, and the four
+        bytes it produced appear nowhere in them.
+
+        Kept as a note rather than deleted quietly because the docstring was
+        the only description of this CDB anywhere, and "it has a CRC" is the
+        kind of claim a future reader would build on.  If a real device ever
+        turns out to want one, it is a 17th-through-20th byte that does not
+        exist today, not a line to un-comment.
+        """
+        frame_log.debug("_build_cdb: cmd=%s size=%s", cmd, size)
+        return struct.pack("<I", cmd) + b"\x00" * 8 + struct.pack("<I", size)
+
+    @staticmethod
+    def _frame_chunks(width: int, height: int) -> list[tuple[int, int]]:
+        """Compute (cmd, size) pairs for chunked frame send."""
+        frame_log.debug("_frame_chunks: width=%s height=%s", width, height)
+        pixels = width * height
+        chunk_size = (_CHUNK_SIZE_SMALL if pixels <= _SMALL_DISPLAY_PIXELS
+                      else _CHUNK_SIZE_LARGE)
+        total = pixels * 2  # RGB565 = 2 bytes per pixel
+        chunks: list[tuple[int, int]] = []
+        offset = 0
+        idx = 0
+        while offset < total:
+            size = min(chunk_size, total - offset)
+            cmd = _FRAME_CMD_BASE | (idx << 24)
+            chunks.append((cmd, size))
+            offset += size
+            idx += 1
+        return chunks

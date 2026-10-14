@@ -1,0 +1,1079 @@
+"""CLI `system` group — setup, sensors, diagnostics."""
+from __future__ import annotations
+
+import logging
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import typer
+
+from ...core.commands import (
+    CheckForUpdate,
+    ControlCenterSnapshot,
+    DeviceState,
+    DisableAutostart,
+    EnableAutostart,
+    EnsureDataDownload,
+    GenerateDebugReport,
+    GetAutostartStatus,
+    GetFirstRunStatus,
+    GetPaths,
+    GetPlatformInfo,
+    GetSensorDashboard,
+    ListDisks,
+    ListDiskSensors,
+    ListFans,
+    ListFonts,
+    ListGpus,
+    ListLanguages,
+    ListMemorySlots,
+    ListSensors,
+    MarkFirstRunDone,
+    RamLighting,
+    ReadSensors,
+    RefreshAutostart,
+    RgbFollow,
+    RgbLights,
+    RunDoctor,
+    RunHealthCheck,
+    RunSetup,
+    RunUpgrade,
+    ScanRgbLights,
+    SetAuraLeds,
+    SetHddEnabled,
+    SetRamEffect,
+    SetRamLighting,
+    SetRgbFollow,
+    SetSensorDashboard,
+)
+from ...core.models import (
+    AUTOSTART_TARGETS,
+    EffectDirection,
+    EffectSpeed,
+    FollowColors,
+    FollowMapping,
+    PanelConfig,
+    RamAccessState,
+    RamEffect,
+    RgbFollowMode,
+    SensorBinding,
+)
+from ...core.results import RgbLightsResult
+from ._ctx import emit_json, get_app
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+log = logging.getLogger(__name__)
+
+app = typer.Typer(help="System-level operations (setup, sensors, info).",
+                  no_args_is_help=True)
+
+
+@app.command("setup")
+def setup(
+    yes: bool = typer.Option(False, "--yes", "-y",
+                             help="Apply the changes without confirming"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="Show what would be done, change nothing"),
+) -> None:
+    """Run the OS-specific setup (udev rules on Linux, WinUSB guide on Windows).
+
+    Applies by default — this is the documented first-run step, so making it
+    refuse without a flag would put a wall in front of onboarding.
+    ``--dry-run`` is the only way to not apply.
+
+    ``--yes`` used to mean the opposite of what it said.  It was wired to the
+    platform's ``interactive`` flag, where ``False`` meant "change nothing", so
+    ``trcc system setup --yes`` PREVIEWED the udev rules instead of writing
+    them and then reported success — and the user hit permission errors on a
+    device the setup had told them was configured (#285).  It is kept and now
+    simply means "apply", which is what anyone passing it intended; there is
+    no confirmation of our own to skip, and the sudo password prompt is not
+    something a flag here can or should suppress.
+    """
+    log.info("cli system setup: yes=%s dry_run=%s", yes, dry_run)
+    result = get_app().dispatch(RunSetup(dry_run=dry_run))
+    typer.echo(result.message)
+    for warning in result.warnings:
+        typer.echo(f"  warning: {warning}", err=True)
+    raise typer.Exit(code=result.exit_code)
+
+
+@app.command("sensors")
+def sensors() -> None:
+    """Print current sensor readings."""
+    log.info("cli system sensors")
+    result = get_app().dispatch(ReadSensors())
+    if not result.readings:
+        typer.echo("No sensor readings available.")
+        return
+    for reading in result.readings:
+        typer.echo(
+            f"  {reading.sensor_id}  {reading.value:.2f} {reading.unit}"
+            f"  ({reading.category})"
+        )
+
+
+@app.command("list-disk-sensors")
+def list_disk_sensors() -> None:
+    """List drive THERMAL sensors — the list disk_temp comes from.
+
+    Not the same as 'list-disks', which enumerates mounted partitions and
+    shares no key with this list.  Pick one of these with 'trcc config disk'.
+    """
+    log.info("cli system list-disk-sensors")
+    r = get_app().dispatch(ListDiskSensors())
+    typer.echo(f"{r.message}; active = {r.active or '(hottest)'}")
+    for d in r.disks:
+        mark = "*" if d.key == r.active else " "
+        temp = f"{d.temp:.1f}°C" if d.temp is not None else "NC"
+        typer.echo(f"  {mark} {d.key:<40} {d.name:<16} {temp}")
+
+
+@app.command("list-gpus")
+def list_gpus() -> None:
+    """List GPUs exposed by the sensors aggregator."""
+    log.info("cli system list-gpus")
+    result = get_app().dispatch(ListGpus())
+    typer.echo(result.message)
+    for g in result.gpus:
+        discrete = "discrete" if g.is_discrete else "integrated"
+        typer.echo(f"  {g.key:20} {g.name}  ({discrete})")
+
+
+@app.command("list-fans")
+def list_fans() -> None:
+    """List fans the sensors aggregator exposes, with live readings.
+
+    Read-only diagnostic (#145/#207) — snapshot() maps fans to theme slots
+    automatically (GPU slot follows the picked GPU); this shows what the box
+    exposes.
+    """
+    log.info("cli system list-fans")
+    result = get_app().dispatch(ListFans())
+    typer.echo(result.message)
+    for f in result.fans:
+        rpm = f"{f.rpm} rpm" if f.rpm is not None else "-- rpm"
+        pct = f", {f.percent:.0f}%" if f.percent is not None else ""
+        typer.echo(f"  {f.key:24} {f.name}  ({rpm}{pct})")
+
+
+@app.command("list-fonts")
+def list_fonts() -> None:
+    """List font families Qt can see."""
+    log.info("cli system list-fonts")
+    result = get_app().dispatch(ListFonts())
+    typer.echo(result.message)
+    for name in result.fonts:
+        typer.echo(f"  {name}")
+
+
+@app.command("memory-slots")
+def memory_slots() -> None:
+    """List DRAM slots — size/type/speed/manufacturer, plus timings on Linux.
+
+    Timings (tCAS/tRCD/tRP/tRAS/tRC/tRFC) come from SPD + the live memory
+    controller and are Linux-only today; other platforms show NC.  This is what
+    the LC1-style memory panel renders, and it is worth pasting into a bug
+    report about that panel.
+    """
+    log.info("cli system memory-slots")
+    r = get_app().dispatch(ListMemorySlots())
+    typer.echo(r.message)
+    for i, s_ in enumerate(r.slots):
+        typer.echo(
+            f"  [{i}] {s_.size or 'NC':>10}  {s_.type or 'NC':<6} "
+            f"{s_.speed or 'NC':<12} {s_.manufacturer or 'NC'}"
+        )
+        typer.echo(
+            f"       tCAS {s_.tcas or 'NC':<4} tRCD {s_.trcd or 'NC':<4} "
+            f"tRP {s_.trp or 'NC':<4} tRAS {s_.tras or 'NC':<4} "
+            f"tRC {s_.trc or 'NC':<4} tRFC {s_.trfc or 'NC'}"
+        )
+
+
+@app.command("list-disks")
+def list_disks() -> None:
+    """List mounted partitions — NOT the drive list `disk_temp` comes from."""
+    log.info("cli system list-disks")
+    result = get_app().dispatch(ListDisks())
+    typer.echo(result.message)
+    for d in result.disks:
+        typer.echo(f"  [{d.index}] {d.device:20} -> {d.mountpoint}")
+
+
+@app.command("list-sensors")
+def list_sensors() -> None:
+    """Print every sensor the platform enumerates — descriptors only.
+
+    Read-only enumeration: no polling, no values.  Pair with
+    ``system sensors`` (or ``system info --metric <prefix>``) when you
+    want the current readings instead.
+    """
+    log.info("cli system list-sensors")
+    result = get_app().dispatch(ListSensors())
+    typer.echo(result.message)
+    for s in result.sensors:
+        unit = f" [{s.unit}]" if s.unit else ""
+        label = f"  {s.label}" if s.label else ""
+        typer.echo(f"  {s.sensor_id:32} {s.category:14}{unit}{label}")
+
+
+@app.command("dashboard")
+def dashboard(
+    auto_map: bool = typer.Option(
+        False, "--save-auto-map",
+        help="Persist the auto-mapped bindings instead of only showing them.",
+    ),
+) -> None:
+    """Print the sensor-dashboard layout — panels, rows and their bindings.
+
+    The grid the GUI's System Info screen edits, stored at
+    ``<config_dir>/system_config.json``.  Unbound rows render as ``--`` in the
+    GUI and are shown here as ``<unbound>``: the row's target sensor does not
+    exist on this machine (no DDR5 SPD temp, no SMART disk temp, fewer fan
+    headers than slots).
+
+    Reading is non-destructive — auto-mapping is recomputed every time and
+    NOT written back, so the layout heals itself when hardware changes.  Pass
+    ``--save-auto-map`` to freeze what you see.
+    """
+    log.info("cli system dashboard: save_auto_map=%s", auto_map)
+    result = get_app().dispatch(GetSensorDashboard())
+    typer.echo(result.message)
+    for index, panel in enumerate(result.panels):
+        # The index is what ``dashboard-delete`` / ``-rename`` / ``-bind``
+        # take.  Names are NOT unique -- every added panel is called "Custom"
+        # until renamed -- so position is the only unambiguous handle.
+        typer.echo(f"  {index}  [{panel.category_id}] {panel.name}")
+        for binding in panel.sensors:
+            target = binding.sensor_id or "<unbound>"
+            unit = f" [{binding.unit}]" if binding.unit else ""
+            typer.echo(f"      {binding.label:12} -> {target}{unit}")
+    if auto_map:
+        written = get_app().dispatch(
+            SetSensorDashboard(panels=tuple(result.panels)),
+        )
+        typer.echo(written.message)
+
+
+@contextmanager
+def _dashboard_edit() -> Iterator[list[PanelConfig]]:
+    """Read the layout, let the caller edit it, write the WHOLE thing back.
+
+    ``SetSensorDashboard`` is a bulk verb, so every edit is the same three
+    steps and only the middle one differs.  A context manager rather than
+    four copies -- and the write is AFTER the ``yield``, so a
+    ``BadParameter`` raised while editing propagates and nothing is
+    persisted.
+
+    No empty-layout guard here on purpose: the Command itself refuses one,
+    and its refusal arrives as ``result.message`` plus a non-zero exit.
+    """
+    log.info("_dashboard_edit: reading layout")
+    trcc = get_app()
+    panels = list(trcc.dispatch(GetSensorDashboard()).panels)
+    yield panels
+    log.info("_dashboard_edit: writing %d panel(s)", len(panels))
+    result = trcc.dispatch(SetSensorDashboard(panels=tuple(panels)))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _panel_at(panels: list[PanelConfig], index: int) -> PanelConfig:
+    """The panel at *index*, or a usable error naming the valid range."""
+    log.debug("_panel_at: index=%d of %d", index, len(panels))
+    if not 0 <= index < len(panels):
+        raise typer.BadParameter(
+            f"no panel {index} — the layout has {len(panels)} "
+            f"(0..{len(panels) - 1}).  Run `trcc system dashboard` to list.",
+        )
+    return panels[index]
+
+
+@app.command("dashboard-add")
+def dashboard_add(
+    name: str = typer.Option("Custom", "--name", help="Panel name."),
+) -> None:
+    """Add an empty custom panel to the sensor dashboard.
+
+    Four unbound rows, ready for ``dashboard-bind``.  What a new panel IS
+    lives on the model, so this, the GUI and qtgui all add the same thing.
+    """
+    log.info("cli system dashboard-add: name=%r", name)
+    with _dashboard_edit() as panels:
+        panels.append(PanelConfig.custom(name))
+
+
+@app.command("dashboard-delete")
+def dashboard_delete(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+) -> None:
+    """Delete a panel from the sensor dashboard.
+
+    Deleting the only panel is refused — an empty layout would make the next
+    read fall back to defaults, a wipe dressed up as a write.
+    """
+    log.info("cli system dashboard-delete: index=%d", index)
+    with _dashboard_edit() as panels:
+        removed = _panel_at(panels, index)
+        panels.remove(removed)
+        typer.echo(f"Removed [{removed.category_id}] {removed.name}")
+
+
+@app.command("dashboard-rename")
+def dashboard_rename(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+    name: str = typer.Argument(..., help="The new panel name."),
+) -> None:
+    """Rename a sensor-dashboard panel."""
+    log.info("cli system dashboard-rename: index=%d name=%r", index, name)
+    if not (name := name.strip()):
+        raise typer.BadParameter("name must not be blank")
+    with _dashboard_edit() as panels:
+        panel = _panel_at(panels, index)
+        typer.echo(f"Renamed {panel.name!r} -> {name!r}")
+        panel.name = name
+
+
+@app.command("dashboard-bind")
+def dashboard_bind(
+    index: int = typer.Argument(..., help="Panel index from `dashboard`."),
+    row: int = typer.Argument(..., help="Row within the panel (0-based)."),
+    sensor_id: str = typer.Argument(..., help="Sensor id from `list-sensors`."),
+) -> None:
+    """Bind one dashboard row to a sensor.
+
+    The sensor must exist on this machine — the GUIs bind by picking from a
+    list and cannot name one that does not, so neither can this.  The unit
+    comes from the sensor rather than the caller, for the same reason.
+    """
+    log.info("cli system dashboard-bind: index=%d row=%d sensor=%s",
+             index, row, sensor_id)
+    known = {s.sensor_id: s for s in get_app().dispatch(ListSensors()).sensors}
+    if (sensor := known.get(sensor_id)) is None:
+        raise typer.BadParameter(
+            f"no sensor {sensor_id!r} on this machine — "
+            f"run `trcc system list-sensors` for the {len(known)} available",
+        )
+    with _dashboard_edit() as panels:
+        panel = _panel_at(panels, index)
+        if not 0 <= row < len(panel.sensors):
+            raise typer.BadParameter(
+                f"no row {row} in {panel.name!r} — it has "
+                f"{len(panel.sensors)} (0..{len(panel.sensors) - 1})",
+            )
+        binding = panel.sensors[row]
+        panel.sensors[row] = SensorBinding(
+            label=binding.label or sensor.label or sensor_id,
+            sensor_id=sensor_id,
+            unit=sensor.unit,
+        )
+        typer.echo(f"Bound {panel.name!r} row {row} -> {sensor_id}")
+
+
+@app.command("list-languages")
+def list_languages() -> None:
+    """List every UI language the i18n table supports."""
+    log.info("cli system list-languages")
+    result = get_app().dispatch(ListLanguages())
+    typer.echo(result.message)
+    for lang in result.languages:
+        typer.echo(
+            f"  {lang.code:6} {lang.name:25} "
+            f"{lang.translated_keys} translated",
+        )
+
+
+@app.command("lang")
+def lang() -> None:
+    """Print the currently-active UI language code.
+
+    Read-only — for "what language is TRCC in right now?" without
+    digging through ``snapshot``.  Use ``set-language`` to change it.
+    """
+    log.info("cli system lang")
+    # Via the bus, not .settings — AppProxy exposes dispatch() only (#249).
+    typer.echo(get_app().dispatch(ControlCenterSnapshot()).language)
+
+
+@app.command("doctor")
+def doctor() -> None:
+    """Run health checks — exits 1 on any FAIL.
+
+    The reporter-friendly summary tells you what's wrong + how to fix
+    it.  For a copy-paste GitHub-issue dump, use `system debug-report`
+    instead.
+    """
+    log.info("cli system doctor")
+    result = get_app().dispatch(RunDoctor())
+    typer.echo(result.rendered)
+    raise typer.Exit(code=result.exit_code)
+
+
+@app.command("debug-report")
+def debug_report(
+    output: Path | None = typer.Option(
+        None, "--output", "-o",
+        help=(
+            "Write the report to this path instead of stdout.  "
+            "Recommended when filing a GitHub issue — attach the file."
+        ),
+    ),
+    log_lines: int = typer.Option(
+        1000, "--log-lines",
+        help="How many trailing log lines to include (default 1000).",
+    ),
+) -> None:
+    """Generate a debug report bundle for GitHub issues."""
+    log.info(
+        "cli system debug-report: output=%s log_lines=%s", output, log_lines,
+    )
+    result = get_app().dispatch(GenerateDebugReport(
+        output_path=output, log_tail_lines=log_lines,
+    ))
+    if output is None:
+        typer.echo(result.rendered_text)
+    else:
+        typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("check-update")
+def check_update() -> None:
+    """Ask GitHub Releases whether a newer version is available."""
+    log.info("cli system check-update")
+    r = get_app().dispatch(CheckForUpdate())
+    typer.echo(r.message)
+    if r.release_url:
+        typer.echo(f"  Release page: {r.release_url}")
+    if not r.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("upgrade")
+def upgrade(
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Accepted for older scripts; nothing is run.",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Accepted for older scripts; nothing is run.",
+    ),
+) -> None:
+    """Print the command that upgrades this TRCC install."""
+    log.info("cli system upgrade: yes=%s dry_run=%s", yes, dry_run)
+    r = get_app().dispatch(RunUpgrade())
+    typer.echo(r.message)
+    if not r.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("first-run-status")
+def first_run_status() -> None:
+    """Show whether trcc has been set up on this machine yet."""
+    log.info("cli system first-run-status")
+    r = get_app().dispatch(GetFirstRunStatus())
+    typer.echo(r.message)
+    typer.echo(f"  marker: {r.marker_path}")
+
+
+@app.command("mark-setup-done")
+def mark_setup_done() -> None:
+    """Tell trcc the welcome flow has been completed."""
+    log.info("cli system mark-setup-done")
+    r = get_app().dispatch(MarkFirstRunDone())
+    typer.echo(r.message)
+
+
+@app.command("health")
+def health() -> None:
+    """Quick read-only health report — same checks as `doctor`, no exit code."""
+    log.info("cli system health")
+    result = get_app().dispatch(RunHealthCheck())
+    typer.echo(result.message)
+    for c in result.checks:
+        typer.echo(f"  [{c.severity:4}] {c.name:22}  {c.message}")
+
+
+@app.command("hdd-enabled")
+def hdd_enabled(
+    state: str = typer.Argument(..., help="'on' or 'off'"),
+) -> None:
+    """Toggle inclusion of HDD metrics in sensor broadcasts."""
+    log.info("cli system hdd-enabled: state=%s", state)
+    if state.lower() not in ("on", "off"):
+        raise typer.BadParameter(f"state must be 'on' or 'off', got {state!r}")
+    result = get_app().dispatch(
+        SetHddEnabled(enabled=state.lower() == "on"),
+    )
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("follow")
+def follow(
+    mode: str = typer.Argument(
+        "status", help="'off', 'openrgb', 'ram' or 'status'"),
+    host: str = typer.Option(
+        "", "--host", help="OpenRGB's SDK server (default: the saved one, "
+                           "127.0.0.1 at first)."),
+    port: int = typer.Option(
+        0, "--port", help="Its port (default: the saved one, 6742 at first)."),
+    source: str | None = typer.Option(
+        None, "--source", help="The device that leads: an LCD's key "
+        "(e.g. 0402:3922) to follow its picture, or '' for the first LED "
+        "cooler.  Default: the saved one."),
+    mapping: FollowMapping | None = typer.Option(
+        None, "--mapping", help="An LCD's picture on the followers: 'halves' "
+        "(left to the first, right to the second) or 'single' (one colour "
+        "each).  Default: the saved one."),
+    colors: FollowColors | None = typer.Option(
+        None, "--colors", help="How a region of an LCD's picture becomes a "
+        "light's colour: 'vivid' (its brightest pixels -- small bright "
+        "details show) or 'smooth' (its average -- steadier).  Default: the "
+        "saved one, vivid at first."),
+    target: list[str] | None = typer.Option(
+        None, "--target", help="A light that follows (a stick's "
+        "'i2c-3/0x19', an OpenRGB device's name); repeat for more.  "
+        "'--target all' for every one.  Default: the saved ones."),
+) -> None:
+    """Make other RGB follow the LED cooler's colours -- or an LCD's picture (#160).
+
+    'openrgb': TRCC connects to OpenRGB's SDK server -- start it in OpenRGB's
+    SDK Server tab -- and sends the cooler's colours to every OpenRGB device,
+    in OpenRGB's direct mode.  'ram': TRCC sends them to Corsair RGB memory
+    itself, with no OpenRGB -- close OpenRGB first, so the two never drive the
+    same sticks.  'off' stops.
+    """
+    log.info("cli system follow: mode=%s host=%r port=%s source=%r "
+             "mapping=%s colors=%s target=%s", mode, host, port, source,
+             mapping, colors, target)
+    choice = mode.lower()
+    modes = [m.value for m in RgbFollowMode]
+    if choice != "status" and choice not in modes:
+        raise typer.BadParameter(
+            f"mode must be one of {', '.join(modes)} or 'status', "
+            f"got {mode!r}")
+    result = get_app().dispatch(
+        RgbFollow() if choice == "status" else
+        SetRgbFollow(mode=RgbFollowMode(choice), host=host, port=port,
+                     source=source, mapping=mapping, colors=colors,
+                     targets=(None if target is None else
+                              () if target == ["all"] else tuple(target))))
+    typer.echo(result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+    typer.echo(f"  following: {result.mode.value} "
+               f"(OpenRGB at {result.host}:{result.port})")
+    typer.echo(f"  source   : {result.source or 'the first LED cooler'}"
+               + (f" ({result.mapping.value}, {result.colors.value})"
+                  if result.source else ""))
+    typer.echo(f"  lights   : {', '.join(result.targets) or 'all'}")
+    if result.lead:
+        typer.echo(f"  cooler   : {result.lead}")
+    if result.devices:
+        typer.echo(f"  devices  : {', '.join(result.devices)}")
+    if result.error:
+        typer.echo(f"  problem  : {result.error}")
+
+
+@app.command("ram-lighting")
+def ram_lighting(
+    action: str = typer.Argument(
+        "status", help="'enable', 'disable' or 'status'"),
+) -> None:
+    """Let TRCC reach RGB memory's lighting -- opt-in, asks for a password.
+
+    RGB memory's lighting chips sit on the motherboard's SMBus, beside the
+    chips that hold the memory's own settings.  Linux can only open the whole
+    bus, so enabling lets programs you run reach all of it, not just TRCC.
+    Only the person logged in at this computer gets access, and only that
+    bus.  'disable' removes it completely.  It lasts across reboots.  Your
+    desktop asks for the password; the answer comes when you type it or close
+    the prompt.
+    """
+    log.info("cli system ram-lighting: %s", action)
+    choice = action.lower()
+    if choice not in ("enable", "disable", "status"):
+        raise typer.BadParameter(
+            f"action must be 'enable', 'disable' or 'status', got {action!r}")
+    result = get_app().dispatch(
+        RamLighting() if choice == "status" else
+        SetRamLighting(enabled=choice == "enable"))
+    typer.echo(result.message)
+    typer.echo(f"  state: {result.state.value}")
+    if result.command and result.state not in (RamAccessState.ON,
+                                               RamAccessState.ELSEWHERE):
+        typer.echo(f"  to enable: {result.command}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _echo_lights(result: RgbLightsResult) -> None:
+    """The lights, one per line, with what TRCC last saved on each stick."""
+    log.debug("_echo_lights: %d", len(result.lights))
+    if result.message:
+        typer.echo(result.message)
+    if any(light.remembered for light in result.lights):
+        typer.echo("  (found at the last search -- `trcc system rgb --scan` "
+                   "to check again)")
+    elif not result.scanned:
+        typer.echo("  (not searched yet -- `trcc system rgb --scan`)")
+    for light in result.lights:
+        effect = (f"  effect: {light.effect.effect.value} (last set by TRCC)"
+                  if light.effect else "")
+        typer.echo(f"  {light.kind.value:<7} {light.ref:<24} {light.name} "
+                   f"({light.led_count} LEDs){effect}")
+    if result.openrgb_error:
+        typer.echo(f"  OpenRGB: {result.openrgb_error}")
+    typer.echo(f"  RAM access: {result.ram_access.value}")
+
+
+@app.command("rgb")
+def rgb(
+    scan: bool = typer.Option(
+        False, "--scan", help="Look for the lights first: RGB memory on the "
+        "SMBus, and OpenRGB's devices."),
+    host: str = typer.Option(
+        "", "--host", help="With --scan: look for OpenRGB here, and save it "
+                           "(default: the saved one, 127.0.0.1 at first)."),
+    port: int = typer.Option(
+        0, "--port", help="With --scan: OpenRGB's port (default: the saved "
+                          "one, 6742 at first)."),
+) -> None:
+    """The RGB lights TRCC can drive or hand colours to."""
+    log.info("cli system rgb: scan=%s host=%r port=%s", scan, host, port)
+    if (host or port) and not scan:
+        raise typer.BadParameter("--host and --port go with --scan")
+    result = get_app().dispatch(ScanRgbLights(host=host, port=port) if scan
+                                else RgbLights())
+    _echo_lights(result)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _parse_rgb(text: str) -> tuple[int, int, int]:
+    """``255,0,0`` -> (255, 0, 0)."""
+    log.debug("_parse_rgb: %r", text)
+    parts = text.split(",")
+    if len(parts) != 3 or not all(p.strip().isdigit() for p in parts):
+        raise typer.BadParameter(f"a colour is R,G,B -- got {text!r}")
+    r, g, b = (int(p) for p in parts)
+    return r, g, b
+
+
+@app.command("ram-effect")
+def ram_effect(
+    effect: RamEffect = typer.Argument(..., help="The effect to save on the RAM."),
+    stick: list[str] | None = typer.Option(
+        None, "--stick", help="A stick by ref (see `trcc system rgb`); "
+        "repeat for more.  Default: every stick."),
+    speed: EffectSpeed = typer.Option(EffectSpeed.MEDIUM, "--speed"),
+    direction: EffectDirection | None = typer.Option(None, "--direction"),
+    color: list[str] | None = typer.Option(
+        None, "--color", help="R,G,B; repeat for a second colour."),
+    random_colors: bool = typer.Option(
+        False, "--random", help="Let the stick pick the colours."),
+    brightness: int = typer.Option(255, "--brightness", min=0, max=255),
+) -> None:
+    """Save one of the memory's own effects on the sticks.
+
+    The stick keeps it after TRCC closes and through a reboot.  If the RAM
+    was following a device, following turns off first.
+    """
+    log.info("cli system ram-effect: %s sticks=%s", effect.value, stick)
+    result = get_app().dispatch(SetRamEffect(
+        effect=effect, refs=tuple(stick or ()), speed=speed,
+        direction=direction,
+        colors=tuple(_parse_rgb(c) for c in color or ()),
+        random_colors=random_colors, brightness=brightness))
+    _echo_lights(result)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("aura-leds")
+def aura_leds(
+    header: int = typer.Argument(..., min=1, help="The ARGB header, from 1 "
+                                 "(see `trcc system rgb`)."),
+    leds: int = typer.Argument(..., min=0, help="How many LEDs it drives."),
+) -> None:
+    """Say how many LEDs an ASUS Aura ARGB header drives.
+
+    The board cannot tell: the header's data line runs one way.  The board
+    is read again after, so the new count is listed.
+    """
+    log.info("cli system aura-leds: header %d -> %d", header, leds)
+    result = get_app().dispatch(SetAuraLeds(header=header, leds=leds))
+    _echo_lights(result)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("snapshot")
+def snapshot(
+    json_output: bool = typer.Option(
+        False, "--json", help="Emit JSON instead of human text.",
+    ),
+) -> None:
+    """Print the AppSettings snapshot (language, GPU, refresh interval)."""
+    log.info("cli system snapshot: json_output=%s", json_output)
+    r = get_app().dispatch(ControlCenterSnapshot())
+    if json_output:
+        emit_json(r)
+        raise typer.Exit(code=0 if r.ok else 1)
+    typer.echo(r.message)
+    typer.echo(f"  language          {r.language}")
+    typer.echo(f"  temp_unit         {r.temp_unit}")
+    typer.echo(f"  active_gpu        {r.active_gpu}")
+    typer.echo(f"  refresh_interval  {r.refresh_interval_s}s")
+
+
+def _show_platform_info() -> None:
+    """Shared body for ``info``-platform / ``platform-info`` commands."""
+    log.debug("_show_platform_info")
+    r = get_app().dispatch(GetPlatformInfo())
+    typer.echo(f"Distro:   {r.distro_name}")
+    typer.echo(f"Install:  {r.install_method}")
+    typer.echo(f"Config:   {r.config_dir}")
+    typer.echo(f"Data:     {r.data_dir}")
+    typer.echo(f"Logs:     {r.log_file}")
+    if r.permission_warnings:
+        typer.echo("\nWarnings:")
+        for w in r.permission_warnings:
+            typer.echo(f"  {w}")
+    else:
+        typer.echo("\nPermissions: OK")
+
+
+@app.command("platform-info")
+def platform_info() -> None:
+    """Show platform info (distro, install method, config dir, permissions)."""
+    log.info("cli system platform-info")
+    _show_platform_info()
+
+
+@app.command("info")
+def info(
+    metric: str | None = typer.Option(
+        None, "--metric", "-m",
+        help=(
+            "Filter readings whose ``sensor_id`` startswith this prefix "
+            "(e.g. cpu, gpu, mem, disk, net, fan, time)."
+        ),
+    ),
+) -> None:
+    """Show current sensor metrics (CPU/GPU/fan/disk/net readings).
+
+    Mirrors legacy ``trcc info`` — dispatches :class:`ReadSensors` and
+    prints each reading.  Use ``--metric <prefix>`` to narrow the
+    output; pass no args for everything.  For paths / install info /
+    permissions, see :command:`trcc system platform-info`.
+    """
+    log.info("cli system info: metric=%s", metric)
+    result = get_app().dispatch(ReadSensors())
+    typer.echo(result.message)
+    needle = metric.lower() if metric else None
+    for reading in result.readings:
+        if needle and not reading.sensor_id.lower().startswith(needle):
+            continue
+        unit = f" {reading.unit}" if reading.unit else ""
+        label = f"  {reading.label}" if reading.label else ""
+        typer.echo(f"  {reading.sensor_id:32} {reading.value:>10.2f}{unit}{label}")
+
+
+@app.command("hid-debug")
+def hid_debug(
+    key: str = typer.Argument(..., help="Device key, e.g. 0402:3922"),
+) -> None:
+    """Connect to *key* + print handshake details for a GitHub issue paste.
+
+    Composes :class:`ConnectDevice` (returns handshake bytes + parsed
+    resolution / model id / serial) and :class:`LcdSnapshot` to dump the
+    persisted state.  Output is plain text — copy + paste-friendly.
+    """
+    log.info("cli system hid-debug: key=%s", key)
+    from ...core.commands import ConnectDevice, LcdSnapshot
+
+    app_obj = get_app()
+    typer.echo(f"HID/LCD diagnostic for {key}")
+    typer.echo("=" * 60)
+    conn = app_obj.dispatch(ConnectDevice(key=key))
+    typer.echo(f"Handshake: {conn.message}")
+    if not conn.ok:
+        raise typer.Exit(code=1)
+    if conn.handshake:
+        h = conn.handshake
+        typer.echo(f"  resolution: {h.resolution[0]}x{h.resolution[1]}")
+        typer.echo(f"  model_id:   {h.model_id}")
+        if h.serial:
+            typer.echo(f"  serial:     {h.serial}")
+        if getattr(h, "sub_byte", None) is not None:
+            typer.echo(f"  sub_byte:   {h.sub_byte}")
+
+    snap = app_obj.dispatch(LcdSnapshot(key=key))
+    typer.echo("")
+    typer.echo("Persisted state:")
+    typer.echo(f"  orientation:     {snap.orientation}")
+    typer.echo(f"  brightness:      {snap.brightness}%")
+    typer.echo(f"  current_theme:   {snap.current_theme}")
+    typer.echo(f"  overlay_enabled: {snap.overlay_enabled}")
+    typer.echo("")
+    typer.echo("=" * 60)
+    typer.echo("Copy the output above into a GitHub issue.")
+
+
+@app.command("led-debug")
+def led_debug(
+    key: str = typer.Argument(..., help="LED device key, e.g. 0416:8001"),
+    test_colors: bool = typer.Option(
+        False, "--test-colors",
+        help="After handshake, enable the 4-color test cycle (Ctrl-C to stop).",
+    ),
+) -> None:
+    """LED device handshake + zone/segment dump + optional test cycle.
+
+    Composes :class:`ConnectDevice` and :class:`LedSnapshot` for a one-
+    shot diagnostic.  Pass ``--test-colors`` to cycle the device's
+    test pattern so you can confirm wire-up visually.
+    """
+    log.info("cli system led-debug: key=%s test_colors=%s", key, test_colors)
+    import signal
+
+    from ...core.commands import ConnectDevice, EnableLedTestMode, LedSnapshot
+
+    app_obj = get_app()
+    typer.echo(f"LED diagnostic for {key}")
+    typer.echo("=" * 60)
+    conn = app_obj.dispatch(ConnectDevice(key=key))
+    typer.echo(f"Handshake: {conn.message}")
+    if not conn.ok:
+        raise typer.Exit(code=1)
+
+    snap = app_obj.dispatch(LedSnapshot(key=key))
+    typer.echo("")
+    typer.echo("Persisted state:")
+    typer.echo(f"  mode:            {snap.mode}")
+    typer.echo(
+        f"  color:           "
+        f"#{snap.color[0]:02x}{snap.color[1]:02x}{snap.color[2]:02x}",
+    )
+    typer.echo(f"  brightness:      {snap.brightness}%")
+    typer.echo(f"  global_on:       {snap.global_on}")
+    typer.echo(f"  zones:           {snap.zone_count}")
+    typer.echo(f"  segments:        {snap.segment_count}")
+    typer.echo(f"  zone_sync:       {snap.zone_sync}")
+
+    if test_colors:
+        typer.echo("")
+        typer.echo("Test colors enabled — Ctrl-C to stop.")
+        result = app_obj.dispatch(EnableLedTestMode(key=key, enabled=True))
+        typer.echo(result.message)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        stopped = {"flag": False}
+
+        def _handle(*_args: object) -> None:
+            log.debug("_handle")
+            stopped["flag"] = True
+
+        signal.signal(signal.SIGINT, _handle)
+        signal.signal(signal.SIGTERM, _handle)
+        while not stopped["flag"]:
+            signal.pause()
+        stop = app_obj.dispatch(EnableLedTestMode(key=key, enabled=False))
+        typer.echo(stop.message)
+
+    typer.echo("")
+    typer.echo("=" * 60)
+    typer.echo("Copy the output above into a GitHub issue.")
+
+
+@app.command("download")
+def download(
+    width: int = typer.Argument(..., min=1, help="Display width (px), e.g. 320"),
+    height: int = typer.Argument(..., min=1, help="Display height (px), e.g. 320"),
+) -> None:
+    """Pre-fetch the theme + cloud + mask archives for a resolution.
+
+    DiscoverDevices runs this implicitly the first time a device of a
+    given resolution attaches.  Call it directly to populate the local
+    cache while you have network — handy for headless setups that'll
+    later run offline.  Idempotent.
+    """
+    log.info("cli system download: width=%s height=%s", width, height)
+    result = get_app().dispatch(
+        EnsureDataDownload(width=width, height=height),
+    )
+    typer.echo(result.message)
+    typer.echo(
+        f"  themes: {'ok' if result.themes_ok else 'FAIL'}\n"
+        f"  web:    {'ok' if result.web_ok else 'FAIL'}\n"
+        f"  masks:  {'ok' if result.masks_ok else 'FAIL'}",
+    )
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("list-endpoints")
+def list_endpoints() -> None:
+    """Enumerate every HTTP route the REST API exposes.
+
+    Builds the FastAPI app (no uvicorn) and walks its router so the
+    output reflects what ``trcc api`` / ``trcc serve`` would serve.  Routes
+    only, no App: ``build_app()`` bare found or STARTED the shared App -- USB
+    and all -- to print a list.
+    """
+    log.info("cli system list-endpoints")
+    from ...ui.api.main import api_routes, build_app
+
+    rows: list[tuple[str, str]] = []
+    for route in api_routes(build_app(serve=False)):
+        path = getattr(route, "path", "")
+        methods = getattr(route, "methods", None) or set()
+        for method in sorted(m for m in methods if m != "HEAD"):
+            rows.append((method, path))
+    rows.sort()
+    for method, path in rows:
+        typer.echo(f"  {method:6} {path}")
+    typer.echo(f"\n{len(rows)} endpoint(s).")
+
+
+# ── Autostart subcommands ────────────────────────────────────────────
+
+autostart_app = typer.Typer(
+    help="Manage auto-launch-on-login (XDG .desktop on Linux).",
+    no_args_is_help=True,
+)
+app.add_typer(autostart_app, name="autostart")
+
+
+@autostart_app.command("status")
+def autostart_status() -> None:
+    """Show whether auto-launch-on-login is enabled."""
+    log.info("cli system autostart status")
+    r = get_app().dispatch(GetAutostartStatus())
+    state = "enabled" if r.enabled else "disabled"
+    typer.echo(f"Autostart: {state}")
+    if r.target:
+        # WHICH ui login brings up.  "enabled" alone cannot say, now that all
+        # four are startable — and the Command already carried the answer.
+        typer.echo(f"Target:    {r.target}")
+    if r.path:
+        typer.echo(f"Path:      {r.path}")
+
+
+@autostart_app.command("enable")
+def autostart_enable(
+    target: str = typer.Option(
+        None, "--target", "-t",
+        help=("Which UI starts with the computer "
+              f"({', '.join(sorted(AUTOSTART_TARGETS))}).  "
+              "Default: gui."),
+    ),
+) -> None:
+    """Install the autostart entry (per-user, no sudo required).
+
+    All four UIs can start at login; without ``--target`` the entry launches
+    the gui, which is what it always did.
+    """
+    log.info("cli system autostart enable: target=%s", target)
+    r = get_app().dispatch(EnableAutostart(target=target))
+    typer.echo(r.message)
+    typer.echo(f"Path: {r.path}")
+    if r.target:
+        typer.echo(f"Target: {r.target}")
+    if not r.enabled:
+        raise typer.Exit(code=1)
+
+
+@autostart_app.command("disable")
+def autostart_disable() -> None:
+    """Remove the autostart entry."""
+    log.info("cli system autostart disable")
+    r = get_app().dispatch(DisableAutostart())
+    typer.echo(r.message)
+
+
+@autostart_app.command("refresh")
+def autostart_refresh() -> None:
+    """Re-render an existing entry so it picks up a new launch path.
+
+    The repair for a moved install (#201): an entry written by an older
+    install keeps its old ``Exec=`` forever.  Does NOT enable autostart —
+    with no entry installed it reports so and changes nothing.
+    """
+    log.info("cli system autostart refresh")
+    r = get_app().dispatch(RefreshAutostart())
+    typer.echo(r.message)
+    if r.path:
+        typer.echo(f"Path: {r.path}")
+
+
+@app.command("paths")
+def paths(
+    resolution: str = typer.Option(
+        "", "--resolution", "-r",
+        help="WxH (e.g. 854x480) — also show the per-resolution theme/mask dirs",
+    ),
+    key: str = typer.Option(
+        "", "--key", "-k",
+        help="Device key (e.g. 0402:3922) — use that cooler's own artwork "
+             "libraries, and its resolution when --resolution is omitted",
+    ),
+) -> None:
+    """Show where this install keeps config, data, logs and user content.
+
+    Answers "where did my theme go?" and "which log do I attach to an issue?"
+    without the user guessing at ``~/.trcc`` versus ``~/.trcc-user``.
+
+    With ``--key`` the answer is that device's: the resolution comes from its
+    handshake (oriented) and the theme/cloud dirs name its per-SKU library, so
+    the output points at the directories the app actually opens for it.
+    """
+    log.info("cli system paths: resolution=%s key=%s",
+             resolution or "(none)", key or "(none)")
+    size: tuple[int, int] | None = None
+    if resolution:
+        try:
+            w, h = (int(v) for v in resolution.lower().split("x", 1))
+            size = (w, h)
+        except ValueError:
+            log.warning("cli system paths: bad --resolution %r "
+                        "(expected WxH, e.g. 854x480)", resolution)
+            typer.echo(f"Bad --resolution {resolution!r}; expected WxH e.g. 854x480")
+            raise typer.Exit(code=1) from None
+    app_obj = get_app()
+    if key:
+        # Ask the bus, never ``app.devices`` — that attribute is absent on the
+        # AppProxy a daemon-mode client holds (#249).  A one-shot CLI does not
+        # coldplug, so without this the answer would quietly be the generic
+        # one and read as if it were the device's.
+        state = app_obj.dispatch(DeviceState(key=key))
+        if not state.ok or not state.connected:
+            typer.echo(
+                f"Device {key} not connected — connect first so we can read "
+                "its artwork libraries (or omit --key for the generic paths)",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    result = app_obj.dispatch(GetPaths(resolution=size, key=key))
+    for field in (
+        "config_dir", "data_dir", "user_content_dir", "user_data_dir",
+        "log_file", "uploads_dir", "media_player_dir", "screencast_dir",
+        "theme_dir", "user_theme_dir", "user_mask_dir",
+        "user_background_dir", "cloud_theme_dir", "cloud_mask_dir",
+    ):
+        value = getattr(result, field)
+        # None means "not asked for" — a resolution-scoped dir with no
+        # resolution given.  Print nothing rather than an empty line that
+        # would read as "this directory is unset".
+        if value is not None:
+            typer.echo(f"{field:22} {value}")
