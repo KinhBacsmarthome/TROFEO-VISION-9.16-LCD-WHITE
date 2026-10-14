@@ -172,6 +172,12 @@ curl -X POST http://127.0.0.1:8080/devices/0416:5408/display/color \
 
 Muốn mở cho mạng LAN thì dùng `--host 0.0.0.0` **kèm** `--token MAT_KHAU` để bảo vệ.
 
+### Dashboard Home Assistant / NAS / thời tiết
+
+Thư mục [`dashboard/`](dashboard/) có chương trình hiển thị đồng hồ, Home Assistant,
+NAS Synology, nhiệt độ, mạng và thời tiết lên màn hình. Xem hướng dẫn ở
+[dashboard/README.md](dashboard/README.md).
+
 ---
 
 ## Xử lý sự cố thường gặp
