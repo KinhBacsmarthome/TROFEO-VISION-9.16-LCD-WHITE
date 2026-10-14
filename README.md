@@ -1,3 +1,5 @@
+> **Fork cho Thermalright Trofeo Vision 9.16 LCD (White).** Hướng dẫn tiếng Việt cho Debian: [HUONG_DAN_DEBIAN.md](HUONG_DAN_DEBIAN.md). Repo gốc: [Lexonight1/thermalright-trcc-linux](https://github.com/Lexonight1/thermalright-trcc-linux).
+
 # Intro
 > "I’ll do it while you talk" - Józef Piłsudski, was the founding father of modern Poland
 
