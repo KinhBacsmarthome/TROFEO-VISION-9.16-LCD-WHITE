@@ -3,6 +3,7 @@
 #       systemctl --user daemon-reload
 #       systemctl --user enable --now trcc-dashboard
 # Log:  journalctl --user -u trcc-dashboard -f
+# Cấu hình: mở http://127.0.0.1:8765 trong trình duyệt
 [Unit]
 Description=Dashboard cho Thermalright Trofeo Vision 9.16 LCD
 After=network-online.target graphical-session.target
@@ -11,7 +12,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/TROFEO-VISION-9.16-LCD-WHITE/dashboard
-ExecStart=/usr/bin/python3 -m lcd_dashboard -c %h/.config/trcc-dashboard/config.toml -v
+# --web: mở trang cấu hình tại http://127.0.0.1:8765 (bỏ đi nếu không cần)
+ExecStart=/usr/bin/python3 -m lcd_dashboard -c %h/.config/trcc-dashboard/config.toml --web -v
 Restart=on-failure
 RestartSec=10
 

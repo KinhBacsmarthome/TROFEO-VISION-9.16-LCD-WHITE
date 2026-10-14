@@ -50,6 +50,11 @@ class Sender:
             self.trcc_command = exe
             log.info("sender: gửi qua %s display send-image", exe)
 
+    @property
+    def mode(self) -> str:
+        """Cách đang thực sự dùng để gửi: ``python`` hoặc ``cli``."""
+        return "python" if self._bus is not None else "cli"
+
     def send(self, path: Path) -> None:
         if self._bus is not None:
             result = self._bus.dispatch(self._send_image(key=self.key, path=path))

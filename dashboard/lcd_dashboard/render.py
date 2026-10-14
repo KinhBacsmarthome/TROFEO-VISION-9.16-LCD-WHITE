@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import threading
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from itertools import pairwise
@@ -21,6 +22,10 @@ from .models import HostStats, NetStats, Snapshot, TempRow, Weather
 log = logging.getLogger(__name__)
 
 SS = 2  # hệ số supersampling
+
+# Vòng lặp gửi ảnh và trang cấu hình có thể vẽ cùng lúc; font FreeType dùng chung
+# giữa các luồng nên chỉ cho một luồng vẽ tại một thời điểm.
+RENDER_LOCK = threading.Lock()
 
 RGB = tuple[int, int, int]
 RGBA = tuple[int, int, int, int]
@@ -518,16 +523,26 @@ def _landscape_cached(w: int, h: int) -> Image.Image:
     return _landscape(w, h)
 
 
+def temp_icon(source: str) -> Callable[..., None]:
+    """Biểu tượng theo nguồn: chip cho CPU, card cho GPU, ổ cứng cho disk, còn lại nhiệt kế."""
+    if source.endswith(":gpu") or "gpu" in source:
+        return icon_gpu
+    if source.endswith(":disk") or any(k in source for k in ("drive", "disk", "hdd", "nvme")):
+        return icon_hdd
+    if source.endswith(":cpu") or any(k in source for k in ("cpu", "processor")):
+        return icon_chip
+    return lambda p, x, y, s: icon_thermo(p, x + s * .1, y, s * .85)
+
+
 def temp_card(p: Painter, x0: float, y0: float, x1: float, y1: float,
               rows: Sequence[TempRow], tmax: float) -> None:
     card(p, x0, y0, x1, y1)
     header(p, x0 + 18, y0 + 18, "NHIỆT ĐỘ", icon_thermo, x1 - x0 - 36)
-    icons = (icon_chip, icon_gpu, icon_hdd)
     n = max(len(rows), 1)
     step = (y1 - y0 - 90) / n
     for i, row in enumerate(rows):
         top = y0 + 80 + i * step
-        icons[min(i, 2)](p, x0 + 20, top + 6, 26)
+        temp_icon(row.source)(p, x0 + 20, top + 6, 26)
         p.fit_text(x0 + 56, top + 19, row.label, 20, x1 - x0 - 140, WHITE, anchor="lm")
         frac = 0.0 if row.value is None else row.value / tmax
         col = temp_color(frac) if row.value is not None else MUTED
@@ -589,6 +604,12 @@ def render(snap: Snapshot, width: int = 1920, height: int = 462, *,
            font_regular: str, font_bold: str, background: str = "") -> Image.Image:
     """Dựng toàn bộ dashboard. Bố cục co giãn theo ``width`` x ``height``."""
     log.debug("render: %dx%d lúc %s", width, height, snap.now)
+    with RENDER_LOCK:
+        return _render(snap, width, height, font_regular, font_bold, background)
+
+
+def _render(snap: Snapshot, width: int, height: int, font_regular: str, font_bold: str,
+            background: str) -> Image.Image:
     p = Painter(1920, 462, font_regular, font_bold)
     # Bề rộng các thẻ (tổng 1840 + 5 khe 12px + lề 10px mỗi bên = 1920)
     widths = (350, 425, 425, 235, 200, 205)

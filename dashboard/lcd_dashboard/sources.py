@@ -101,12 +101,39 @@ class HomeAssistant:
         self.token = cfg.token
         self.verify_ssl = cfg.verify_ssl
 
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.token}"}
+
+    def ping(self) -> str:
+        """Kiểm tra URL + token; trả về thông báo của HA ("API running.")."""
+        data = http_json(f"{self.url}/api/", headers=self._headers(),
+                         verify_ssl=self.verify_ssl)
+        log.info("ha: ping %s -> %s", self.url, data)
+        return str(data.get("message", ""))
+
+    def list_entities(self) -> list[dict[str, str]]:
+        """Mọi entity: id, tên, trạng thái, đơn vị, device_class — để chọn trên trang cấu hình."""
+        data = http_json(f"{self.url}/api/states", headers=self._headers(),
+                         verify_ssl=self.verify_ssl)
+        out = []
+        for item in data:
+            attrs = item.get("attributes", {})
+            out.append({
+                "entity_id": str(item.get("entity_id", "")),
+                "name": str(attrs.get("friendly_name", "")),
+                "state": str(item.get("state", "")),
+                "unit": str(attrs.get("unit_of_measurement") or ""),
+                "device_class": str(attrs.get("device_class") or ""),
+            })
+        out.sort(key=lambda e: e["entity_id"])
+        log.info("ha: list_entities -> %d entity", len(out))
+        return out
+
     def state(self, entity_id: str) -> tuple[float | None, str]:
         """(giá trị số, đơn vị) của một entity; giá trị None nếu unavailable."""
         data = http_json(
             f"{self.url}/api/states/{urllib.parse.quote(entity_id)}",
-            headers={"Authorization": f"Bearer {self.token}"},
-            verify_ssl=self.verify_ssl,
+            headers=self._headers(), verify_ssl=self.verify_ssl,
         )
         unit = str(data.get("attributes", {}).get("unit_of_measurement") or "")
         return _num(data.get("state")), unit
@@ -139,6 +166,8 @@ class HomeAssistant:
         def size(key: str) -> float | None:
             return self.size(entities[key]) if entities.get(key) else None
 
+        if not any(entities.get(k) for k in entities):
+            self.ping()  # chưa gán entity nào: chỉ kiểm tra kết nối để biết online
         st = HostStats(online=True)
         st.cpu_pct = val("cpu")
         st.cpu_temp = val("cpu_temp")
@@ -153,6 +182,11 @@ class HomeAssistant:
         st.disk_pct = val("disk_pct")
         if st.disk_pct is None:
             st.disk_pct = _pct(st.disk_used, st.disk_total)
+        # Chỉ có % và dung lượng tổng (vd. tích hợp Synology DSM): tự tính phần đã dùng.
+        if st.ram_used is None and st.ram_total and st.ram_pct is not None:
+            st.ram_used = st.ram_total * st.ram_pct / 100.0
+        if st.disk_used is None and st.disk_total and st.disk_pct is not None:
+            st.disk_used = st.disk_total * st.disk_pct / 100.0
         log.debug("ha: host_stats %s", st)
         return st
 
@@ -436,6 +470,9 @@ class Collector:
     def _ha_stats(self) -> HostStats:
         if self.ha is None:
             return HostStats()
+        if not self.cfg.home_assistant.token:
+            self._log["home_assistant"].failure("chưa có token")
+            return HostStats()
         return self._guard("home_assistant",
                            lambda: self.ha.host_stats(self.cfg.home_assistant.entities),  # type: ignore[union-attr]
                            HostStats())
@@ -450,6 +487,9 @@ class Collector:
                 return HostStats()
             return self._guard("nas", lambda: self.ha.host_stats(nas.entities),  # type: ignore[union-attr]
                                HostStats())
+        if not nas.username:
+            self._log["nas"].failure("chưa có tài khoản DSM")
+            return HostStats()
         return self._guard("nas", self.syno.host_stats, HostStats())  # type: ignore[union-attr]
 
     def _net(self) -> tuple[float | None, float | None]:
@@ -500,7 +540,7 @@ class Collector:
         if self.weather is not None:
             self._weather = self._guard("weather", self.weather.get, self._weather)
 
-        temps = [TempRow(label, self._temp(src, ha, nas))
+        temps = [TempRow(label, self._temp(src, ha, nas), src)
                  for label, src in self.cfg.temperature.rows]
         snap = Snapshot(
             now=now,

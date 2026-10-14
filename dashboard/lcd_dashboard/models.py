@@ -26,6 +26,7 @@ class HostStats:
 class TempRow:
     label: str
     value: float | None
+    source: str = ""   # "local:cpu", "nas:disk", "sensor.xxx"… — chọn biểu tượng
 
 
 @dataclass

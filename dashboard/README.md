@@ -51,7 +51,47 @@ cp config.example.toml ~/.config/trcc-dashboard/config.toml
 nano ~/.config/trcc-dashboard/config.toml
 ```
 
-### Điền cấu hình
+### Trang web cấu hình (khuyên dùng)
+
+Thay vì sửa file TOML bằng tay, bạn có thể mở trang cấu hình trên trình duyệt:
+
+```bash
+cd ~/TROFEO-VISION-9.16-LCD-WHITE/dashboard
+python3 -m lcd_dashboard --web -v          # vừa gửi lên màn hình, vừa mở trang cấu hình
+# hoặc: python3 -m lcd_dashboard --web-only  # chỉ mở trang cấu hình, không gửi lên màn hình
+```
+
+Rồi mở **http://127.0.0.1:8765** trên trình duyệt của máy đó.
+
+![Trang cấu hình](webui.png)
+
+Những gì làm được trên trang:
+
+- **Home Assistant**: nhập địa chỉ và token, bấm **Kết nối & tải danh sách entity**.
+  Mỗi ô (CPU %, nhiệt độ CPU, RAM, ổ đĩa…) có danh sách gợi ý để gõ tìm entity. Giá trị
+  hiện tại hiển thị ngay bên cạnh, nên bạn biết mình chọn đúng hay chưa.
+  Nút **Tự dò System Monitor** tự điền các entity của tích hợp System Monitor.
+- **NAS**: chọn **Synology DSM** (nhập tài khoản và bấm **Kiểm tra kết nối**) hoặc
+  **Entity Home Assistant**, có nút **Tự dò tích hợp Synology DSM**.
+- **Nhiệt độ**: thêm, xoá hoặc đổi tên dòng (tối đa 4). Mỗi dòng chọn nguồn là CPU/GPU
+  của máy này, NAS, hoặc bất kỳ cảm biến nhiệt độ nào trong Home Assistant.
+- **Mạng**, **Thời tiết** (có sẵn danh sách thành phố), thời gian cập nhật, ảnh nền.
+- **Xem trước** ảnh màn hình với số liệu thật hoặc số liệu mẫu.
+- Bấm **Lưu & áp dụng**: cấu hình được ghi vào `~/.config/trcc-dashboard/config.toml`
+  (quyền 600). Vòng gửi ảnh **tự nạp lại** ở lần gửi kế tiếp, không cần khởi động lại.
+
+Về an toàn:
+
+- Trang chỉ nghe trên `127.0.0.1`, nên chỉ máy này mở được.
+- Token và mật khẩu không bao giờ được gửi ngược về trình duyệt. Để trống ô token khi
+  lưu nghĩa là giữ token cũ.
+- Lệnh `trcc_command`, thư mục `state_dir` và đường dẫn font chỉ sửa được trong file.
+- Muốn cấu hình từ máy khác trong LAN, an toàn nhất là dùng đường hầm SSH:
+  `ssh -L 8765:127.0.0.1:8765 user@may-debian`, rồi mở http://127.0.0.1:8765 trên máy
+  của bạn. Có thể dùng `--web-host 0.0.0.0`, nhưng khi đó **ai trong mạng LAN cũng sửa
+  được cấu hình** (trang không có mật khẩu).
+
+### Điền cấu hình bằng tay
 
 1. **Home Assistant**
    - Cài tích hợp **System Monitor**: Cài đặt → Thiết bị & dịch vụ → Thêm tích hợp,
@@ -82,12 +122,17 @@ python3 -m lcd_dashboard --demo --output /tmp/thu.png
 # Lấy số liệu thật, lưu ra file ảnh để kiểm tra
 python3 -m lcd_dashboard -c ~/.config/trcc-dashboard/config.toml --output /tmp/that.png -v
 
+# Mở trang cấu hình + chạy liên tục
+python3 -m lcd_dashboard --web -v
+
 # Gửi lên màn hình một lần
 python3 -m lcd_dashboard -c ~/.config/trcc-dashboard/config.toml --once -v
 
 # Chạy liên tục (Ctrl+C để dừng)
 python3 -m lcd_dashboard -c ~/.config/trcc-dashboard/config.toml -v
 ```
+
+Không truyền `-c` thì chương trình dùng `~/.config/trcc-dashboard/config.toml`.
 
 `-v` hiện thông báo chính, `-vv` hiện chi tiết từng request (dùng khi dò lỗi).
 
@@ -143,3 +188,5 @@ Muốn dùng `python` với pipx: `pipx inject trcc-linux pillow`, rồi sửa `
 | NAS báo `lỗi mã 105` | Tài khoản không có quyền quản trị. |
 | Ô thời tiết hiện `--` | Máy không ra được `api.open-meteo.com`. |
 | `gửi ảnh lỗi: … screencast` | Tắt screencast trong trcc. |
+| Trang cấu hình báo `token sai hoặc đã hết hạn` | Tạo lại token dài hạn trong Home Assistant. |
+| `không mở được trang web … Address already in use` | Đã có một dashboard khác đang chạy, hoặc đổi cổng bằng `--web-port 8766`. |
